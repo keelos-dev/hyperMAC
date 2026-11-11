@@ -19,6 +19,7 @@ FreeBSD 上看不出来，是因为默认的互斥锁是 errorcheck 类型、pth
 | 0015 bhyvegc | `bhyvegc_set_fbaddr()` 把调用方给的帧缓冲 `free()` 掉 | ramfb 切换模式时崩溃 |
 | 0006 PCI BAR | 来宾把 BAR 临时指到别的设备占着的地址时注册失败，之后再也不注册；改成那段地址空出来后重试 | virtio-gpu 的 BAR 不通 |
 | 0021 xhci | `pci_xhci_handle_transfer()` 持有端点的传输锁时调 `pci_xhci_try_usb_xfer()`，后者再锁同一把；和 0002 同一类（`EDEADLK` 被忽略、里层解锁放掉外层的锁） | Linux 的 soft lockup；`compat/` 的重入报告只报这一处 |
+| 0022 nvme INTx | NVMe 只有 MSI-X：不申请传统中断，INTMS/INTMC 的写入被忽略；用不了 MSI-X 的来宾挂不上盘。补上引脚中断（MSI-X 关着时按规范的电平语义）和两个屏蔽寄存器 | FreeBSD/arm64 以 ACPI 启动（GICv3 没有 ITS）：`unable to allocate shared interrupt` |
 
 ## 第二组：帧缓冲和 VNC 不限 amd64
 
@@ -69,7 +70,7 @@ packed virtqueue 没做；只有 virtio-net 按新旧接口区分了头的长度
 
 ## 建议的顺序
 
-1. 第一组七个小补丁，各自一个 review——不依赖任何讨论，先建立往来。
+1. 第一组八个小补丁，各自一个 review——不依赖任何讨论，先建立往来。
 2. 在邮件列表（freebsd-virtualization）上问第三组的两个设计问题：设备地址跟不跟 QEMU `virt`、DSDT 怎么生成。
 3. 第二组的 0004（不依赖 fw_cfg），然后 0008 → 0009/0012/0013 → 0014 → 0010 → ACPI。
 4. 0018 单独走。

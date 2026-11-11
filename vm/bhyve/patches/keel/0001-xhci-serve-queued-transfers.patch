@@ -1,0 +1,133 @@
+bhyve: xhci: serve an endpoint's queued transfers while its device has data
+
+A device interrupt (hci_intr) filled one transfer of the endpoint and no
+more.  A device that queues its reports (the USB keyboard, the tablet's
+clicks) therefore fell one report behind for good each time an event came
+while the guest had no transfer queued, unless the guest rang the doorbell
+for every transfer it queued afterwards.  FreeBSD does not: its keyboard
+driver keeps two interrupt transfers queued and rings once.  The reports
+at the end of a burst, key releases among them, stayed in the device until
+the next key, and the guest repeated the key it still saw down ("Donnnnnn").
+
+A controller serves a running endpoint at every service interval, without
+a doorbell between transfers.  Do the same: on a device interrupt, fill
+transfers while that completes one; and when the endpoint has no transfer
+ready, look again every 4 ms for up to a second, since the guest may queue
+one without telling.
+
+Applies to pci_xhci.c as keelOS's patch-xhci.py leaves it.
+
+--- a/usr.sbin/bhyve/pci_xhci.c
++++ b/usr.sbin/bhyve/pci_xhci.c
+@@ -274,6 +274,8 @@
+ 
+ 	struct usb_hci		hci;
+ 
++	uint32_t		hm_starved;	/* hyperMAC: endpoints with data and no transfer (hm_xhci_serve) */
++	int			hm_tries;
+ 	int			keel_remote;	/* keel: an asynchronous (remote) device */
+ 	int			keel_conn;	/* keel: ... with a device on its port */
+ };
+@@ -294,6 +296,7 @@
+ 	uint32_t	keel_pend;	/* keel: interrupters with new events */
+ 	uint32_t	keel_rpend;	/* keel: remote ports: change event after a restore */
+ 	struct mevent	*keel_rtev;
++	struct mevent	*hm_serve_ev;	/* hyperMAC: the retry of hm_xhci_serve() */
+ 	struct pci_xhci_rtsregs keel_rts[KEEL_XHCI_MAXINTR]; /* keel: 1..n-1 */
+ 	/* keel: counters for the trace (patch-xhci.py) */
+ 	int		keel_inins, keel_inmmio;
+@@ -3547,7 +3550,85 @@
+ 		DPRINTF(("Init empty port %d 0x%x", portn, port->portsc));
+ 	}
+ }
++
++/*
++ * hyperMAC: a device says it has data for an endpoint. A controller serves such an endpoint at
++ * every interval: the data goes into the transfers the guest has queued, one after the other,
++ * with no doorbell in between. Here one device interrupt used to fill one transfer and no more,
++ * so a device with a queue of reports (the keyboard, the tablet's clicks) fell behind for good
++ * whenever an event came while the guest had no transfer queued, unless the guest rang the
++ * doorbell for each transfer it queued. FreeBSD does not (its keyboard driver keeps two queued):
++ * the last reports of a burst, key releases among them, stayed in the device until the next key,
++ * and the guest repeated the key it still saw down.
++ *
++ * So: fill transfers while that makes progress; and when the endpoint has no transfer ready,
++ * look again every few milliseconds for a while (the guest queues one without telling).
++ */
++#define	HM_SERVE_MS	4
++#define	HM_SERVE_TRIES	250
+ 
++static void hm_xhci_serve_timer(int fd, enum ev_type type, void *arg);
++
++static void
++hm_xhci_serve(struct pci_xhci_softc *sc, struct pci_xhci_dev_emu *dev, uint32_t slot, uint32_t epid)
++{
++	struct pci_xhci_dev_ep *devep;
++	uint64_t before;
++	int i;
++
++	devep = &dev->eps[epid];
++	for (i = 0; i < 64; i++) {
++		before = sc->keel_nev;
++		pci_xhci_device_doorbell(sc, slot, epid, 0);
++		if (sc->keel_nev == before)
++			break;		/* no transfer completed */
++		dev->hm_tries = 0;
++	}
++	/*
++	 * A transfer that waits (the device said NAK): the device has nothing more. None at all:
++	 * the guest has queued none yet, and the device may still have data.
++	 */
++	if (dev->keel_remote || devep->ep_xfer == NULL || devep->ep_xfer->ndata > 0 || i == 64) {
++		dev->hm_starved &= ~(1u << epid);
++		return;
++	}
++	dev->hm_starved |= 1u << epid;
++	if (sc->hm_serve_ev == NULL && dev->hm_tries < HM_SERVE_TRIES)
++		sc->hm_serve_ev = mevent_add(HM_SERVE_MS, EVF_TIMER, hm_xhci_serve_timer, sc);
++}
++
++static void
++hm_xhci_serve_timer(int fd __unused, enum ev_type type __unused, void *arg)
++{
++	struct pci_xhci_softc *sc = arg;
++	struct pci_xhci_dev_emu *dev;
++	uint32_t starved;
++	int epid, slot;
++
++	pthread_mutex_lock(&sc->mtx);
++	if (sc->hm_serve_ev != NULL) {
++		mevent_delete(sc->hm_serve_ev);
++		sc->hm_serve_ev = NULL;
++	}
++	for (slot = 1; slot <= XHCI_MAX_SLOTS && sc->slots != NULL; slot++) {
++		dev = XHCI_SLOTDEV_PTR(sc, slot);
++		if (dev == NULL || dev->hm_starved == 0)
++			continue;
++		if (sc->rtsregs.erstba_p == NULL || (sc->opregs.usbcmd & XHCI_CMD_RS) == 0 ||
++		    dev->dev_ctx == NULL || ++dev->hm_tries > HM_SERVE_TRIES) {
++			dev->hm_starved = 0;	/* the next device interrupt starts over */
++			dev->hm_tries = 0;
++			continue;
++		}
++		starved = dev->hm_starved;
++		for (epid = 1; epid < XHCI_MAX_ENDPOINTS; epid++)
++			if ((starved & (1u << epid)) != 0 &&
++			    (dev->dev_ctx->ctx_ep[epid].dwEpCtx0 & 0x7) != XHCI_ST_EPCTX_DISABLED)
++				hm_xhci_serve(sc, dev, dev->hci.hci_port, epid);	/* as the device's interrupt does */
++	}
++	pthread_mutex_unlock(&sc->mtx);
++}
++
+ static int
+ keel_xhci_dev_intr_locked(struct usb_hci *hci, int epctx)
+ {
+@@ -3604,7 +3685,7 @@
+ 
+ 	DPRINTF(("xhci device interrupt on endpoint %d", epid));
+ 
+-	pci_xhci_device_doorbell(sc, hci->hci_port, epid, 0);
++	hm_xhci_serve(sc, dev, hci->hci_port, epid);
+ 
+ done:
+ 	return (error);

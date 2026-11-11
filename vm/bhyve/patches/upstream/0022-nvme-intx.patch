@@ -1,0 +1,134 @@
+bhyve: nvme: the pin-based interrupt, and INTMS/INTMC
+
+The emulated NVMe controller offered only MSI-X: it requested no legacy
+interrupt and ignored writes to INTMS and INTMC.  A guest that cannot use
+MSI-X could not attach the disk at all.  FreeBSD/arm64 booted with ACPI on
+a GICv3 without an ITS is one: nvme(4) reports "unable to allocate MSI-X",
+then "unable to allocate shared interrupt", and the attach fails.
+
+Request a legacy interrupt, and while MSI-X is disabled drive it as the
+specification describes for pin-based interrupts: asserted while a
+completion queue with interrupts enabled holds an entry the guest has not
+consumed and INTMS does not mask it; re-evaluated when a completion is
+posted, when the guest moves a completion queue head doorbell, and when it
+writes INTMS or INTMC.  With MSI-X enabled nothing changes.
+
+--- a/usr.sbin/bhyve/pci_nvme.c
++++ b/usr.sbin/bhyve/pci_nvme.c
+@@ -388,6 +388,8 @@
+ };
+ 
+ 
++static void pci_nvme_intr(struct pci_nvme_softc *sc, uint16_t vector);
++static void pci_nvme_intx_update(struct pci_nvme_softc *sc);
+ static void pci_nvme_cq_update(struct pci_nvme_softc *sc,
+     struct nvme_completion_queue *cq,
+     uint32_t cdw0,
+@@ -1004,7 +1006,7 @@
+ 		aen->event_data = 0;
+ 		aen->posted = false;
+ 
+-		pci_generate_msix(sc->nsc_pi, 0);
++		pci_nvme_intr(sc, 0);
+ 	}
+ }
+ 
+@@ -1042,6 +1044,8 @@
+ 	sc->regs.vs = NVME_REV(1,4);	/* NVMe v1.4 */
+ 
+ 	sc->regs.cc = 0;
++	sc->regs.intms = 0;
++	pci_lintr_deassert(sc->nsc_pi);
+ 
+ 	assert(sc->submit_queues != NULL);
+ 
+@@ -2148,7 +2152,7 @@
+ 	sq->head = sqhead;
+ 
+ 	if (cq->head != cq->tail)
+-		pci_generate_msix(sc->nsc_pi, 0);
++		pci_nvme_intr(sc, 0);
+ 
+ 	pthread_mutex_unlock(&sq->mtx);
+ }
+@@ -2299,7 +2303,7 @@
+ 
+ 	if (cq->head != cq->tail) {
+ 		if (cq->intr_en & NVME_CQ_INTEN) {
+-			pci_generate_msix(sc->nsc_pi, cq->intr_vec);
++			pci_nvme_intr(sc, cq->intr_vec);
+ 		} else {
+ 			DPRINTF("%s: CQ%u interrupt disabled",
+ 						__func__, sq->cqid);
+@@ -2910,7 +2914,46 @@
+ 
+ 		atomic_store_short(&sc->compl_queues[idx].head,
+ 				(uint16_t)value);
++		/* the guest took entries: the pin may go down */
++		pci_nvme_intx_update(sc);
++	}
++}
++
++/*
++ * The pin (INTx), for a guest that leaves MSI-X off: a level, asserted while a completion queue
++ * with interrupts enabled holds an entry the guest has not taken and INTMS does not mask it
++ * (NVMe base specification, "Pin-based, single MSI and multiple MSI behavior").
++ */
++static void
++pci_nvme_intx_update(struct pci_nvme_softc *sc)
++{
++	struct nvme_completion_queue *cq;
++	bool pending;
++	uint32_t i;
++
++	if (pci_msix_enabled(sc->nsc_pi) || sc->compl_queues == NULL)
++		return;
++	pending = false;
++	for (i = 0; i <= sc->num_cqueues && !pending; i++) {
++		cq = &sc->compl_queues[i];
++		pending = cq->qbase != NULL && (cq->intr_en & NVME_CQ_INTEN) != 0 &&
++		    cq->head != cq->tail;
+ 	}
++	if (pending && (sc->regs.intms & 1) == 0)
++		pci_lintr_assert(sc->nsc_pi);
++	else
++		pci_lintr_deassert(sc->nsc_pi);
++}
++
++/* The interrupt of a completion queue: its MSI-X message, or the pin. */
++static void
++pci_nvme_intr(struct pci_nvme_softc *sc, uint16_t vector)
++{
++
++	if (pci_msix_enabled(sc->nsc_pi))
++		pci_generate_msix(sc->nsc_pi, vector);
++	else
++		pci_nvme_intx_update(sc);
+ }
+ 
+ static void
+@@ -3022,10 +3065,13 @@
+ 		/* readonly */
+ 		break;
+ 	case NVME_CR_INTMS:
+-		/* MSI-X, so ignore */
++		/* MSI-X has its own masks; these two are for the pin */
++		sc->regs.intms |= (uint32_t)value;
++		pci_nvme_intx_update(sc);
+ 		break;
+ 	case NVME_CR_INTMC:
+-		/* MSI-X, so ignore */
++		sc->regs.intms &= ~(uint32_t)value;
++		pci_nvme_intx_update(sc);
+ 		break;
+ 	case NVME_CR_CC:
+ 		ccreg = (uint32_t)value;
+@@ -3370,6 +3416,8 @@
+ 		WPRINTF("%s pci add msixcap failed", __func__);
+ 		goto done;
+ 	}
++	/* and the pin, for a guest without MSI-X (pci_nvme_intx_update()) */
++	pci_lintr_request(pi);
+ 
+ 	error = pci_emul_add_pciecap(pi, PCIEM_TYPE_ROOT_INT_EP);
+ 	if (error) {

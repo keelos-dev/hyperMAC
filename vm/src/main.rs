@@ -179,7 +179,7 @@ fn main() -> anyhow::Result<()> {
             }
             Ok(())
         }
-        _ => anyhow::bail!("usage: hypermac create NAME --ipsw PATH [...] | create NAME --os linux --iso PATH [...] | run NAME [--vnc-port P] | ctl NAME info|stop|kill | ip NAME | net NAME nat|bridged[:IF] | list | serve [--listen ADDR:PORT] | token new [NAME]|list|revoke ID | netd-install (sudo)"),
+        _ => anyhow::bail!("usage: hypermac create NAME --ipsw PATH [...] | create NAME --os linux --iso PATH [...] | run NAME [--vnc-port P] | ctl NAME info|stop|kill|pause|resume|suspend | ip NAME | net NAME nat|bridged[:IF] | list | serve [--listen ADDR:PORT] | token new [NAME]|list|revoke ID | netd-install (sudo)"),
     }
 }
 

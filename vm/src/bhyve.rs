@@ -408,6 +408,10 @@ fn viewer(port: u16) {
 // ---- run ------------------------------------------------------------------------------------
 
 static CHILD: AtomicI32 = AtomicI32::new(0);
+/// ctl "pause": the bhyve process is stopped (SIGSTOP), so the guest's CPUs and devices stand
+/// still and its memory stays. The guest's clock does not stand still (the virtual timer runs
+/// on the Mac's): after "resume" the guest finds that time has passed, as after the Mac slept.
+static PAUSED: AtomicBool = AtomicBool::new(false);
 /// this bhyve run: Enter at the CD's "Press any key to boot from CD or DVD"
 static PRESS_KEY: AtomicBool = AtomicBool::new(false);
 static VNC_PORT: AtomicU16 = AtomicU16::new(0);
@@ -460,10 +464,15 @@ fn arguments(name: &str, dir: &Path, conf: &VmConf, fw: &Path, tty: &str, fb_por
         // Windows keeps the clock in local time
         o("rtc.use_localtime=true".into());
     }
-    if conf.os == "freebsd" {
-        // FreeBSD by the device tree: with our ACPI tables it finds no MSI controller (it
-        // wants an IORT for the GICv2m frame) and cannot attach the disk (docs/bhyve-plan.md, B5)
-        o("acpi_tables=false".into());
+    // (FreeBSD too runs with the ACPI tables: that is where the power button is, so Stop is a
+    // clean shutdown. It finds no MSI controller there (with a GICv3 it knows only the ITS, and
+    // Hypervisor.framework's GIC has none) and uses the devices' legacy interrupts, which the
+    // NVMe disk has since patches/upstream/0022. Until 2026-11-11 FreeBSD VMs ran by the
+    // device tree, where Stop cut the power; they start this way now, their disk is the same.)
+    // HYPERMAC_BHYVE_O="key=value key=value": more -o options, for looking into a problem
+    // (e.g. keel.xhci_trace=true: the xHCI's events and interrupts on stderr, into run.log)
+    for kv in std::env::var("HYPERMAC_BHYVE_O").unwrap_or_default().split_whitespace() {
+        o(kv.to_string());
     }
     let mut s = |v: String| a.extend(["-s".into(), v]);
     s("0,hostbridge".into());
@@ -587,6 +596,7 @@ pub fn run(name: &str, args: &[String], conf: VmConf) -> anyhow::Result<()> {
                 };
                 CHILD.store(child.id() as i32, Ordering::Relaxed);
                 let _ = std::fs::write(dir.join("bhyve.pid"), child.id().to_string());
+                PAUSED.store(false, Ordering::Relaxed);
                 eprintln!("vm started (bhyve pid {}, run {runs})", child.id());
                 let st = child.wait();
                 CHILD.store(0, Ordering::Relaxed);
@@ -665,8 +675,26 @@ pub fn run(name: &str, args: &[String], conf: VmConf) -> anyhow::Result<()> {
                     let _ = std::fs::remove_file(&sock);
                     std::process::exit(0);
                 }
+                cmd @ ("pause" | "resume") => {
+                    let (p, pause) = (CHILD.load(Ordering::Relaxed), cmd == "pause");
+                    if p > 0 && unsafe { libc::kill(p, if pause { libc::SIGSTOP } else { libc::SIGCONT }) } == 0 {
+                        PAUSED.store(pause, Ordering::Relaxed);
+                        eprintln!("vm {}", if pause { "paused" } else { "resumed" });
+                        serde_json::json!({"ok": true})
+                    } else {
+                        serde_json::json!({"error": "bhyve is not running"})
+                    }
+                }
+                "suspend" => serde_json::json!({"error": "suspending to a file is not there yet for machines on the bhyve engine: pause keeps one in memory"}),
                 // the ACPI power button; the process ends when the guest is down
                 "stop" => {
+                    // a stopped process takes no power button
+                    if PAUSED.swap(false, Ordering::Relaxed) {
+                        let p = CHILD.load(Ordering::Relaxed);
+                        if p > 0 {
+                            unsafe { libc::kill(p, libc::SIGCONT) };
+                        }
+                    }
                     on_term(0);
                     serde_json::json!({"ok": true})
                 }
@@ -692,6 +720,8 @@ pub fn run(name: &str, args: &[String], conf: VmConf) -> anyhow::Result<()> {
                     "net": conf.net.clone().unwrap_or("nat".into()),
                     "ip": crate::lease(&conf.mac),
                     "screen": size().map(|(w, h)| format!("{w}x{h}")),
+                    "paused": PAUSED.load(Ordering::Relaxed),
+                    "can_suspend": false,
                 }),
             };
             if writeln!(w, "{r}").is_err() {

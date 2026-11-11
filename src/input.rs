@@ -86,19 +86,40 @@ fn keycode(code: u8, extended: bool) -> Option<u16> {
     })
 }
 
-/// A modifier scancode -> its CGEventFlags bit. Win=Command, Alt=Option (design.md).
-fn modifier(code: u8, extended: bool) -> Option<CGEventFlags> {
+/// A modifier scancode -> (its Mac key code, the device-dependent bit that tells left from
+/// right, its CGEventFlags bit). Win=Command, Alt=Option (design.md).
+fn modifier(code: u8, extended: bool) -> Option<(u16, u64, CGEventFlags)> {
     Some(match (code, extended) {
-        (0x2a, _) | (0x36, _) => CGEventFlags::MaskShift,
-        (0x1d, _) => CGEventFlags::MaskControl,
-        (0x38, _) => CGEventFlags::MaskAlternate,
-        (0x5b, true) | (0x5c, true) => CGEventFlags::MaskCommand,
+        (0x2a, _) => (0x38, 0x02, CGEventFlags::MaskShift),        // left shift
+        (0x36, _) => (0x3c, 0x04, CGEventFlags::MaskShift),        // right shift
+        (0x1d, false) => (0x3b, 0x01, CGEventFlags::MaskControl),  // left control
+        (0x1d, true) => (0x3e, 0x2000, CGEventFlags::MaskControl), // right control
+        (0x38, false) => (0x3a, 0x20, CGEventFlags::MaskAlternate), // left alt -> option
+        (0x38, true) => (0x3d, 0x40, CGEventFlags::MaskAlternate), // right alt -> option
+        (0x5b, true) => (0x37, 0x08, CGEventFlags::MaskCommand),   // left win -> command
+        (0x5c, true) => (0x36, 0x10, CGEventFlags::MaskCommand),   // right win -> command
         _ => return None,
     })
 }
 
+/// Device-dependent modifier bits (NX_DEVICE*KEYMASK) and the generic flag each one implies.
+const DEVICE_BITS: [(u64, CGEventFlags); 8] = [
+    (0x02, CGEventFlags::MaskShift),
+    (0x04, CGEventFlags::MaskShift),
+    (0x01, CGEventFlags::MaskControl),
+    (0x2000, CGEventFlags::MaskControl),
+    (0x20, CGEventFlags::MaskAlternate),
+    (0x40, CGEventFlags::MaskAlternate),
+    (0x08, CGEventFlags::MaskCommand),
+    (0x10, CGEventFlags::MaskCommand),
+];
+
 pub struct Input {
+    /// generic modifier flags plus the device-dependent bits of the modifier keys held down,
+    /// as a real keyboard puts on its events
     flags: CGEventFlags,
+    /// device-dependent bits of the modifier keys held down
+    held: u64,
     buttons: u8, // bit0 left, bit1 right, bit2 middle
     pos: CGPoint,
     /// (vertical px, horizontal px, modifier flags) to the `scroll_pump` thread.
@@ -117,7 +138,7 @@ impl Input {
             .name("scroll-pump".into())
             .spawn(move || scroll_pump(scroll_rx))
             .expect("spawn scroll pump thread");
-        Self { flags: CGEventFlags::empty(), buttons: 0, pos: CGPoint { x: 0.0, y: 0.0 }, scroll_tx, last_down: None, clicks: 1 }
+        Self { flags: CGEventFlags::empty(), held: 0, buttons: 0, pos: CGPoint { x: 0.0, y: 0.0 }, scroll_tx, last_down: None, clicks: 1 }
     }
 
     fn send(&self, ev: Option<objc2_core_foundation::CFRetained<CGEvent>>, what: &str) {
@@ -158,6 +179,35 @@ impl Input {
         }
     }
 
+    /// A modifier key goes down or up: posted as the flags-changed event a real keyboard makes
+    /// (the key's own code, generic + device-dependent flags). Apps that track the modifier
+    /// keys themselves — hyperMAC's VM console, Virtualization.framework's view, games, remote
+    /// desktop clients — see only these events; the flags on the letters alone are not enough.
+    fn modifier_key(&mut self, key: u16, device: u64, down: bool) {
+        if down {
+            self.held |= device;
+        } else {
+            self.held &= !device;
+        }
+        let mut flags = CGEventFlags::empty();
+        for (bit, generic) in DEVICE_BITS {
+            if self.held & bit != 0 {
+                flags |= generic;
+            }
+        }
+        // NX_NONCOALSESCEDMASK (0x100) is on every real keyboard event
+        self.flags = CGEventFlags::from_bits_retain(flags.bits() | self.held | 0x100);
+        let ev = CGEvent::new_keyboard_event(None, key, down);
+        match ev {
+            Some(ev) => unsafe {
+                CGEvent::set_type(Some(&ev), CGEventType::FlagsChanged);
+                CGEvent::set_flags(Some(&ev), self.flags);
+                CGEvent::post(CGEventTapLocation::HIDEventTap, Some(&ev));
+            },
+            None => warn!("CGEvent not made (is Accessibility allowed for the app running hypermac?)"),
+        }
+    }
+
     fn post_mouse(&self, kind: CGEventType, button: CGMouseButton) {
         let ev = CGEvent::new_mouse_event(None, kind, self.pos, button);
         if let Some(ev) = &ev {
@@ -191,10 +241,8 @@ impl RdpServerInputHandler for Input {
             KeyboardEvent::UnicodeReleased(u) => self.type_unicode(u, false),
             KeyboardEvent::Pressed { code, extended } | KeyboardEvent::Released { code, extended } => {
                 let down = matches!(ev, KeyboardEvent::Pressed { .. });
-                if let Some(bit) = modifier(code, extended) {
-                    self.flags.set(bit, down);
-                    // A lone modifier change still needs an event so the OS sees the chord.
-                    self.send(CGEvent::new(None), "flags");
+                if let Some((key, device, _)) = modifier(code, extended) {
+                    self.modifier_key(key, device, down);
                 } else if let Some(key) = keycode(code, extended) {
                     self.virtual_key(key, down);
                 } else {

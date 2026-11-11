@@ -15,6 +15,7 @@ FreeBSD 的 bhyve（head，提交号在 `UPSTREAM`）跑在 macOS 的 Hypervisor
 | `freebsd/` | 上游文件原样，**不手改**。`MANIFEST` 是清单，`./import.sh SRCTOP` 从 FreeBSD 的源码树重新取 |
 | `patches/upstream/` | 对上游文件的改动里打算提给 FreeBSD 的（每个补丁带提交说明） |
 | `patches/macos/` | 只为 macOS 的改动 |
+（另有 `patches/keel/`：我们对 keelOS 生成器输出的改动，`build.sh` 在生成器之后打，`mkpatch.sh keel 名字 文件` 生成。）
 | `compat/` | macOS 缺的头文件和函数，让上游文件不改就能编 |
 | `hvf/` | 我们自己的、只为 macOS 的文件：`vmmapi_hvf.c`（libvmmapi 实现在 Hypervisor.framework 上）、`net_backend_macos.c`（vmnet 网络后端） |
 | `src/` | 我们自己的、和 macOS 无关的文件（可以提上游）：`pflash.c`（存 UEFI 变量的 NOR 闪存）、`acpi_arm64.c` 和 DSDT（arm64 的 ACPI 表） |

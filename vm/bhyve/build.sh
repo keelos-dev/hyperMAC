@@ -35,6 +35,13 @@ keel_gen patch-xhci.py pci_xhci.c	# several interrupters (-o keel.xhci_intrs=N),
 cp "$K/usb_remote.c" "$K/usb_remote.h" "$N/"	# remote USB devices on the xHCI's free ports (-o keel.usb_sock=PATH)
 cp "$K/pci_virtio_gpu.c" "$K/pci_virtio_gpu.h" "$N/"	# virtio-gpu 2D, the picture in a shared memory object
 
+# Our own changes to what the generators made (patches/keel): they apply to keelOS's text, so
+# they come last. mkpatch.sh keel NAME FILE makes one.
+for p in $(ls patches/keel/*.patch 2>/dev/null); do
+	patch -d build/src.new -p1 -s -N --no-backup-if-mismatch < "$p" ||
+	    { echo "build.sh: $p does not apply" >&2; exit 1; }
+done
+
 # (no -t: a file that is replaced gets the current time, so it is newer than its object file even when
 # the replacement is the older, unedited text)
 rsync -rlp --checksum --delete build/src.new/ build/src/

@@ -290,12 +290,28 @@ fn vm_row(vm: &Vm) -> Retained<NSView> {
             // the VM's own process opens the window
             let _ = ctl_request(&n, "console");
         })));
+        // pause: the machine stands still in memory. suspend (where the engine can): its memory
+        // goes to a file, the process ends, the next start goes on from there
+        let paused = info.get("paused").and_then(|v| v.as_bool()).unwrap_or(false);
+        let n = name.clone();
+        ctl.push(as_view(&button(if paused { t("继续", "Resume") } else { t("暂停", "Pause") }, move || {
+            let _ = ctl_request(&n, if paused { "resume" } else { "pause" });
+            render();
+        })));
+        if info.get("can_suspend").and_then(|v| v.as_bool()).unwrap_or(false) {
+            let n = name.clone();
+            ctl.push(as_view(&button(t("挂起", "Suspend"), move || {
+                let _ = ctl_request(&n, "suspend");
+                render();
+            })));
+        }
         let n = name.clone();
         ctl.push(as_view(&button(t("停止…", "Stop…"), move || stop(&n))));
         let net = if bridged { t("桥接", "bridged") } else { "NAT" };
+        let running = if paused { t("已暂停", "Paused") } else { t("运行中", "Running") };
         let state = match ip {
-            Some(ip) => format!("{} · {ip}（{net}）", t("运行中", "Running")),
-            None => format!("{} · {}（{net}）", t("运行中", "Running"), t("还没有地址", "no address yet")),
+            Some(ip) => format!("{running} · {ip}（{net}）"),
+            None => format!("{running} · {}（{net}）", t("还没有地址", "no address yet")),
         };
         (state, ctl)
     } else if starting {
@@ -328,8 +344,16 @@ fn vm_row(vm: &Vm) -> Retained<NSView> {
         let n5 = name.clone();
         ctl.push(as_view(&button(t("编辑…", "Edit…"), move || edit_vm(&n5))));
         ctl.push(as_view(&button(t("删除…", "Delete…"), move || delete(&n2))));
-        ctl.push(as_view(&button(t("启动", "Start"), move || start(&n3))));
-        let state = if has_iso { t("已停止 · 插着安装盘", "Stopped · installer attached") } else { t("已停止", "Stopped") };
+        // suspended: its memory is in a file; Start goes on from there (vm/src/vm.rs SAVED)
+        let suspended = vm_dir(&name).join("suspend.vzvmsave").exists();
+        ctl.push(as_view(&button(if suspended { t("继续", "Resume") } else { t("启动", "Start") }, move || start(&n3))));
+        let state = if suspended {
+            t("已挂起", "Suspended")
+        } else if has_iso {
+            t("已停止 · 插着安装盘", "Stopped · installer attached")
+        } else {
+            t("已停止", "Stopped")
+        };
         (state.to_string(), ctl)
     };
     let refs: Vec<&NSView> = controls.iter().map(|v| &**v).collect();

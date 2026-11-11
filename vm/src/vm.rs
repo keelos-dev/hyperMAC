@@ -28,6 +28,10 @@ unsafe impl<T> Sync for OnMain<T> {}
 
 static VNC_PORT: AtomicU16 = AtomicU16::new(0);
 static WAS_RUNNING: AtomicBool = AtomicBool::new(false);
+/// paused by ctl "pause" (the guest's CPUs stand still, its memory stays)
+static PAUSED: AtomicBool = AtomicBool::new(false);
+/// where a suspended VM's memory and devices are kept (ctl "suspend"; `run` starts from it)
+pub const SAVED: &str = "suspend.vzvmsave";
 
 fn url(p: &Path) -> Retained<NSURL> {
     NSURL::fileURLWithPath(&NSString::from_str(&p.to_string_lossy()))
@@ -421,15 +425,53 @@ pub fn run(name: &str, args: &[String]) -> anyhow::Result<()> {
         "linux" | "windows" => config_linux(&dir, &conf, opt(args, "--iso").or(conf.iso.as_deref()))?,
         os => anyhow::bail!("vm.json: os {os:?}?"),
     };
+    // Can this machine be suspended to a file (Virtualization.framework saves the memory and
+    // the devices)? Asked of the framework for this very configuration.
+    let can_suspend = unsafe { cfg.validateSaveRestoreSupportWithError() }.is_ok();
     let vm = unsafe { VZVirtualMachine::initWithConfiguration(VZVirtualMachine::alloc(), &cfg) };
-    let started = RcBlock::new(|e: *mut NSError| match unsafe { e.as_ref() } {
-        Some(e) => die(anyhow!("start failed: {}", e.localizedDescription())),
-        None => {
-            WAS_RUNNING.store(true, Ordering::Relaxed);
-            eprintln!("vm started");
-        }
-    });
-    unsafe { vm.startWithCompletionHandler(&started) };
+    let saved = dir.join(SAVED);
+    if saved.exists() {
+        // suspended: go on from the file. It is used once: gone when read, and when it cannot
+        // be read (another macOS since, the configuration changed) the VM starts cold.
+        eprintln!("resuming from {}", saved.display());
+        let (vm2, saved2) = (OnMain(vm.clone()), saved.clone());
+        let restored = RcBlock::new(move |e: *mut NSError| {
+            let _ = std::fs::remove_file(&saved2);
+            match unsafe { e.as_ref() } {
+                Some(e) => {
+                    eprintln!("the suspended state cannot be used ({}): starting the machine instead", e.localizedDescription());
+                    let started = RcBlock::new(|e: *mut NSError| match unsafe { e.as_ref() } {
+                        Some(e) => die(anyhow!("start failed: {}", e.localizedDescription())),
+                        None => {
+                            WAS_RUNNING.store(true, Ordering::Relaxed);
+                            eprintln!("vm started");
+                        }
+                    });
+                    unsafe { vm2.0.startWithCompletionHandler(&started) };
+                }
+                None => {
+                    let resumed = RcBlock::new(|e: *mut NSError| match unsafe { e.as_ref() } {
+                        Some(e) => die(anyhow!("resume failed: {}", e.localizedDescription())),
+                        None => {
+                            WAS_RUNNING.store(true, Ordering::Relaxed);
+                            eprintln!("vm resumed");
+                        }
+                    });
+                    unsafe { vm2.0.resumeWithCompletionHandler(&resumed) };
+                }
+            }
+        });
+        unsafe { vm.restoreMachineStateFromURL_completionHandler(&url(&saved), &restored) };
+    } else {
+        let started = RcBlock::new(|e: *mut NSError| match unsafe { e.as_ref() } {
+            Some(e) => die(anyhow!("start failed: {}", e.localizedDescription())),
+            None => {
+                WAS_RUNNING.store(true, Ordering::Relaxed);
+                eprintln!("vm started");
+            }
+        });
+        unsafe { vm.startWithCompletionHandler(&started) };
+    }
 
     // our own virtio-gpu/input (HYPERMAC_VIRTIO=1): our own VNC server (rfb.rs); VZ's only
     // serves VZ's graphics and USB HID
@@ -570,30 +612,67 @@ pub fn run(name: &str, args: &[String]) -> anyhow::Result<()> {
                         Ok(v) => v,
                         Err(e) => serde_json::json!({"error": e.to_string()}),
                     },
-                    // freeze / thaw the guest (e.g. at a bugcheck, to read its memory at leisure)
-                    "pause" | "resume" => {
-                        let (vm, pause) = (vm.clone(), line.trim() == "pause");
-                        DispatchQueue::main().exec_async(move || {
-                            let done = RcBlock::new(|e: *mut NSError| {
-                                if let Some(e) = unsafe { e.as_ref() } {
-                                    eprintln!("pause/resume: {}", e.localizedDescription());
-                                }
-                            });
-                            unsafe {
-                                if pause {
-                                    vm.0.pauseWithCompletionHandler(&done)
-                                } else {
-                                    vm.0.resumeWithCompletionHandler(&done)
-                                }
-                            }
-                        });
-                        serde_json::json!({"ok": true})
-                    }
                     // our VNC server in the Mac's Screen Sharing (own_devices)
                     "vnc" => {
                         open_vnc_console(&vnc_password);
                         serde_json::json!({"ok": true})
                     }
+                    // the CPUs stand still, the memory stays; "resume" goes on
+                    cmd @ ("pause" | "resume") => {
+                        let (vm, pause) = (vm.clone(), cmd == "pause");
+                        DispatchQueue::main().exec_async(move || {
+                            let done = RcBlock::new(move |e: *mut NSError| match unsafe { e.as_ref() } {
+                                Some(e) => eprintln!("{}: {}", if pause { "pause" } else { "resume" }, e.localizedDescription()),
+                                None => {
+                                    PAUSED.store(pause, Ordering::Relaxed);
+                                    eprintln!("vm {}", if pause { "paused" } else { "resumed" });
+                                }
+                            });
+                            unsafe {
+                                if pause { vm.0.pauseWithCompletionHandler(&done) } else { vm.0.resumeWithCompletionHandler(&done) }
+                            }
+                        });
+                        serde_json::json!({"ok": true})
+                    }
+                    // to a file and out: the memory goes back to the Mac; the next `run` goes on
+                    // from the file
+                    "suspend" if can_suspend => {
+                        let (vm, saved, sock) = (vm.clone(), dir.join(SAVED), sock.clone());
+                        DispatchQueue::main().exec_async(move || {
+                            let (vm2, saved2, sock2) = (vm.clone(), saved.clone(), sock.clone());
+                            let save = move || {
+                                let (vm3, saved3, sock3) = (vm2.clone(), saved2.clone(), sock2.clone());
+                                let done = RcBlock::new(move |e: *mut NSError| match unsafe { e.as_ref() } {
+                                    Some(e) => {
+                                        eprintln!("suspend: {}", e.localizedDescription());
+                                        let _ = std::fs::remove_file(&saved3);
+                                        let again = RcBlock::new(|_e: *mut NSError| PAUSED.store(false, Ordering::Relaxed));
+                                        unsafe { vm3.0.resumeWithCompletionHandler(&again) };
+                                    }
+                                    None => {
+                                        eprintln!("vm suspended to {}", saved3.display());
+                                        let _ = std::fs::remove_file(&sock3);
+                                        std::process::exit(0);
+                                    }
+                                });
+                                unsafe { vm2.0.saveMachineStateToURL_completionHandler(&url(&saved2), &done) };
+                            };
+                            if PAUSED.load(Ordering::Relaxed) {
+                                save();
+                            } else {
+                                let paused = RcBlock::new(move |e: *mut NSError| match unsafe { e.as_ref() } {
+                                    Some(e) => eprintln!("suspend: pause: {}", e.localizedDescription()),
+                                    None => {
+                                        PAUSED.store(true, Ordering::Relaxed);
+                                        save();
+                                    }
+                                });
+                                unsafe { vm.0.pauseWithCompletionHandler(&paused) };
+                            }
+                        });
+                        serde_json::json!({"ok": true})
+                    }
+                    "suspend" => serde_json::json!({"error": "this machine cannot be suspended to a file (Virtualization.framework: its devices do not support it)"}),
                     "stop" => {
                         // the guest's shutdown dialog / ACPI-style request; the process exits when it is down
                         let vm = vm.clone();
@@ -612,6 +691,8 @@ pub fn run(name: &str, args: &[String]) -> anyhow::Result<()> {
                         "mac": conf.mac,
                         "net": conf.net.clone().unwrap_or("nat".into()),
                         "ip": crate::guest_ip(&conf),
+                        "paused": PAUSED.load(Ordering::Relaxed),
+                        "can_suspend": can_suspend,
                         // bridged only: frames relayed each way, and what was lost (vmnet.rs)
                         "net_stats": {
                             "to_guest": crate::vmnet::TO_GUEST.load(Ordering::Relaxed),
