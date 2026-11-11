@@ -30,6 +30,7 @@ mod ui;
 mod update;
 mod video;
 mod vms;
+mod vmsound;
 mod web;
 
 use std::net::SocketAddr;
@@ -653,6 +654,7 @@ async fn serve() -> anyhow::Result<()> {
     info!(id = screen.id, w = screen.width, h = screen.height, "primary display");
 
     let listener = TcpListener::bind(a.listen).await.with_context(|| format!("listen on {}", a.listen))?;
+    no_app_nap();
     info!("listening on {}", a.listen);
 
     // The keelOS-host face (web.rs): kRDPclient adds this address like a keelOS host and
@@ -768,6 +770,9 @@ async fn serve() -> anyhow::Result<()> {
                 // and stays on EGFX. The app's switch (settings.rs) or MACRDP_VIDEO=0 turns it off.
                 // It also carries kRDPclient's sound switch (SOUND) to this connection's sound.
                 let video = settings::on(&state, "video", "MACRDP_VIDEO").then(|| video::Video::new(offers.clone(), sound.clone()));
+                if let Some((v, _)) = &video {
+                    v.set_lan(video::is_lan(peer.ip()));
+                }
                 let refresh = std::sync::Arc::new(std::sync::atomic::AtomicU32::new(0));
                 let builder = RdpServer::builder()
                     .with_addr(listen)
@@ -781,11 +786,11 @@ async fn serve() -> anyhow::Result<()> {
                         mac: display::Display::new(
                             screen,
                             video.as_ref().map(|(v, _)| v.clone()),
-                            sound,
+                            sound.clone(),
                             // "mute the Mac while remote" (tap.rs), its own switch, read live
                             tap::MuteSwitch(state.to_path_buf()),
                         ),
-                        vm: vms::VmDisplay::new(vm_slot.clone(), refresh.clone()),
+                        vm: vms::VmDisplay::new(vm_slot.clone(), refresh.clone(), video.as_ref().map(|(v, _)| v.clone()), sound),
                         on_vm: None,
                     })
                     .with_credential_validator(Some(Arc::new(login)))
@@ -793,7 +798,7 @@ async fn serve() -> anyhow::Result<()> {
                     .with_sound_factory(sound_factory)
                     // the clipboard, text both ways (clip.rs); the app's switch or MACRDP_CLIP=0 turns it off
                     .with_cliprdr_factory(settings::on(&state, "clip", "MACRDP_CLIP").then(|| {
-                        let (_clip, factory) = clip::Clip::new();
+                        let (_clip, factory) = clip::Clip::new(peer.ip());
                         Box::new(factory) as Box<dyn ironrdp_server::CliprdrServerFactory>
                     }));
                 // MS-RDPEUDP2 reliable UDP beside TCP (keel-rdp, keelOS docs/71 §4.9.1): the
@@ -860,4 +865,22 @@ async fn serve() -> anyhow::Result<()> {
             });
         });
     }
+}
+
+/// The service is not to be napped: it has no window, and macOS (App Nap) then lowers its
+/// priority and stretches its timers: a VM's picture went out at 35 frames a second instead of
+/// the 54 it got, twenty minutes after the start (2026-11-11; the VM program does the same,
+/// vm/src/main.rs). The Mac may still go to sleep when idle.
+fn no_app_nap() {
+    use objc2::rc::Retained;
+    use objc2::runtime::AnyObject;
+    use objc2::{class, msg_send};
+    // NSActivityUserInitiatedAllowingIdleSystemSleep | NSActivityLatencyCritical
+    let options: u64 = 0x00EF_FFFF | 0xFF_0000_0000;
+    let reason = objc2_foundation::NSString::from_str("remote desktop sessions are served");
+    let token: Option<Retained<AnyObject>> = unsafe {
+        let info: *mut AnyObject = msg_send![class!(NSProcessInfo), processInfo];
+        msg_send![info, beginActivityWithOptions: options, reason: &*reason]
+    };
+    std::mem::forget(token); // for as long as the process lives
 }

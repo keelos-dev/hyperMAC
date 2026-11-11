@@ -25,6 +25,13 @@ use objc2_foundation::{NSPoint, NSRect, NSSize, NSString};
 
 /// the window wants frames (it is open)
 static SHOWN: AtomicBool = AtomicBool::new(false);
+/// The window is open (someone is at this VM on this Mac).
+pub fn shown() -> bool {
+    SHOWN.load(Ordering::Relaxed)
+}
+
+/// wheel movement not yet sent to the guest (less than a notch)
+static WHEEL: Mutex<f64> = Mutex::new(0.0);
 /// a frame is queued on the main thread and not drawn yet: skip, don't pile up
 static QUEUED: AtomicBool = AtomicBool::new(false);
 static PUMP: std::sync::Once = std::sync::Once::new();
@@ -79,6 +86,20 @@ define_class!(
         }
         #[unsafe(method(mouseEntered:))]
         fn mouse_entered(&self, _e: &NSEvent) {}
+        #[unsafe(method(scrollWheel:))]
+        fn scroll_wheel(&self, e: &NSEvent) {
+            // a trackpad gives points (about 30 to a notch), a wheel mouse gives lines; what
+            // is less than a notch is kept for the next event
+            let d = if e.hasPreciseScrollingDeltas() { e.scrollingDeltaY() / 30.0 } else { e.scrollingDeltaY() };
+            let mut acc = WHEEL.lock().unwrap();
+            *acc += d;
+            let steps = acc.trunc();
+            if steps != 0.0 {
+                *acc -= steps;
+                self.pointer(e, None);
+                crate::vinput::wheel(steps as i32);
+            }
+        }
         #[unsafe(method(mouseDragged:))]
         fn mouse_dragged(&self, e: &NSEvent) {
             self.pointer(e, None);
@@ -276,9 +297,25 @@ pub fn open(title: &str) {
 /// ~30 fps: a new scanout frame -> the view's layer (on the main thread).
 fn pump() {
     let mut last = None;
+    let mut tick = 0u32;
     loop {
         std::thread::sleep(std::time::Duration::from_millis(33));
-        if !SHOWN.load(Ordering::Relaxed) || QUEUED.load(Ordering::Relaxed) {
+        if !SHOWN.load(Ordering::Relaxed) {
+            continue;
+        }
+        // Closed? Asked here a few times a second, not only when a frame is drawn (show): a
+        // still screen draws none, and the guest's sound (sound.rs) plays while SHOWN says so.
+        tick = tick.wrapping_add(1);
+        if tick % 8 == 0 {
+            DispatchQueue::main().exec_async(|| {
+                CONSOLE.with(|c| {
+                    if !c.borrow().as_ref().is_some_and(|(window, _)| window.isVisible()) {
+                        SHOWN.store(false, Ordering::Relaxed);
+                    }
+                })
+            });
+        }
+        if QUEUED.load(Ordering::Relaxed) {
             continue;
         }
         let Some((n, w, h, pix)) = crate::vgpu::snapshot(last) else { continue };

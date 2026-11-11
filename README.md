@@ -10,8 +10,9 @@ hyperMAC does two things, and they fit together:
 
 1. **A hypervisor.** macOS, Windows 11 ARM, Linux and FreeBSD guests on Apple Silicon. Windows and
    FreeBSD run on **bhyve**, FreeBSD's hypervisor, ported to Apple's Hypervisor.framework: as far
-   as we know the first bhyve on Apple Silicon. macOS and Linux guests run on Apple's own
-   Virtualization.framework.
+   as we know the first bhyve on Apple Silicon, and the first bhyve anywhere to give a Windows
+   guest 3D acceleration without handing it a real graphics card (Direct3D 11, drawn by the
+   Mac's GPU). macOS and Linux guests run on Apple's own Virtualization.framework.
 2. **An RDP server.** Your Mac's own desktop and its virtual machines are reachable with plain RDP:
    Windows' built-in `mstsc` connects with nothing to install. A Mac mini in a closet becomes a
    Windows-and-Mac server you use from any PC.
@@ -62,7 +63,7 @@ Apple**, and it installs by itself. Linux and FreeBSD: point it at the distribut
 
 | Guest | Engine | How it installs | State |
 |---|---|---|---|
-| **Windows 11 ARM** | bhyve on Hypervisor.framework | Microsoft's ISO: by hand, or unattended | TPM 2.0, Secure Boot, network, 1920x1080, Windows Update |
+| **Windows 11 ARM** | bhyve on Hypervisor.framework | Microsoft's ISO: by hand, or unattended | TPM 2.0, Secure Boot, network, 1920x1080, Windows Update, sound, 3D acceleration (Direct3D 11, opt-in) |
 | **macOS** | Virtualization.framework | by itself, from Apple's restore image (downloaded for you) | graphics acceleration (Apple's paravirtual GPU), smooth |
 | **Linux** (arm64) | Virtualization.framework | the distribution's ISO | Fedora tested |
 | **FreeBSD** (arm64) | bhyve on Hypervisor.framework | the release's ISO | 15.1 tested |
@@ -79,10 +80,28 @@ welcome as an issue.
 | What runs the guest | bhyve on Hypervisor.framework; Apple VZ | QEMU; Apple VZ | its own | its own | its own |
 | Windows 11 ARM | ✅ | ✅ | ✅ | ✅ | ✅ (7.2 and later) |
 | macOS guests | ✅ | ✅ | ✅ | ❌ | ❌ |
-| 3D acceleration in Windows | ❌ not yet | ❌ | ✅ | ✅ | ❌ |
+| 3D acceleration in Windows | ✅ Direct3D 11 (new, opt-in) | ✅ Direct3D 11, and 12 where Apple's D3DMetal is there (5.0.8) | ✅ DirectX 11.1, OpenGL 4.3 | ✅ DirectX 11 | experimental (7.2) |
+| Games in Windows | Direct3D 11 titles; numbers below | Direct3D 11 and 12 titles | Direct3D 11 titles; the longest record with games | Direct3D 11 titles | not something to count on yet |
+| The game's picture and sound on another PC | ✅ RDP, H.264 at 60 fps, sound | ❌ | ❌ | ❌ | ❌ |
 | RDP to the Mac's own desktop and to the VMs | ✅ built in (a macOS guest runs hyperMAC itself) | ❌ | ❌ | ❌ | VMs only (VRDE) |
 
-Honestly: if you need games or 3D in Windows, Parallels is ahead and will be for a while. If you
+Games: Direct3D 11 titles run, with sound. Measured with Unigine Heaven 4.0 (Direct3D 11; an
+x64 program, so Windows translates it) on a Mac mini M4 with 16 GB, the guest with 4 cores and
+8 GB, 2026-11-11, the whole benchmark run:
+
+| Heaven 4.0 | Score | Average | Lowest | Highest |
+|---|---|---|---|---|
+| 1920x1080 full screen, 2x anti-aliasing, quality High, tessellation off | 1967 | 78.1 fps | 12.9 | 173.5 |
+
+Seen from another PC in kRDPclient during that run: 1920x1080 H.264 at 64 fps, 11.6 Mbps, no
+frame skipped, the guest's sound as Opus.
+
+Honestly, though: this is new, and one benchmark and a browser are what has been tried. Every
+program in the table can run Direct3D 11 games on Apple Silicon by now; UTM (whose author wrote
+the guest driver used here) also does Direct3D 12, and Parallels has years of work on game
+compatibility behind it. No Direct3D 12, OpenGL or Vulkan here, and games with kernel anti-cheat
+do not start in a virtual machine. What only hyperMAC does is put that game on another PC's
+screen, with its sound. If you
 want Windows 11 for Office, a browser, development tools or that one Windows-only program, on a
 Mac that may not even have a screen attached, and you would rather not pay every year for it:
 this is for you.
@@ -180,8 +199,16 @@ kRDPclient before judging hyperMAC.
 ## What is rough
 
 - **This is young.** The virtual machine part is brand new. Keep copies of anything important.
-- No graphics acceleration in Windows (the basic display driver, up to 1920x1200) and no sound
-  from virtual machines yet.
+- 3D acceleration in Windows is new and off unless asked for: add `"gpu3d": true` to the VM's
+  `vm.json` (there is no switch in the app yet). It is Direct3D 11: the desktop, Edge and WebGL
+  use it, and so do Direct3D 11 games (Unigine Heaven 4.0, 1920x1080 full screen, 2x
+  anti-aliasing: 78 fps on average on a Mac mini M4; WebGL Aquarium, 500 fish: 57 fps at 1024x768 on
+  a MacBook Air M4). Anti-aliasing goes up to 4x (what the Mac's GPU has): a game asking for 8x
+  says it cannot set the video mode. No Direct3D 12, OpenGL or Vulkan. Without it Windows has
+  the basic display driver, up to 1920x1200.
+- Sound from virtual machines: Windows only. It plays on the Mac while the VM's window is open,
+  and goes to kRDPclient when that is connected to the VM (new). macOS, Linux and
+  FreeBSD guests have no sound yet.
 - Bridged networking, sleep/wake and long uptimes are not tested enough.
 - The firmware's Secure Boot keeps its keys where the guest's kernel could reach them (the EDK2
   platform has no protected variable store): enough for Windows' requirements, not the strength
@@ -200,6 +227,11 @@ the arm64 story:
 - What arm64 bhyve did not have and Windows needs: **UEFI** (EDK2), **ACPI** tables, a CFI flash
   for UEFI variables, QEMU's fw_cfg and ramfb, the **virtio 1.0** transport, a **TPM** (libtpms
   inside the process), Secure Boot.
+- **3D for Windows guests**, which bhyve never had short of passing a whole graphics card
+  through: a virtio-gpu 3D device (`vm/bhyve/hvf/pci_virtio_gpu_3d.c`) that carries the guest's
+  Direct3D 11 calls to the Mac's GPU. It stands on other people's work: the guest's driver is
+  Triton and the host's side is virglrenderer's Neptune, both from UTM's author, and DXMT turns
+  Direct3D 11 into Metal. As far as we know this is the first time they run under bhyve.
 - Eighteen of the patches are written for FreeBSD review, bugs found on the way included
   (`vm/bhyve/patches/REVIEW.md`). Nothing has been submitted yet.
 

@@ -34,6 +34,8 @@ keel_gen patch-usbemul.py usb_emul.h	# asynchronous USB devices, 256 blocks per 
 keel_gen patch-xhci.py pci_xhci.c	# several interrupters (-o keel.xhci_intrs=N), control transfer and LINK TRB fixes, remote ports
 cp "$K/usb_remote.c" "$K/usb_remote.h" "$N/"	# remote USB devices on the xHCI's free ports (-o keel.usb_sock=PATH)
 cp "$K/pci_virtio_gpu.c" "$K/pci_virtio_gpu.h" "$N/"	# virtio-gpu 2D, the picture in a shared memory object
+# the HD Audio card whose output goes into a ring another process reads ("-s N,hda,play=keel:PATH")
+cp "$K/audio.c" "$K/audio.h" "$K/hda_codec.c" "$K/pci_hda.c" "$K/pci_hda.h" "$N/"
 
 # Our own changes to what the generators made (patches/keel): they apply to keelOS's text, so
 # they come last. mkpatch.sh keel NAME FILE makes one.

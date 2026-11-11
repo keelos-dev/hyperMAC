@@ -219,6 +219,17 @@ pub struct Video {
     offers: Option<Offers>,
     /// this connection's RDPSND (sound.rs), for the client's SOUND switch; None: sound is off
     sound: Option<crate::sound::Sound>,
+    /// the client is on the local network (set_lan): the high frame rate
+    lan: Arc<AtomicBool>,
+}
+
+/// An address of the local network: private, link-local or this Mac itself. (A VPN that hands
+/// out private addresses counts too; one on 100.64/10, as Tailscale's, does not.)
+pub fn is_lan(ip: std::net::IpAddr) -> bool {
+    match ip.to_canonical() {
+        std::net::IpAddr::V4(a) => a.is_private() || a.is_loopback() || a.is_link_local(),
+        std::net::IpAddr::V6(a) => a.is_loopback() || a.segments()[0] & 0xfe00 == 0xfc00 || a.segments()[0] & 0xffc0 == 0xfe80,
+    }
 }
 
 pub struct Factory(Video);
@@ -233,6 +244,23 @@ impl Video {
     /// v2: the second connection is up and verified (main.rs): FRAMEs go through `tx` from
     /// the client's TRANSPORT_READY on; the next frame is a keyframe (§4.8.1: a change of line
     /// always starts with one).
+    /// The client is on the local network (user 2026-11-11: "本地LAN的话，就可以上高刷").
+    pub fn set_lan(&self, lan: bool) {
+        self.lan.store(lan, Ordering::Relaxed);
+    }
+
+    /// Frames a second for this connection: 60 on the local network, else capture::fps()'s 30
+    /// (a WAN's jitter is as long as a 60 fps frame). MACRDP_FPS, when set, is it for both.
+    pub fn fps(&self) -> i32 {
+        if std::env::var_os("MACRDP_FPS").is_none() && self.lan.load(Ordering::Relaxed) { 60 } else { crate::capture::fps() }
+    }
+
+    /// The H.264 bit rate: 6 Mbps is 1080p30 over a home uplink; twice the frames on the local
+    /// network get twice the bits. MACRDP_VIDEO_KBPS, when set, is it for both.
+    pub fn kbps(&self) -> u32 {
+        std::env::var("MACRDP_VIDEO_KBPS").ok().and_then(|s| s.parse().ok()).unwrap_or(if self.fps() > 30 { 12_000 } else { 6_000 })
+    }
+
     pub fn attach_transport(&self, session: u32, tx: UnboundedSender<Vec<u8>>) -> bool {
         let mut s = self.state.lock().unwrap();
         if s.session != Some(session) {
@@ -323,7 +351,7 @@ impl Video {
             s.keyframe = true;
             drop(s);
             // fps_hint = the capture ceiling actually in force (MACRDP_FPS), not a constant
-            let hint = crate::capture::fps() as u16;
+            let hint = self.fps() as u16;
             self.send(vec![message(START, &start_body(id, CODEC_H264, w as u16, h as u16, hint))]);
             s = self.state.lock().unwrap();
         }

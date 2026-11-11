@@ -249,6 +249,12 @@ static LAST_ABS: Mutex<Option<(f64, f64)>> = Mutex::new(None);
 /// buttons held down (bit per button)
 static BUTTONS: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(0);
 
+/// The wheel, `steps` notches (up when positive). Only the bhyve engine's tablet has one; our
+/// virtio pointer for Virtualization.framework guests does not yet.
+pub fn wheel(steps: i32) -> u64 {
+    if crate::bhyve::active() { crate::bhyve::wheel(steps) } else { 0 }
+}
+
 pub fn button(b: u16, down: bool) -> u64 {
     // the bhyve engine has its own devices (bhyve.rs)
     if crate::bhyve::active() {

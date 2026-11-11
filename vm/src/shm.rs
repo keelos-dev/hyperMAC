@@ -85,7 +85,8 @@ pub fn export(dir: &Path) -> anyhow::Result<()> {
     std::thread::spawn(move || {
         let mut last = None;
         loop {
-            std::thread::sleep(std::time::Duration::from_millis(16));
+            // (twice a 60 Hz frame: a poll that just misses a frame costs half of one, not a whole)
+            std::thread::sleep(std::time::Duration::from_millis(8));
             if !s.wanted() {
                 last = None; // a new reader gets a whole frame at once
                 continue;

@@ -11,6 +11,7 @@ Copies of files from keelOS's bhyve (keelOS `root/bhyve`, commit `db60789fb881fa
 | `patch-xhci.py` | several interrupters (`-o keel.xhci_intrs=N`), control transfer and LINK TRB fixes, remote ports |
 | `usb_remote.c`, `usb_remote.h` | remote USB devices on the xHCI's free ports (`-o keel.usb_sock=PATH`) |
 | `pci_virtio_gpu.c`, `pci_virtio_gpu.h` | virtio-gpu 2D, the picture in a shared memory object |
+| `audio.c`, `audio.h`, `hda_codec.c`, `pci_hda.c`, `pci_hda.h` | the HD Audio card (`-s N,hda,play=keel:PATH`): what the guest plays goes into a ring another process reads (16-bit stereo; layout in `audio.h`). They replace FreeBSD's files whole. From keelOS `root/bhyve/hda` at commit `19e813ff01a4c679b7c649970bdb7668be23df30`; `patches/keel/0003` lets the ring be a file |
 
 The `.py` files are generators: each takes FreeBSD's source file and prints keelOS's, changing it at
 anchors (pieces of the original text) and stopping when one is gone, so they say at once when a new

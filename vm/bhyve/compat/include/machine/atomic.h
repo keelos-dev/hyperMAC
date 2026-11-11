@@ -6,6 +6,8 @@
 
 #define	atomic_load_32(p)	__atomic_load_n((uint32_t *)(p), __ATOMIC_SEQ_CST)
 #define	atomic_load_64(p)	__atomic_load_n((uint64_t *)(p), __ATOMIC_SEQ_CST)
+#define	atomic_store_rel_32(p, v)	__atomic_store_n((uint32_t *)(p), (v), __ATOMIC_SEQ_CST)
+#define	atomic_store_rel_64(p, v)	__atomic_store_n((uint64_t *)(p), (v), __ATOMIC_SEQ_CST)
 #define	atomic_load_acq_short(p) __atomic_load_n((unsigned short *)(p), __ATOMIC_SEQ_CST)
 #define	atomic_store_short(p, v) __atomic_store_n((unsigned short *)(p), (v), __ATOMIC_SEQ_CST)
 #define	atomic_store_rel_short(p, v) __atomic_store_n((unsigned short *)(p), (v), __ATOMIC_SEQ_CST)

@@ -31,7 +31,25 @@ SRCS := $(addprefix $(B)/,$(BHYVE_SRCS)) $(addprefix $(B)/aarch64/,$(BHYVE_MD_SR
 	$(addprefix $(S)/sys/contrib/libnv/,nvlist.c bsd_nvpair.c cnvlist.c dnvlist.c) \
 	$(S)/lib/libnv/msgio.c \
 	$(addprefix $(S)/lib/libutil/,expand_number.c hexdump.c cpuset.c) \
-	$(wildcard compat/src/*.c) $(wildcard hvf/*.c) $(filter-out src/tpm_emul_libtpms.c,$(wildcard src/*.c))
+	$(wildcard compat/src/*.c) $(filter-out hvf/pci_virtio_gpu_3d.c,$(wildcard hvf/*.c)) \
+	$(filter-out src/tpm_emul_libtpms.c,$(wildcard src/*.c))
+
+# virtio-gpu 3D (hvf/pci_virtio_gpu_3d.c): Direct3D for Windows guests through virglrenderer
+# (UTM's fork with Neptune, MIT), a shared library beside bhyve. VIRGL=PREFIX names its install;
+# without it bhyve builds with the 2D virtio-gpu only. gpu3d.sh builds all of it and calls this
+# with GPU3D_LIB: the library's copy in build/gpu3d, which bhyve-3d then finds beside itself.
+VIRGL ?=
+GPU3D_LIB ?= $(VIRGL)/lib/libvirglrenderer.1.dylib
+ifneq ($(wildcard $(VIRGL)/include/virgl/virglrenderer.h),)
+SRCS += hvf/pci_virtio_gpu_3d.c
+VIRGL_INC := -I$(VIRGL)/include/virgl -DKEEL_VTGPU_3D
+# (beside bhyve-3d, or in hyperMAC.app: programs in Contents/MacOS, this folder in Contents/Resources)
+VIRGL_LIBS := $(GPU3D_LIB) -Wl,-rpath,@executable_path/gpu3d -Wl,-rpath,@executable_path/../Resources/gpu3d
+# its own objects and its own name: the flags differ, and build/bhyve stays the 2D one
+O := build/obj-3d
+OUT := build/bhyve-3d
+endif
+OUT ?= build/bhyve
 
 # The TPM of a Windows guest inside this process: libtpms (BSD-3-Clause) and the libcrypto it
 # needs (OpenSSL, Apache-2.0), both linked statically so that bhyve stays one file with nothing to
@@ -50,7 +68,7 @@ OBJS := $(patsubst %.c,$(O)/%.o,$(SRCS))
 INC := -include compat/include/bhyve_macos.h -Icompat/include -Ibuild/include \
 	-I$(S)/sys -I$(S)/sys/contrib/libfdt -I$(S)/sys/contrib/libnv -I$(S)/lib/libnv \
 	-I$(S)/sys/dev/e1000 -I$(S)/sys/dev/mii -I$(S)/sys/dev/usb/controller \
-	-I$(S)/lib/libvmmapi -I$(B) -I$(B)/aarch64 -Ihvf -Isrc $(TPM_INC)
+	-I$(S)/lib/libvmmapi -I$(B) -I$(B)/aarch64 -Ihvf -Isrc $(TPM_INC) $(VIRGL_INC)
 DEFS := -DBHYVE_GDB -DINET -DINET6 -DNO_OPENSSL
 # FreeBSD builds this code with its own warning set; here: errors that matter on, the style ones off.
 # -Wno-format: uint64_t is unsigned long on FreeBSD and unsigned long long here (both 64 bits); the
@@ -60,12 +78,12 @@ WARN := -Wall -Wno-format -Wno-unused-parameter -Wno-unused-function -Wno-unused
 CFLAGS := -O2 -g -std=gnu17 -arch arm64 -mmacosx-version-min=26.0 $(WARN) $(DEFS) $(INC)
 LDFLAGS := -arch arm64 -framework Hypervisor -framework vmnet -lz -lpthread
 
-all: build/bhyve
+all: $(OUT)
 
 # Linked and signed under another name and then renamed: a VM that is running from build/bhyve keeps
 # its file (rewriting a signed binary in place kills the processes that run it).
-build/bhyve: $(OBJS) hvf/bhyve.entitlements
-	$(CC) -o $@.new $(OBJS) $(TPM_LIBS) $(LDFLAGS)
+$(OUT): $(OBJS) hvf/bhyve.entitlements
+	$(CC) -o $@.new $(OBJS) $(TPM_LIBS) $(VIRGL_LIBS) $(LDFLAGS)
 	codesign --force -s - --entitlements hvf/bhyve.entitlements $@.new
 	mv -f $@.new $@
 
@@ -74,7 +92,7 @@ $(O)/%.o: %.c
 	$(CC) $(CFLAGS) -MMD -MP -c -o $@ $<
 
 clean:
-	rm -rf build/obj build/bhyve
+	rm -rf build/obj build/obj-3d build/bhyve build/bhyve-3d
 
 -include $(OBJS:.o=.d)
 .PHONY: all clean

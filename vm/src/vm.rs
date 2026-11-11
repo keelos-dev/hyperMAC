@@ -228,6 +228,7 @@ pub fn create(name: &str, args: &[String]) -> anyhow::Result<()> {
         net: opt(args, "--net").filter(|n| *n != "nat").map(str::to_string),
         os_version: opt(args, "--os-version").map(str::to_string),
         engine: None,
+        gpu3d: false,
     };
     let disk_gb = num(args, "--disk-gb", 64);
     let name = name.to_string();
@@ -477,6 +478,7 @@ pub fn run(name: &str, args: &[String]) -> anyhow::Result<()> {
     // serves VZ's graphics and USB HID
     // the picture for `hypermac serve`'s RDP (shm.rs, rdp.rs)
     if conf.own_devices() {
+        crate::no_app_nap();
         if let Err(e) = crate::shm::export(&dir) {
             eprintln!("screen.shm: {e:#}");
         }
@@ -839,6 +841,7 @@ pub(crate) fn create_linux(name: &str, args: &[String]) -> anyhow::Result<()> {
         net: opt(args, "--net").filter(|n| *n != "nat").map(str::to_string),
         os_version: opt(args, "--os-version").map(str::to_string),
         engine: freebsd.then(|| "bhyve".to_string()),
+        gpu3d: false,
     };
     std::fs::File::create(dir.join("disk.img"))?.set_len(num(args, "--disk-gb", if windows { 64 } else { 32 }) << 30)?;
     unsafe {

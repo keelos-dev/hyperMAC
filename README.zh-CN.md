@@ -9,7 +9,8 @@ Apple Silicon 上的 bhyve + 苹果的 Virtualization.framework + 内置 RDP 服
 hyperMAC 做两件事，而且两件事正好配套：
 
 1. **虚拟机。** 在 Apple Silicon 上跑 macOS、Windows 11 ARM、Linux、FreeBSD。Windows 和 FreeBSD 跑在 **bhyve** 上：
-   FreeBSD 的 hypervisor，移植到了苹果的 Hypervisor.framework——据我们所知这是 Apple Silicon 上的第一个 bhyve。
+   FreeBSD 的 hypervisor，移植到了苹果的 Hypervisor.framework——据我们所知这是 Apple Silicon 上的第一个 bhyve，
+   也是第一个不靠显卡直通就给 Windows 虚拟机 3D 加速的 bhyve（Direct3D 11，由 Mac 的 GPU 来画）。
    macOS 和 Linux 跑在苹果自己的 Virtualization.framework 上。
 2. **RDP 服务端。** 这台 Mac 自己的桌面和它上面的虚拟机都能用标准 RDP 连：Windows 自带的 `mstsc` 直接连，什么都不用装。
    柜子里的一台 Mac mini，就成了能从任何 PC 上用的 Windows + Mac 服务器。
@@ -49,7 +50,7 @@ macOS 虚拟机一样短：「新建虚拟机… → macOS → 从苹果下载�
 
 | 系统 | 引擎 | 怎么装 | 状态 |
 |---|---|---|---|
-| **Windows 11 ARM** | bhyve + Hypervisor.framework | 微软的 ISO：手动，或无人值守 | TPM 2.0、Secure Boot、网络、1920x1080、Windows Update |
+| **Windows 11 ARM** | bhyve + Hypervisor.framework | 微软的 ISO：手动，或无人值守 | TPM 2.0、Secure Boot、网络、1920x1080、Windows Update、声音、3D 加速（Direct3D 11，需手动打开） |
 | **macOS** | Virtualization.framework | 全自动，用苹果的恢复映像（可代为下载） | 有图形加速（苹果的半虚拟化显卡），流畅 |
 | **Linux**（arm64） | Virtualization.framework | 发行版的 ISO | 测过 Fedora |
 | **FreeBSD**（arm64） | bhyve + Hypervisor.framework | 官方 ISO | 测过 15.1 |
@@ -65,10 +66,23 @@ macOS 虚拟机一样短：「新建虚拟机… → macOS → 从苹果下载�
 | 虚拟化核心 | bhyve + Hypervisor.framework；苹果 VZ | QEMU；苹果 VZ | 自研 | 自研 | 自研 |
 | Windows 11 ARM | ✅ | ✅ | ✅ | ✅ | ✅（7.2 起） |
 | macOS 虚拟机 | ✅ | ✅ | ✅ | ❌ | ❌ |
-| Windows 里的 3D 加速 | ❌ 还没有 | ❌ | ✅ | ✅ | ❌ |
+| Windows 里的 3D 加速 | ✅ Direct3D 11（刚做，需手动打开） | ✅ Direct3D 11，有苹果 D3DMetal 时还有 12（5.0.8） | ✅ DirectX 11.1、OpenGL 4.3 | ✅ DirectX 11 | 实验性（7.2） |
+| 在 Windows 里打游戏 | Direct3D 11 的游戏；数字见下 | Direct3D 11 和 12 的游戏 | Direct3D 11 的游戏；游戏上积累最久 | Direct3D 11 的游戏 | 还指望不上 |
+| 把游戏的画面和声音送到另一台 PC | ✅ RDP，H.264 60 帧，带声音 | ❌ | ❌ | ❌ | ❌ |
 | RDP 连 Mac 自己的桌面和虚拟机 | ✅ 内置（macOS 虚拟机里自己装一份 hyperMAC） | ❌ | ❌ | ❌ | 只有虚拟机（VRDE） |
 
-说实话：要在 Windows 里打游戏、跑 3D，Parallels 领先，而且还会领先一阵。要的是用 Windows 11 跑 Office、浏览器、
+打游戏：Direct3D 11 的游戏能跑，带声音。用 Unigine Heaven 4.0 实测（Direct3D 11；它是 x64 程序，由 Windows 转译），
+Mac mini M4（16 GB），虚拟机 4 核 8 GB，2026-11-11，完整跑完一轮：
+
+| Heaven 4.0 | 分数 | 平均 | 最低 | 最高 |
+|---|---|---|---|---|
+| 1920x1080 全屏，2 倍抗锯齿，画质 High，曲面细分关 | 1967 | 78.1 帧 | 12.9 | 173.5 |
+
+跑的时候在另一台 PC 的 kRDPclient 里看：1920x1080 H.264，64 帧，11.6 Mbps，没有跳帧，虚拟机的声音走 Opus。
+
+不过说实话：这部分刚做出来，试过的只有一个跑分和浏览器。表里每一家现在都能在 Apple Silicon 上跑 Direct3D 11 的游戏；
+UTM（这里用的来宾驱动就是它的作者写的）还有 Direct3D 12，Parallels 在游戏兼容性上有多年的积累。这里没有 Direct3D 12、OpenGL、Vulkan，
+带内核反作弊的游戏在虚拟机里起不来。只有 hyperMAC 做的一件事，是把这个游戏连同声音送到另一台 PC 的屏幕上。要的是用 Windows 11 跑 Office、浏览器、
 开发工具，或者那一个只有 Windows 版的程序，Mac 甚至可能没接显示器，又不想每年为此付费——那就是它了。
 
 ## RDP 服务端
@@ -155,7 +169,12 @@ mstsc（远程桌面连接）等标准 RDP 客户端也能连（`Mac地址:3389`
 ## 还毛糙的地方
 
 - **它还很新。** 虚拟机部分刚做出来。重要的东西请留备份。
-- Windows 里没有显卡加速（基本显示驱动，最大 1920x1200），虚拟机还没有声音。
+- Windows 里的 3D 加速刚做出来，默认不开：在虚拟机的 `vm.json` 里加 `"gpu3d": true`（app 里还没有开关）。
+  是 Direct3D 11：桌面、Edge、WebGL 都走它，Direct3D 11 的游戏也是（Unigine Heaven 4.0，1920x1080 全屏、2 倍抗锯齿，
+  Mac mini M4 上平均 78 帧；WebGL Aquarium 500 条鱼，MacBook Air M4 上 1024x768 是 57 帧）。抗锯齿最高 4 倍（Mac 的 GPU 只到这里），
+  游戏要 8 倍时会说设不了显示模式。没有 Direct3D 12、OpenGL、Vulkan。不开时 Windows 用基本显示驱动，最大 1920x1200。
+- 虚拟机的声音只有 Windows 有：虚拟机的窗口开着时在 Mac 上播放，kRDPclient 连着这台虚拟机时发给它（刚做）。
+  macOS、Linux、FreeBSD 虚拟机还没有声音。
 - 桥接网络、睡眠唤醒、长时间运行测得还不够。
 - 固件的 Secure Boot 把密钥放在来宾内核够得着的地方（这个 EDK2 平台没有受保护的变量存储）：满足 Windows 的要求，但不是真机的强度。
 
@@ -168,6 +187,10 @@ mstsc（远程桌面连接）等标准 RDP 客户端也能连（`Mac地址:3389`
   经 GICv2m 的 MSI、CPU 不给解码信息的 MMIO 指令的解码。
 - arm64 的 bhyve 原来没有、而 Windows 需要的：**UEFI**（EDK2）、**ACPI** 表、存 UEFI 变量的 CFI 闪存、QEMU 的 fw_cfg 和 ramfb、
   **virtio 1.0** 接口、**TPM**（libtpms 在进程内）、Secure Boot。
+- **Windows 虚拟机的 3D**：bhyve 以前除了把整块显卡直通进去之外没有 3D。这里是一块 virtio-gpu 3D 设备
+  （`vm/bhyve/hvf/pci_virtio_gpu_3d.c`），把来宾的 Direct3D 11 调用送到 Mac 的 GPU 上。它站在别人的工作上：
+  来宾里的驱动是 Triton，宿主这边是 virglrenderer 的 Neptune，都出自 UTM 的作者；DXMT 把 Direct3D 11 变成 Metal。
+  据我们所知，这是它们第一次跑在 bhyve 上。
 - 其中 18 个补丁是按提给 FreeBSD review 写的，包括一路上发现的缺陷（`vm/bhyve/patches/REVIEW.md`）。还没有提交。
 
 ## 更新

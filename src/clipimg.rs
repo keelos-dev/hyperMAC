@@ -114,6 +114,7 @@ pub fn from_dib(d: &[u8]) -> Option<Rgba> {
 
 /// The pasteboard has a picture to offer (and not a copied file, whose icon comes along).
 pub fn mac_has_image() -> bool {
+    let _g = crate::clip::pasteboard_lock();
     has_image(&NSPasteboard::generalPasteboard())
 }
 
@@ -130,6 +131,7 @@ fn pasteboard_rep(pb: &NSPasteboard) -> Option<Retained<NSBitmapImageRep>> {
 
 /// The pasteboard picture as PNG bytes.
 pub fn mac_png() -> Option<Vec<u8>> {
+    let _g = crate::clip::pasteboard_lock();
     png_of(&NSPasteboard::generalPasteboard())
 }
 
@@ -150,6 +152,7 @@ fn png_of(pb: &NSPasteboard) -> Option<Vec<u8>> {
 /// The pasteboard picture as CF_DIB: drawn into a known 8-bit RGBA bitmap first, whatever its
 /// own layout (16-bit, planar, CMYK...).
 pub fn mac_dib() -> Option<Vec<u8>> {
+    let _g = crate::clip::pasteboard_lock();
     dib_of(&NSPasteboard::generalPasteboard())
 }
 
@@ -205,6 +208,7 @@ fn dib_of(pb: &NSPasteboard) -> Option<Vec<u8>> {
 
 /// Put PNG bytes (and the TIFF most Mac apps read) on the pasteboard. Returns its changeCount.
 pub fn put_png(png: &[u8]) -> Option<isize> {
+    let _g = crate::clip::pasteboard_lock();
     put_png_on(&NSPasteboard::generalPasteboard(), png)
 }
 
@@ -223,6 +227,7 @@ fn put_png_on(pb: &NSPasteboard, png: &[u8]) -> Option<isize> {
 
 /// Put a client's DIB on the pasteboard (as PNG + TIFF).
 pub fn put_dib(dib: &[u8]) -> Option<isize> {
+    let _g = crate::clip::pasteboard_lock();
     put_dib_on(&NSPasteboard::generalPasteboard(), dib)
 }
 

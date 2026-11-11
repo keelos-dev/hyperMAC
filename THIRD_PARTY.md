@@ -97,3 +97,13 @@ of macOS and are not distributed with hyperMAC.
 The Linux and FreeBSD marks in the list of virtual machines (`assets/os/linux.svg`,
 `assets/os/freebsd.svg`) are from Simple Icons (https://simpleicons.org, CC0 1.0). The marks
 themselves are trademarks of their owners and stand here only for the system a machine runs.
+
+## Direct3D for Windows machines: virglrenderer, DXMT, Triton
+
+A release that has the 3D engine (`bhyve-3d` and the folder `gpu3d`; built by `vm/bhyve/gpu3d.sh`)
+contains, in `gpu3d`: UTM's virglrenderer with Neptune (MIT) and libepoxy (MIT); DXMT, which
+turns Direct3D 11 into Metal, as a library of its own that the render server loads (GNU Lesser
+General Public License 2.1); and the Windows driver Triton (`viogpu3d`), unchanged from its
+authors' release, for hyperMAC to put on a new Windows machine's setup disc. `gpu3d/SOURCES`
+names each one's source and the commit it was built from, and says how to use another build of
+DXMT; `gpu3d/LICENSES` has the license texts.

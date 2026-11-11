@@ -27,6 +27,7 @@ mod console;
 mod fbdev;
 mod rfb;
 mod shm;
+mod sound;
 mod vgpu;
 mod vinput;
 mod vm;
@@ -73,12 +74,36 @@ pub struct VmConf {
     /// Hypervisor.framework (bhyve.rs), which is what runs Windows
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub engine: Option<String>,
+    /// bhyve engine, Windows: Direct3D on the Mac's GPU. A second display adapter (virtio-gpu
+    /// with 3D, `-s 9`) that the guest's Triton driver (viogpu3d) takes; the calls are executed
+    /// by virglrenderer + DXMT on Metal (bhyve.rs `gpu3d`). Without the 3D engine installed
+    /// the VM starts as before, on the framebuffer.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub gpu3d: bool,
 }
 
 impl VmConf {
     pub fn own_devices(&self) -> bool {
         self.own_devices || std::env::var_os("HYPERMAC_VIRTIO").is_some()
     }
+}
+
+/// A VM's process is not to be napped: without a window in front macOS (App Nap) lowers its
+/// priority and stretches its timers, and the picture it hands on (shm.rs, rfb.rs, the console)
+/// fell from 56 to 13 frames a second some minutes after the start (2026-11-11). The Mac may
+/// still go to sleep when idle.
+pub fn no_app_nap() {
+    use objc2::rc::Retained;
+    use objc2::runtime::AnyObject;
+    use objc2::{class, msg_send};
+    // NSActivityUserInitiatedAllowingIdleSystemSleep | NSActivityLatencyCritical
+    let options: u64 = 0x00EF_FFFF | 0xFF_0000_0000;
+    let reason = objc2_foundation::NSString::from_str("a virtual machine is running");
+    let token: Option<Retained<AnyObject>> = unsafe {
+        let info: *mut AnyObject = msg_send![class!(NSProcessInfo), processInfo];
+        msg_send![info, beginActivityWithOptions: options, reason: &*reason]
+    };
+    std::mem::forget(token); // for as long as the process lives
 }
 
 pub fn root() -> PathBuf {
@@ -128,7 +153,38 @@ pub fn num(args: &[String], name: &str, default: u64) -> u64 {
     opt(args, name).and_then(|s| s.parse().ok()).unwrap_or(default)
 }
 
+/// As many open files as the system lets a process have, for this process and the ones it starts
+/// (bhyve and the 3D renderer inherit it). Started from the app, a process has launchd's limit of
+/// 256; the 3D engine holds a few descriptors for every guest process that draws (shared memory,
+/// pipes, sockets) and reached it eight minutes after Windows was up, with Edge open: no new
+/// context or surface could be made, and the picture fell back to the firmware's (2026-11-11).
+/// Started from a terminal the limit was a million, so it had not shown before.
+fn raise_open_files() {
+    unsafe {
+        let mut l = libc::rlimit { rlim_cur: 0, rlim_max: 0 };
+        if libc::getrlimit(libc::RLIMIT_NOFILE, &mut l) != 0 {
+            return;
+        }
+        // (macOS refuses a soft limit above kern.maxfilesperproc, even when the hard one is "unlimited")
+        let mut per_proc: libc::c_int = 0;
+        let mut len = std::mem::size_of::<libc::c_int>();
+        let name = c"kern.maxfilesperproc";
+        if libc::sysctlbyname(name.as_ptr(), (&mut per_proc as *mut libc::c_int).cast(), &mut len, std::ptr::null_mut(), 0) != 0 || per_proc <= 0 {
+            per_proc = 10240;
+        }
+        let want = (per_proc as libc::rlim_t).min(l.rlim_max);
+        if want > l.rlim_cur {
+            let was = l.rlim_cur;
+            l.rlim_cur = want;
+            if libc::setrlimit(libc::RLIMIT_NOFILE, &l) != 0 {
+                eprintln!("open files: the limit stays at {was} ({})", std::io::Error::last_os_error());
+            }
+        }
+    }
+}
+
 fn main() -> anyhow::Result<()> {
+    raise_open_files();
     let args: Vec<String> = std::env::args().skip(1).collect();
     let name = || args.get(1).cloned().context("VM name?");
     match args.first().map(String::as_str) {
@@ -234,5 +290,22 @@ pub fn guest_ip(c: &VmConf) -> Option<String> {
     match vmnet::GUEST_IP.load(std::sync::atomic::Ordering::Relaxed) {
         0 => None,
         ip => Some(std::net::Ipv4Addr::from(ip).to_string()),
+    }
+}
+
+#[cfg(test)]
+mod limit_tests {
+    /// From launchd's 256 the limit goes up to what the system allows a process.
+    #[test]
+    fn open_files_limit_is_raised() {
+        unsafe {
+            let mut l = libc::rlimit { rlim_cur: 0, rlim_max: 0 };
+            assert_eq!(libc::getrlimit(libc::RLIMIT_NOFILE, &mut l), 0);
+            l.rlim_cur = 256;
+            assert_eq!(libc::setrlimit(libc::RLIMIT_NOFILE, &l), 0);
+            super::raise_open_files();
+            assert_eq!(libc::getrlimit(libc::RLIMIT_NOFILE, &mut l), 0);
+            assert!(l.rlim_cur >= 10240, "{}", l.rlim_cur);
+        }
     }
 }

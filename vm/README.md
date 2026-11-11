@@ -97,8 +97,41 @@ hypermac win-resume win1     # 中途停了从断点接着装
 - 实测（2026-11-11，Mac mini M4，日文 26300 ISO）：8 分钟到桌面，1920x1080，NetKVM 已装，来宾的 3389 可连。
 - `vm.json` 里 `"engine": "bhyve"`。`hypermac run` 是监管进程：来宾重启时重新起 bhyve，`ctl NAME stop` = 电源键。
   画面、键鼠、`ctl.sock`、`screen.shm`、VNC 口和别的 VM 一样用（`src/bhyve.rs`）。来宾的串口输出在 VM 目录的 `console.log`。
-- 分辨率在创建时定（`--w --h`，最大 1920x1200），运行中不能改；没有声卡；没有 TPM 和 Secure Boot（安装时关掉了检查）。
+- 分辨率在创建时定（`--w --h`，最大 1920x1200），运行中不能改；声卡见下一条；没有 TPM 和 Secure Boot（安装时关掉了检查）。
+- 声卡（2026-11-11）：HD Audio（`-s 16,hda,play=keel:<VM 目录>/sound.ring`，keelOS 的 hda，`bhyve/keel/`），Windows 用自带的
+  `hdaudio.sys`，不用装驱动；`HYPERMAC_HDA=0` 不挂。来宾播放的声音写进 `sound.ring`（16 位立体声，来宾的采样率，布局在
+  `bhyve/keel/audio.h`）。VM 的窗口开着时本进程用 AudioQueue 在 Mac 上播（`src/sound.rs`），窗口关了不出声；
+  RDP 连着这台 VM 时服务读同一个环走 RDPSND（仓库根 `src/vmsound.rs`）。实测：设备管理器三项正常、440 Hz 的音在环里是 440 Hz、
+  本机听到 Windows 的开机声；kRDPclient 连上这台 VM 听到声音（Opus）。mstsc（PCM）和 44.1 kHz 的转换没实测。只有 Windows 来宾有，没有录音。
 - `create … --engine vz` 仍走下面的老办法；没装 bhyve 引擎的机器自动走老办法。
+
+### 3D 加速（Direct3D 11，2026-11-11 实测：MacBook Air M4 / macOS 27.2，guest 26300 日文版）
+
+`create … --os windows … --gpu3d`，或已有的虚拟机在 `vm.json` 里加 `"gpu3d": true`。guest 的 Direct3D 调用在宿主的 GPU 上执行：
+桌面合成（DWM）、Edge、WebGL 都走它。实测 WebGL Aquarium 500 条鱼 57 帧（1024x768）。
+
+要先造出 3D 引擎（不是默认构建的一部分，要 LLVM 15、meson，约十分钟）：`vm/bhyve/gpu3d.sh`，得到 `vm/bhyve/build/bhyve-3d` 和
+`build/gpu3d/`（它旁边要有的东西，全在这个目录里）。之后根目录的 `build.sh` 会把它们装到 hyperMAC 旁边。没有引擎时带 `gpu3d` 的虚拟机照常启动，只是没有 3D。
+
+怎么通的：
+
+```
+guest 进程 → d3d11.dll → Triton（viogpu3d，UTM 作者的 WDDM 驱动，微软签名）
+   → virtio-gpu（vm/bhyve/hvf/pci_virtio_gpu_3d.c：上下文、blob 资源映射进 guest、fence、blob 扫描输出）
+   → virglrenderer 的 Neptune（每个 guest 进程一个 virgl_render_server 进程）→ DXMT（Direct3D 11 → Metal）
+```
+
+- 3D 显卡是 fbuf 之外的第二块显示设备（`-s 9,virtio-gpu,3d=on,hostmem=4096`，和 QEMU 的布局一样：驱动只认这种）。固件、安装程序、
+  没装驱动的系统仍然在 fbuf 上；驱动点亮画面后，fbuf 的 VNC（也就是控制台窗口、RDP、`vshot`）给出的就是它的画面。
+- 驱动在新建虚拟机时随 setup.iso 进去（`gpu3d/driver/`），安装期间不挂 3D 设备，装完第一次启动 Windows 自己绑上。
+- guest 启动后的分辨率是 `vm.json` 的 `w`×`h`（设备在驱动出第一帧后 5、20、60 秒各提醒一次，驱动包里的 viogpuap.exe 来改）。
+- `hostmem` 是 guest 和渲染器共享内存的窗口，一个 64 位 BAR：主桥为此有了 64 位的 PCI 内存窗口（256 GB 处 32 GB，
+  `patches/macos/0024`、`src/acpi_arm64_dsdt.asl`）。
+- 调试：环境变量 `VTGPU3D_DEBUG=1`（每条 3D 命令）、`VTGPU_DEBUG=3`（寄存器读写），输出在虚拟机的 `run.log`；
+  `VIRGL_LOG_LEVEL=debug` 是渲染器自己的。
+- 还没有：Direct3D 12（DXMT 只有 11）、OpenGL/Vulkan、窗口缩放时改 guest 分辨率、主窗口里的开关；画面每帧整屏拷一次。
+- 没查明：把 virtio-gpu 并进 fbuf 那个设备（`fbuf,virtio=on`，`patches/macos/0023`，keelOS 的 virtio-vga）时 Triton 显示「已启动」
+  却从不访问寄存器，之后重启、关机都卡住。所以现在是两块设备。
 
 ## Windows 11 ARM guest：老办法，VZ + efiprobe（2026-11-10，Mac mini M4 / macOS 27.2：**能装到桌面**，guest 26300 日文版）
 

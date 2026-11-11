@@ -67,6 +67,20 @@ if [ -d "$(dirname "$INST")" ]; then
 			&& cp "$D/vm/bhyve/firmware/QEMU_VARS.secboot.fd" "$(dirname "$INST")/QEMU_VARS.secboot.fd" \
 			&& echo "bhyve engine installed: $B (hypervisor, virtualization)"
 	fi
+	# The 3D engine for Windows guests (vm.json "gpu3d"), when vm/bhyve/gpu3d.sh has made it: bhyve-3d
+	# and the folder it looks in beside itself. Not built here: it needs LLVM 15, meson and ten minutes.
+	G3="$D/vm/bhyve/build"
+	if [ -n "$BHYVE" ] && [ -x "$G3/bhyve-3d" ] && [ -f "$G3/gpu3d/virgl_render_server" ]; then
+		B="$(dirname "$INST")/bhyve-3d"
+		rm -rf "$(dirname "$INST")/gpu3d.new" && cp -R "$G3/gpu3d" "$(dirname "$INST")/gpu3d.new" \
+			&& for f in "$(dirname "$INST")/gpu3d.new"/*.dylib "$(dirname "$INST")/gpu3d.new/virgl_render_server"; do
+				codesign --force --sign "${ID:--}" --timestamp=none "$f" || exit 1
+			done \
+			&& rm -rf "$(dirname "$INST")/gpu3d" && mv "$(dirname "$INST")/gpu3d.new" "$(dirname "$INST")/gpu3d" \
+			&& cp "$G3/bhyve-3d" "$B.new" && codesign --force --sign "${ID:--}" --identifier dev.keelos.hypermac.bhyve --timestamp=none \
+				--entitlements "$D/vm/bhyve/hvf/bhyve.entitlements" "$B.new" && mv -f "$B.new" "$B" \
+			&& echo "3D engine installed: $B, $(dirname "$INST")/gpu3d"
+	fi
 	cp "$VMBIN" "$INST-vm.new" && sign_vm "$INST-vm.new" >/dev/null && mv -f "$INST-vm.new" "$INST-vm" \
 		&& echo "VM program installed: $INST-vm"
 	cp "$EFIPROBE" "$(dirname "$INST")/efiprobe.efi" && echo "efiprobe installed: $(dirname "$INST")/efiprobe.efi"

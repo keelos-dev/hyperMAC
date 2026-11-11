@@ -8,6 +8,8 @@
 #   CD=file.iso          a CD to attach (the install medium, virtio-win.iso)
 #   CD2=file.iso         a second one
 #   CDKEY=1              press a key at "Press any key to boot from CD or DVD" (once)
+#   BHYVE=path           another bhyve (build/bhyve-3d: make VIRGL=PREFIX)
+#   FBUF=virtio=on,3d=on more options for fbuf (the virtio-vga, Direct3D)
 B=$(cd "$(dirname "$0")/.." && pwd)
 dir=${1:?usage: win11-run.sh DIR [bhyve arguments]}; shift
 dir=$(cd "$dir" && pwd)
@@ -17,10 +19,10 @@ cds=
 n=0
 while :; do
 	n=$((n + 1))
-	cmd="'$B/build/bhyve' -c ${CPUS:-4} -m ${MEM:-6G} -o console={tty} -o rtc.use_localtime=true -o rundir='$dir' \
+	cmd="'${BHYVE:-$B/build/bhyve}' -c ${CPUS:-4} -m ${MEM:-6G} -o console={tty} -o rtc.use_localtime=true -o rundir='$dir' \
 	    -o bootrom='$B/firmware/QEMU_EFI.fd' -o bootvars='$dir/vars.fd' \
 	    -s 0,hostbridge -s 2,nvme,'$dir/disk.img' $cds -s 5,xhci,tablet,kbd -s 6,virtio-rnd \
-	    -s 7,fbuf,rfb=127.0.0.1:${VNC:-5910},w=${FBW:-1024},h=${FBH:-768} $* win > '$dir/bhyve.log' 2>&1; \
+	    -s 7,fbuf,rfb=127.0.0.1:${VNC:-5910},w=${FBW:-1024},h=${FBH:-768}${FBUF:+,$FBUF} $* win > '$dir/bhyve.log' 2>&1; \
 	    echo \"bhyve exit status \$?\" >> '$dir/bhyve.log'"
 	if [ -n "$CDKEY" ] && [ $n = 1 ]; then
 		python3 "$B/test/console.py" --log "$dir/serial.log" --pty "$cmd" \

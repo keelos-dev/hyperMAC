@@ -190,6 +190,12 @@ impl Sound {
         }
     }
 
+    /// A VM's samples (vmsound.rs), interleaved stereo at RATE: this connection shows the VM,
+    /// so neither the tap nor ScreenCaptureKit runs for it.
+    pub fn push_vm(&self, data: &[f32]) {
+        self.push_f32(data, data.len() / CHANNELS, CHANNELS, false);
+    }
+
     /// Float32 samples from the capture, `channels` wide, planar (channel after channel) or
     /// interleaved; `frames` samples per channel. Converted, cut into waves, sent.
     fn push_f32(&self, data: &[f32], frames: usize, channels: usize, planar: bool) {

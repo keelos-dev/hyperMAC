@@ -1,0 +1,406 @@
+virtio-gpu: 3D through virglrenderer ("-s N,virtio-gpu,3d=on[,hostmem=MiB]")
+
+Built only with make VIRGL=PREFIX (KEEL_VTGPU_3D): every control command goes to
+hvf/pci_virtio_gpu_3d.c first; commands it answers later (a fence with a ring index)
+keep their chain until vtgpu_h_complete(); a blob scanout is copied to the shm by
+vtgpu_h_present(); the device config says how many capsets; BAR 4 is the
+host-visible memory window, its address follows pe_baraddr.
+
+--- a/usr.sbin/bhyve/pci_virtio_gpu.c
++++ b/usr.sbin/bhyve/pci_virtio_gpu.c
+@@ -51,6 +51,11 @@
+ #include "pci_emul.h"
+ #include "pci_virtio_gpu.h"
+ #include "virtio.h"
++#ifdef KEEL_VTGPU_3D
++#include "pci_virtio_gpu_3d.h"
++#define	BAR_HOSTMEM	4		/* and 5: the 3D part's host-visible memory window */
++#define	VTGPU_RESP_MAX	(1u << 20)	/* a capset */
++#endif
+ 
+ #define	VTGPU_QSIZE	256
+ #define	VTGPU_MAXW	KGPU_MAXW
+@@ -155,8 +160,25 @@
+ 	uint8_t *pix;
+ 	uint32_t pref_w, pref_h;
+ 	uint32_t req_seen;
++#ifdef KEEL_VTGPU_3D
++	struct vtgpu3d *g3d;		/* NULL: 2D only */
++	struct vtgpu_wait *waits;	/* commands the 3D part answers later (a fence) */
++	int nudged;			/* half seconds since a 3D driver's first picture; 0: none yet */
++	uint64_t token;
++#endif
+ };
+ 
++#ifdef KEEL_VTGPU_3D
++struct vtgpu_wait {
++	struct vtgpu_wait *next;
++	uint64_t token;
++	uint16_t idx;			/* the chain */
++	struct vgpu_hdr hdr;		/* the response */
++	int niov;
++	struct iovec iov[4];		/* the first writable descriptors: the header goes there */
++};
++#endif
++
+ static int
+ vtgpu_add_cap(struct pci_devinst *pi, u_char *capdata, int caplen)
+ {
+@@ -585,8 +607,8 @@
+ 	struct vqueue_info *vq = &sc->vq[qn];
+ 	struct iovec iov[VTGPU_NIOV];
+ 	struct vi_req req;
+-	uint8_t *buf = NULL, resp[sizeof(struct vgpu_hdr) + EDID_RESP_LEN];
+-	size_t cap = 0;
++	uint8_t *buf = NULL, resp0[sizeof(struct vgpu_hdr) + EDID_RESP_LEN], *resp = resp0;
++	size_t cap = 0, rcap = sizeof(resp0);
+ 	int n, i;
+ 
+ 	while (vq_has_descs(vq)) {
+@@ -621,12 +643,58 @@
+ 			cursor_cmd(sc, buf, len);
+ 		} else {
+ 			size_t rlen;
+-			struct vgpu_hdr *rh = (struct vgpu_hdr *)resp;
++			struct vgpu_hdr *rh;
+ 			const struct vgpu_hdr *qh = (const void *)buf;
++			uint32_t type = 0;
++#ifdef KEEL_VTGPU_3D
++			if (sc->g3d != NULL) {
++				/* room for what the driver can take (a capset is larger than resp0) */
++				size_t want = 0;
++				for (i = req.readable; i < n; i++)
++					want += iov[i].iov_len;
++				want = MIN(want, (size_t)VTGPU_RESP_MAX);
++				if (want > rcap) {
++					uint8_t *nr = malloc(want);
++					if (nr != NULL) {
++						if (resp != resp0)
++							free(resp);
++						resp = nr;
++						rcap = want;
++					}
++				}
++			}
++#endif
++			rh = (struct vgpu_hdr *)resp;
+ 			memset(resp, 0, sizeof(struct vgpu_hdr));
+-			rh->type = cmd(sc, buf, len, resp, &rlen);
++#ifdef KEEL_VTGPU_3D
++			if (sc->g3d != NULL) {
++				type = vtgpu3d_cmd(sc->g3d, buf, len, resp, rcap, &rlen, sc->token + 1);
++				if (type == VTGPU3D_DEFERRED) {
++					struct vtgpu_wait *w = calloc(1, sizeof(*w));
++					if (w != NULL) {
++						w->token = ++sc->token;
++						w->idx = req.idx;
++						w->hdr.type = RESP_OK_NODATA;
++						w->hdr.flags = qh->flags;
++						w->hdr.fence_id = qh->fence_id;
++						w->hdr.ctx_id = qh->ctx_id;
++						w->hdr.ring_idx = qh->ring_idx;
++						for (i = req.readable; i < n && w->niov < 4; i++)
++							w->iov[w->niov++] = iov[i];
++						w->next = sc->waits;
++						sc->waits = w;
++						continue;	/* the chain stays out */
++					}
++					type = RESP_OK_NODATA;	/* no memory: early, but answered */
++					rlen = sizeof(struct vgpu_hdr);
++				}
++			}
++#endif
++			if (type == 0)
++				type = cmd(sc, buf, len, resp, &rlen);
++			rh->type = type;
+ 			if (len >= sizeof(*qh) && (qh->flags & VIRTIO_GPU_FLAG_FENCE)) {
+-				rh->flags = VIRTIO_GPU_FLAG_FENCE;
++				rh->flags = qh->flags & (VIRTIO_GPU_FLAG_FENCE | 2);	/* and INFO_RING_IDX */
+ 				rh->fence_id = qh->fence_id;
+ 				rh->ctx_id = qh->ctx_id;
+ 				rh->ring_idx = qh->ring_idx;
+@@ -644,8 +712,88 @@
+ 	}
+ 	vq_endchains(vq, 1);
+ 	free(buf);
++	if (resp != resp0)
++		free(resp);
+ }
+ 
++#ifdef KEEL_VTGPU_3D
++/* what the 3D part asks of us (struct vtgpu3d_host) */
++
++static void
++vtgpu_h_lock(void *arg)
++{
++	pthread_mutex_lock(&((struct vtgpu_softc *)arg)->mtx);
++}
++
++static void
++vtgpu_h_unlock(void *arg)
++{
++	pthread_mutex_unlock(&((struct vtgpu_softc *)arg)->mtx);
++}
++
++/* a deferred command's fence retired: its response, its chain, the interrupt */
++static void
++vtgpu_h_complete(void *arg, uint64_t token)
++{
++	struct vtgpu_softc *sc = arg;
++	struct vtgpu_wait **p, *w;
++	size_t done = 0;
++	int i;
++
++	for (p = &sc->waits; (w = *p) != NULL; p = &w->next)
++		if (w->token == token)
++			break;
++	if (w == NULL)
++		return;
++	*p = w->next;
++	for (i = 0; i < w->niov && done < sizeof(w->hdr); i++) {
++		size_t c = MIN(w->iov[i].iov_len, sizeof(w->hdr) - done);
++		memcpy(w->iov[i].iov_base, (uint8_t *)&w->hdr + done, c);
++		done += c;
++	}
++	if (sc->q[0].enabled) {
++		vq_relchain(&sc->vq[0], w->idx, done);
++		vq_endchains(&sc->vq[0], 0);
++	}
++	free(w);
++}
++
++/* rows of a blob scanout (linear pixels in the renderer's shared memory) to the shm */
++static void
++vtgpu_h_present(void *arg, const uint8_t *pix, uint32_t format, uint32_t width, uint32_t height,
++    uint32_t stride, uint32_t y, uint32_t rows)
++{
++	struct vtgpu_softc *sc = arg;
++	uint32_t x, r;
++
++	if (width == 0 || width > VTGPU_MAXW || height > VTGPU_MAXH) {
++		sc->shm->active = 0;
++		sc->shm->seq++;
++		return;
++	}
++	sc->scanout_res = 0;		/* the 2D scanout, if there was one, is over */
++	if (sc->nudged == 0)
++		sc->nudged = 1;		/* vtgpu_watch counts from here */
++	if (sc->shm->width != width || sc->shm->height != height || !sc->shm->active) {
++		EPRINTLN("virtio-gpu: scanout %ux%u (3D)", width, height);
++		sc->shm->width = width;
++		sc->shm->height = height;
++	}
++	for (r = 0; r < rows; r++) {
++		const uint8_t *src = pix + (size_t)r * stride;
++		uint8_t *dst = sc->pix + (size_t)(y + r) * width * 4;
++		if (format == 1 || format == 2)
++			memcpy(dst, src, (size_t)width * 4);
++		else
++			for (x = 0; x < width; x++, src += 4, dst += 4)
++				to_bgrx(format, src, dst);
++	}
++	sc->shm->active = 1;
++	atomic_thread_fence_rel();
++	sc->shm->seq++;
++}
++#endif
++
+ /* keel-rdp's size wish: the thread */
+ 
+ static void *
+@@ -669,6 +817,28 @@
+ 			}
+ 			pthread_mutex_unlock(&sc->mtx);
+ 		}
++#ifdef KEEL_VTGPU_3D
++		/*
++		 * Windows' viogpu3d starts at the size it had last (1024x768 the first time),
++		 * whatever GET_DISPLAY_INFO says, and goes to the preferred size when it is told of
++		 * a change; its agent in the user's session (viogpuap.exe) applies it, and is not
++		 * there yet when the first picture comes. So: 5, 20 and 60 seconds after a driver's
++		 * first picture, if the size is still another one, say it again. Later the size is
++		 * the user's business (they may have chosen it in Windows).
++		 */
++		pthread_mutex_lock(&sc->mtx);
++		if (sc->nudged > 0 && sc->nudged <= 120) {
++			int t = sc->nudged++;
++			if ((t == 10 || t == 40 || t == 120) && sc->shm->active &&
++			    (sc->shm->width != sc->pref_w || sc->shm->height != sc->pref_h) &&
++			    (sc->vs.vs_status & 4)) {
++				sc->events_read |= VIRTIO_GPU_EVENT_DISPLAY;
++				sc->cfggen++;
++				vi_interrupt(&sc->vs, VIRTIO_PCI_ISR_CONFIG, sc->vs.vs_msix_cfg_idx);
++			}
++		}
++		pthread_mutex_unlock(&sc->mtx);
++#endif
+ 		uint32_t s = sc->shm->req_seq;
+ 		if (s == sc->req_seen)
+ 			continue;
+@@ -697,6 +867,17 @@
+ static void
+ vtgpu_reset(struct vtgpu_softc *sc)
+ {
++#ifdef KEEL_VTGPU_3D
++	sc->nudged = 0;
++	if (sc->g3d != NULL) {
++		vtgpu3d_reset(sc->g3d);
++		while (sc->waits != NULL) {	/* their chains go with the queues */
++			struct vtgpu_wait *w = sc->waits;
++			sc->waits = w->next;
++			free(w);
++		}
++	}
++#endif
+ 	while (sc->res != NULL)
+ 		res_free(sc, sc->res->id);
+ 	sc->scanout_res = 0;
+@@ -832,6 +1013,9 @@
+ 	if (baridx != sc->bar_regs)
+ 		return;
+ 	pthread_mutex_lock(&sc->mtx);
++	if (sc->shm->debug >= 3)
++		EPRINTLN("virtio-gpu: write +%#llx/%d = %#llx (queue %d)", (unsigned long long)off,
++		    size, (unsigned long long)value, sc->vs.vs_curq);
+ 	if (off < OFF_ISR) {
+ 		common_write(sc, off, size, value);
+ 	} else if (off >= OFF_DEVICE && off < OFF_DEVICE + 16) {
+@@ -856,6 +1040,9 @@
+ 	if (baridx != sc->bar_regs)
+ 		return (0);
+ 	pthread_mutex_lock(&sc->mtx);
++	if (sc->shm->debug >= 3 && off != OFF_ISR)
++		EPRINTLN("virtio-gpu: read +%#llx/%d (queue %d)", (unsigned long long)off, size,
++		    sc->vs.vs_curq);
+ 	if (off < OFF_ISR) {
+ 		v = common_read(sc, off, size);
+ 	} else if (off == OFF_ISR) {
+@@ -866,6 +1053,10 @@
+ 	} else if (off >= OFF_DEVICE && off < OFF_DEVICE + 16) {
+ 		/* events_read, events_clear, num_scanouts, num_capsets */
+ 		uint32_t cfg[4] = { sc->events_read, 0, 1, 0 };
++#ifdef KEEL_VTGPU_3D
++		if (sc->g3d != NULL)
++			cfg[3] = vtgpu3d_num_capsets(sc->g3d);
++#endif
+ 		uint64_t o = off - OFF_DEVICE;
+ 		memcpy(&v, (uint8_t *)cfg + o, MIN((uint64_t)size, 16 - o));
+ 	}
+@@ -923,6 +1114,8 @@
+ 	sc->shm->magic = KGPU_MAGIC;
+ 	sc->shm->pref_width = sc->pref_w;
+ 	sc->shm->pref_height = sc->pref_h;
++	if ((v = getenv("VTGPU_DEBUG")) != NULL)	/* from the start: 3 = the register writes too */
++		sc->shm->debug = atoi(v);
+ 
+ 	sc->features = VIRTIO_F_VERSION_1 | VIRTIO_GPU_F_EDID;
+ 	vi_softc_linkup(&sc->vs, &vtgpu_vi_consts, sc, pi, sc->vq);
+@@ -948,6 +1141,29 @@
+ 	vtgpu_add_vcap(pi, bar_regs, VPCI_CAP_DEVICE, OFF_DEVICE, 16, 0);
+ 	vtgpu_add_vcap(pi, bar_regs, VPCI_CAP_NOTIFY, OFF_NOTIFY, 4, 1);
+ 
++#ifdef KEEL_VTGPU_3D
++	/*
++	 * "3d=on[,hostmem=MiB]": Direct3D through virglrenderer (hvf/pci_virtio_gpu_3d.c). Its
++	 * memory window is BAR 4 (and 5), free in the standalone device and in fbuf's
++	 * virtio-vga. When the renderer does not start the device stays 2D.
++	 */
++	if (get_config_bool_node_default(nvl, "3d", false)) {
++		struct vtgpu3d_host host = {
++			.arg = sc,
++			.lock = vtgpu_h_lock,
++			.unlock = vtgpu_h_unlock,
++			.complete = vtgpu_h_complete,
++			.present = vtgpu_h_present,
++		};
++		uint64_t mib = 8192;
++		if ((v = get_config_value_node(nvl, "hostmem")) != NULL)
++			mib = MIN(MAX(strtoull(v, NULL, 0), 256ull), 16384ull);
++		sc->g3d = vtgpu3d_init(pi, BAR_HOSTMEM, mib << 20, &host);
++		if (sc->g3d != NULL)
++			sc->features |= vtgpu3d_features(sc->g3d);
++	}
++#endif
++
+ 	pthread_create(&tid, NULL, vtgpu_watch, sc);
+ 	pthread_set_name_np(tid, "virtio-gpu watch");
+ 	return (sc);
+@@ -958,9 +1174,28 @@
+ {
+ 	struct vtgpu_softc *sc = arg;
+ 
++#ifdef KEEL_VTGPU_3D
++	if (baridx == BAR_HOSTMEM && sc->g3d != NULL)
++		return (1);	/* what of the window has no blob: reads 0 */
++#endif
+ 	return (baridx == sc->bar_regs || baridx == sc->bar_msix);
+ }
+ 
++/* the guest set (or took away) a BAR's address: the 3D part's window follows */
++void
++keel_vtgpu_baraddr(void *arg, int baridx, int enabled, uint64_t address)
++{
++	if (arg != NULL && ((struct vtgpu_softc *)arg)->shm->debug >= 3)
++		EPRINTLN("virtio-gpu: BAR %d %s at %#llx", baridx, enabled ? "decoded" : "off",
++		    (unsigned long long)address);
++#ifdef KEEL_VTGPU_3D
++	struct vtgpu_softc *sc = arg;
++
++	if (baridx == BAR_HOSTMEM && sc != NULL && sc->g3d != NULL)
++		vtgpu3d_baraddr(sc->g3d, enabled, address);
++#endif
++}
++
+ /*
+  * The scanout while the guest's driver shows one (BGRX, stride = w * 4): for fbuf's
+  * console image (VNC, keel-rdp's QUERY). 0 without one.
+@@ -980,6 +1215,8 @@
+ 
+ /* standalone: -s N,virtio-gpu */
+ 
++void *keel_vtgpu_standalone;
++
+ static void
+ vtgpu_write(struct pci_devinst *pi, int baridx, uint64_t off, int size, uint64_t value)
+ {
+@@ -1009,6 +1246,7 @@
+ 	if (sc == NULL)
+ 		return (1);
+ 	pi->pi_arg = sc;
++	keel_vtgpu_standalone = sc;
+ 	return (0);
+ }
+ 
+@@ -1171,9 +1409,16 @@
+ }
+ #endif
+ 
++static void
++vtgpu_baraddr(struct pci_devinst *pi, int baridx, int enabled, uint64_t address)
++{
++	keel_vtgpu_baraddr(pi->pi_arg, baridx, enabled, address);
++}
++
+ static const struct pci_devemu pci_de_vtgpu = {
+ 	.pe_emu =	"virtio-gpu",
+ 	.pe_init =	vtgpu_init,
++	.pe_baraddr =	vtgpu_baraddr,
+ 	.pe_barwrite =	vtgpu_write,
+ 	.pe_barread =	vtgpu_read,
+ #ifdef BHYVE_SNAPSHOT
+--- a/usr.sbin/bhyve/pci_virtio_gpu.h
++++ b/usr.sbin/bhyve/pci_virtio_gpu.h
+@@ -47,6 +47,13 @@
+ 	    uint64_t value);
+ uint64_t keel_vtgpu_barread(void *sc, struct pci_devinst *pi, int baridx, uint64_t off, int size);
+ int	keel_vtgpu_scanout(void *sc, void **pix, int *w, int *h);
++void	keel_vtgpu_baraddr(void *sc, int baridx, int enabled, uint64_t address);
++/*
++ * The standalone device ("-s N,virtio-gpu"), or NULL: fbuf shows its scanout as the console's
++ * picture too (VNC), as it does its own virtio-vga part's. A guest's driver may take the
++ * standalone device and not the virtio-vga (Windows' viogpu3d).
++ */
++extern void *keel_vtgpu_standalone;
+ #ifdef BHYVE_SNAPSHOT
+ struct vm_snapshot_meta;
+ int	keel_vtgpu_snapshot(void *sc, struct vm_snapshot_meta *meta);

@@ -11,8 +11,8 @@
 //! objc2-core-video, block signatures). The structure is the deliverable.
 
 use std::num::{NonZeroU16, NonZeroUsize};
-use std::sync::Mutex;
-use std::time::Duration;
+use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
 
 use anyhow::{Context, anyhow, bail};
 use block2::RcBlock;
@@ -95,6 +95,112 @@ pub fn primary() -> anyhow::Result<Screen> {
     })
 }
 
+/// Where a capture's thread is while it calls into the system, for the log: on 2026-11-11 the
+/// Mac's desktop stayed without a picture after a restart of the service (three logins, no
+/// "capturing", no error, no timeout) and nothing said which call never came back. Each call
+/// that leaves this process is a step; a watchdog thread says so when one lasts, and once has
+/// the system's `sample` write this process's stacks to <state>/logs.
+#[derive(Clone)]
+struct Steps(Arc<Mutex<StepState>>);
+
+struct StepState {
+    /// the call in progress and since when; None: not in one
+    now: Option<(&'static str, Instant)>,
+    /// the capture's thread has ended
+    over: bool,
+    /// the steps done and what each took, ms (said when one was slow)
+    took: Vec<(&'static str, u128)>,
+}
+
+/// A step lasting this long is said in the log (and again at 3x, 9x, ...).
+const STEP_SLOW: Duration = Duration::from_secs(5);
+
+impl Steps {
+    fn new() -> Self {
+        let s = Steps(Arc::new(Mutex::new(StepState { now: None, over: false, took: Vec::new() })));
+        let w = s.clone();
+        let _ = std::thread::Builder::new().name("capture-watch".into()).spawn(move || {
+            let mut said = (None::<&'static str>, STEP_SLOW, false);
+            loop {
+                std::thread::sleep(Duration::from_secs(1));
+                let st = w.0.lock().unwrap();
+                if st.over {
+                    return;
+                }
+                let Some((name, since)) = st.now else {
+                    said = (None, STEP_SLOW, said.2);
+                    continue;
+                };
+                drop(st);
+                if said.0 != Some(name) {
+                    said = (Some(name), STEP_SLOW, said.2);
+                }
+                if since.elapsed() < said.1 {
+                    continue;
+                }
+                said.1 *= 3;
+                warn!(step = name, secs = since.elapsed().as_secs(), "capture: this call has not come back");
+                if !said.2 {
+                    said.2 = true;
+                    sample_self(name);
+                }
+            }
+        });
+        s
+    }
+
+    /// Run `f` as the step `name`.
+    fn step<T>(&self, name: &'static str, f: impl FnOnce() -> T) -> T {
+        let t = Instant::now();
+        self.0.lock().unwrap().now = Some((name, t));
+        let r = f();
+        let mut st = self.0.lock().unwrap();
+        st.now = None;
+        st.took.push((name, t.elapsed().as_millis()));
+        r
+    }
+
+    /// The steps so far, if any was slow: one line.
+    fn report(&self) {
+        let mut st = self.0.lock().unwrap();
+        if st.took.iter().any(|(_, ms)| *ms >= 1000) {
+            let all: Vec<String> = st.took.iter().map(|(n, ms)| format!("{n} {ms} ms")).collect();
+            warn!(steps = all.join(", "), "capture: slow to start");
+        }
+        st.took.clear();
+    }
+}
+
+impl Drop for StepsEnd {
+    fn drop(&mut self) {
+        self.0 .0.lock().unwrap().over = true;
+    }
+}
+
+/// Ends the watchdog when the capture's thread ends, however it does.
+struct StepsEnd(Steps);
+
+/// This process's stacks, by the system's `sample`, into <state>/logs/capture-stall-<time>.txt:
+/// what a person would run by hand, done while the call is still stuck.
+fn sample_self(step: &str) {
+    let dir = crate::vms::root().join("logs");
+    let _ = std::fs::create_dir_all(&dir);
+    let secs = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0);
+    let file = dir.join(format!("capture-stall-{secs}.txt"));
+    match std::process::Command::new("/usr/bin/sample")
+        .arg(std::process::id().to_string())
+        .args(["2", "-mayDie", "-file"])
+        .arg(&file)
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .spawn()
+    {
+        Ok(_) => warn!(step, file = %file.display(), "capture: stacks of this process are being written"),
+        Err(e) => warn!(step, "capture: could not run sample: {e}"),
+    }
+}
+
 /// Start capturing `screen`. Frames arrive on the returned channel from ScreenCaptureKit's
 /// own queue; dropping the receiver (and with it `Stop`, held by the same owner) ends the
 /// capture. The capture runs on its own thread so no ObjC object crosses into the
@@ -121,27 +227,31 @@ fn run(
     sound: Option<crate::sound::Sound>,
     mute: crate::tap::MuteSwitch,
 ) -> anyhow::Result<()> {
+    let steps = Steps::new();
+    let _end = StepsEnd(steps.clone());
     // The SCDisplay for this capture, fetched here so the Retained object can be moved
     // to this thread in one piece.
-    let display: Retained<SCDisplay> = with_content(move |c| {
+    let display: Retained<SCDisplay> = steps.step("shareable content", || with_content(move |c| {
         let displays = unsafe { c.displays() };
         let d = displays
             .iter()
             .find(|d| unsafe { d.displayID() } == screen.id)
             .context("display gone")?;
         Ok(SendCell(d))
-    })
+    }))
     .map(|c| c.0)?;
 
-    let filter = unsafe {
+    let filter = steps.step("content filter", || unsafe {
         SCContentFilter::initWithDisplay_excludingWindows(SCContentFilter::alloc(), &display, &NSArray::new())
-    };
+    });
     let config = unsafe { SCStreamConfiguration::new() };
-    unsafe {
+    steps.step("stream configuration", || unsafe {
         config.setWidth(screen.width as usize);
         config.setHeight(screen.height as usize);
         config.setPixelFormat(kCVPixelFormatType_32BGRA);
-        config.setMinimumFrameInterval(CMTime { value: 1, timescale: fps(), flags: CMTimeFlags::Valid, epoch: 0 });
+        // (60 for a client on the local network, video.rs fps(); bitmaps stay at fps(), frame())
+        let rate = video.as_ref().map_or(fps(), |v| v.fps());
+        config.setMinimumFrameInterval(CMTime { value: 1, timescale: rate, flags: CMTimeFlags::Valid, epoch: 0 });
         config.setQueueDepth(3);
         // the client draws the pointer itself (cursor.rs)
         config.setShowsCursor(false);
@@ -153,35 +263,37 @@ fn run(
             config.setChannelCount(2);
             config.setExcludesCurrentProcessAudio(true);
         }
-    }
+    });
     let with_sound = sound.is_some();
     let output = Output::new(tx.clone(), video, sound);
     let queue = DispatchQueue::new("hypermac.capture", None);
-    let stream = unsafe {
+    let stream = steps.step("stream init", || unsafe {
         SCStream::initWithFilter_configuration_delegate(
             SCStream::alloc(),
             &filter,
             &config,
             Some(ProtocolObject::from_ref(&*output)),
         )
-    };
-    unsafe {
+    });
+    steps.step("add screen output", || unsafe {
         stream
             .addStreamOutput_type_sampleHandlerQueue_error(
                 ProtocolObject::from_ref(&*output),
                 SCStreamOutputType::Screen,
                 Some(&queue),
             )
-            .map_err(|e| anyhow!("addStreamOutput: {}", e.localizedDescription()))?;
-        if with_sound {
+            .map_err(|e| anyhow!("addStreamOutput: {}", e.localizedDescription()))
+    })?;
+    if with_sound {
+        steps.step("add audio output", || unsafe {
             stream
                 .addStreamOutput_type_sampleHandlerQueue_error(
                     ProtocolObject::from_ref(&*output),
                     SCStreamOutputType::Audio,
                     Some(&queue),
                 )
-                .map_err(|e| anyhow!("addStreamOutput(audio): {}", e.localizedDescription()))?;
-        }
+                .map_err(|e| anyhow!("addStreamOutput(audio): {}", e.localizedDescription()))
+        })?;
     }
     let (start_tx, start_rx) = std::sync::mpsc::channel::<Result<(), String>>();
     let block = RcBlock::new(move |error: *mut NSError| {
@@ -190,11 +302,10 @@ fn run(
             None => Ok(()),
         });
     });
-    unsafe { stream.startCaptureWithCompletionHandler(Some(&block)) };
-    start_rx
-        .recv_timeout(Duration::from_secs(10))
-        .context("startCapture did not answer")?
-        .map_err(|e| anyhow!("startCapture: {e}"))?;
+    steps.step("startCapture (the call)", || unsafe { stream.startCaptureWithCompletionHandler(Some(&block)) });
+    let started = steps.step("startCapture (its answer)", || start_rx.recv_timeout(Duration::from_secs(10)));
+    steps.report();
+    started.context("startCapture did not answer")?.map_err(|e| anyhow!("startCapture: {e}"))?;
     info!(id = screen.id, w = screen.width, h = screen.height, "capturing");
 
     // Hold the stream until the connection is done with it: the frame callback notices
@@ -217,7 +328,7 @@ fn run(
         }
         let want = tap_ok && mute_on;
         if want && tap.is_none() {
-            match crate::tap::Tap::start(sound.clone()) {
+            match steps.step("CoreAudio tap", || crate::tap::Tap::start(sound.clone())) {
                 Ok(t) => {
                     if let Some(s) = &sound {
                         s.set_tapped(true);
@@ -250,13 +361,14 @@ fn run(
     if let Some(s) = &sound {
         s.set_tapped(false);
     }
-    drop(tap);
+    steps.step("CoreAudio tap (closing)", || drop(tap));
     let block = RcBlock::new(move |error: *mut NSError| {
         if let Some(e) = unsafe { error.as_ref() } {
             debug!("stopCapture: {}", unsafe { e.localizedDescription() });
         }
     });
-    unsafe { stream.stopCaptureWithCompletionHandler(Some(&block)) };
+    steps.step("stopCapture (the call)", || unsafe { stream.stopCaptureWithCompletionHandler(Some(&block)) });
+    steps.report();
     info!(id = screen.id, "capture stopped");
     Ok(())
 }
@@ -272,6 +384,8 @@ struct Ivars {
     encoder: Mutex<Option<(crate::encoder::Encoder, u32)>>,
     /// RDPSND of this connection: the stream's audio samples go here (sound.rs).
     sound: Option<crate::sound::Sound>,
+    /// when the last bitmap went out (frame(): their rate is fps() whatever the capture's is)
+    bitmap_at: Mutex<Option<std::time::Instant>>,
 }
 
 define_class!(
@@ -323,6 +437,7 @@ impl Output {
             video,
             encoder: Mutex::new(None),
             sound,
+            bitmap_at: Mutex::new(None),
         });
         unsafe { msg_send![super(this), init] }
     }
@@ -380,9 +495,8 @@ impl Output {
                     if enc.as_ref().map(|(_, s)| *s) != Some(stream) {
                         *enc = None; // the old stream's encoder, and its drain thread, go
                         // 6 Mbps: 1080p30 over a home uplink (10 burst to 14 and queued, 200 ms
-                        // spikes); MACRDP_VIDEO_KBPS raises it on a LAN
-                        let kbps = std::env::var("MACRDP_VIDEO_KBPS").ok().and_then(|s| s.parse().ok()).unwrap_or(6_000);
-                        match crate::encoder::Encoder::new(w, h, fps() as u32, kbps) {
+                        // spikes); 12 at 60 a second on the local network (video.rs kbps())
+                        match crate::encoder::Encoder::new(w, h, v.fps() as u32, v.kbps()) {
                             Ok((e, rx)) => {
                                 let v = v.clone();
                                 // encoded frames come out on VideoToolbox's thread into rx;
@@ -416,6 +530,12 @@ impl Output {
                     if let Ok(mut enc) = self.ivars().encoder.try_lock() {
                         *enc = None;
                     }
+                    // the capture may run at the local network's 60: bitmaps stay at fps()
+                    let mut last = self.ivars().bitmap_at.lock().unwrap();
+                    if last.is_some_and(|t| t.elapsed() < Duration::from_micros(900_000 / fps() as u64)) {
+                        return Ok(());
+                    }
+                    *last = Some(std::time::Instant::now());
                 }
             }
         }
@@ -462,5 +582,53 @@ impl Output {
                 Ok(())
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod step_tests {
+    use super::*;
+
+    /// A step gives back what its call gave and is no longer "in progress" afterwards; the
+    /// watchdog's thread ends with the capture's.
+    #[test]
+    fn steps_are_recorded() {
+        let steps = Steps::new();
+        let end = StepsEnd(steps.clone());
+        assert_eq!(steps.step("a", || 7), 7);
+        steps.step("b", || std::thread::sleep(Duration::from_millis(20)));
+        {
+            let st = steps.0.lock().unwrap();
+            assert!(st.now.is_none());
+            assert_eq!(st.took.iter().map(|(n, _)| *n).collect::<Vec<_>>(), ["a", "b"]);
+            assert!(st.took[1].1 >= 20);
+        }
+        drop(end);
+        assert!(steps.0.lock().unwrap().over);
+    }
+
+    /// The real thing, by hand (takes 12 s, writes a file into the state folder's logs):
+    /// `cargo test --release -- --ignored stalled_step_is_said_and_sampled --nocapture`.
+    /// A step that does not come back is said after STEP_SLOW and this process's stacks are
+    /// written, with this test's own frame in them.
+    #[test]
+    #[ignore]
+    fn stalled_step_is_said_and_sampled() {
+        let dir = crate::vms::root().join("logs");
+        let before: std::collections::HashSet<_> =
+            std::fs::read_dir(&dir).map(|d| d.filter_map(|e| e.ok()).map(|e| e.path()).collect()).unwrap_or_default();
+        let steps = Steps::new();
+        let _end = StepsEnd(steps.clone());
+        steps.step("a call that hangs (test)", || std::thread::sleep(STEP_SLOW + Duration::from_secs(7)));
+        let new: Vec<_> = std::fs::read_dir(&dir)
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .map(|e| e.path())
+            .filter(|p| !before.contains(p) && p.file_name().is_some_and(|n| n.to_string_lossy().starts_with("capture-stall-")))
+            .collect();
+        assert_eq!(new.len(), 1, "{new:?}");
+        let text = std::fs::read_to_string(&new[0]).unwrap();
+        assert!(text.contains("stalled_step_is_said_and_sampled"), "the sample does not show this test's thread");
+        let _ = std::fs::remove_file(&new[0]);
     }
 }

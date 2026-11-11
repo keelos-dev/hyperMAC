@@ -72,6 +72,49 @@ pub fn program() -> Option<PathBuf> {
     find("HYPERMAC_BHYVE", "bhyve", "build/bhyve")
 }
 
+/// The 3D engine (vm.json `"gpu3d": true`): bhyve built with virglrenderer (`make VIRGL=PREFIX`
+/// in vm/bhyve makes build/bhyve-3d) and what it starts for every guest process that draws:
+/// `virgl_render_server`, which loads Direct3D-on-Metal from `libdxmt-native.dylib`.
+pub struct Gpu3d {
+    pub bhyve: PathBuf,
+    server: PathBuf,
+    dxmt: PathBuf,
+    /// the guest's driver (Triton: viogpu3d.inf and its files), when it is there: a new
+    /// Windows VM's setup CD takes it
+    pub driver: Option<PathBuf>,
+}
+
+/// Those two are looked for in $HYPERMAC_GPU3D, else `gpu3d/` beside bhyve-3d (hyperMAC.app:
+/// in Contents/Resources): flat, or as virglrenderer's and DXMT's `meson install` leave them
+/// (lib/, libexec/).
+pub fn gpu3d() -> Option<Gpu3d> {
+    let bhyve = find("HYPERMAC_BHYVE3D", "bhyve-3d", "build/bhyve-3d")?;
+    let beside = bhyve.with_file_name("gpu3d");
+    let in_app = bhyve.parent().and_then(|p| p.parent()).map(|p| p.join("Resources/gpu3d"));
+    let dir = std::env::var_os("HYPERMAC_GPU3D").map(PathBuf::from).unwrap_or_else(|| match in_app {
+        Some(a) if !beside.exists() && a.exists() => a,
+        _ => beside,
+    });
+    let pick = |sub: &str, name: &str| [dir.join(name), dir.join(sub).join(name)].into_iter().find(|p| p.exists());
+    let driver = Some(dir.join("driver")).filter(|d| d.join("viogpu3d.inf").exists());
+    Some(Gpu3d { bhyve, server: pick("libexec", "virgl_render_server")?, dxmt: pick("lib", "libdxmt-native.dylib")?, driver })
+}
+
+impl Gpu3d {
+    /// What the renderer reads from the environment. Not DYLD_*: the system takes those away
+    /// from a program started through /bin/sh, and names what is loaded less exactly.
+    fn env(&self, cmd: &mut Command) {
+        cmd.env("RENDER_SERVER_EXEC_PATH", &self.server).env("NPT_BACKEND", "dxmt");
+        // DXMT writes a log file into the current directory otherwise
+        if std::env::var_os("DXMT_LOG_PATH").is_none() {
+            cmd.env("DXMT_LOG_PATH", "none");
+        }
+        for k in ["NPT_D3D11_LIBRARY_PATH", "NPT_DXGI_LIBRARY_PATH", "NPT_D3D12_LIBRARY_PATH"] {
+            cmd.env(k, &self.dxmt);
+        }
+    }
+}
+
 /// swtpm (Homebrew's, or beside this program): the software TPM behind a Windows VM's TPM 2.0.
 pub fn swtpm() -> Option<PathBuf> {
     if let Some(p) = find("HYPERMAC_SWTPM", "swtpm", "build/swtpm") {
@@ -199,8 +242,77 @@ pub fn active() -> bool {
     ACTIVE.load(Ordering::Relaxed)
 }
 
+// With 3D the picture is taken where the device puts it: its shared memory (/keel-gpu-NAME,
+// struct kgpu_shm in vm/bhyve/keel/pci_virtio_gpu.h), not through bhyve's VNC server, which
+// sends a screen that changes everywhere (a game) about 7 times a second. Input still goes
+// through the VNC connection.
+const KGPU_PIXELS: usize = 4096;
+const KGPU_SIZE: usize = KGPU_PIXELS + 3840 * 2160 * 4 + 64 * 64 * 4;
+/// frame numbers of this source: apart from SCREEN's
+const KGPU_FRAME: u64 = 1 << 48;
+
+struct Kgpu(*const u8);
+unsafe impl Send for Kgpu {}
+
+/// the VM's name when it runs with 3D
+static KGPU_NAME: Mutex<Option<String>> = Mutex::new(None);
+/// (the mapping, when it was last tried). Each bhyve start makes a new object: view() drops this.
+static KGPU: Mutex<(Option<Kgpu>, Option<std::time::Instant>)> = Mutex::new((None, None));
+
+fn kgpu_u32(p: *const u8, off: usize) -> u32 {
+    unsafe { (p.add(off) as *const u32).read_volatile() }
+}
+
+/// The 3D device's scanout, when its driver shows one: None = take bhyve's framebuffer.
+fn kgpu_snapshot(last: Option<u64>) -> Option<(u64, u32, u32, Vec<u8>)> {
+    let mut g = KGPU.lock().unwrap();
+    if g.0.is_none() {
+        if g.1.is_some_and(|t| t.elapsed() < Duration::from_millis(500)) {
+            return None;
+        }
+        g.1 = Some(std::time::Instant::now());
+        let name = std::ffi::CString::new(format!("/keel-gpu-{}", KGPU_NAME.lock().unwrap().as_deref()?)).ok()?;
+        let fd = unsafe { libc::shm_open(name.as_ptr(), libc::O_RDONLY, 0) };
+        if fd < 0 {
+            return None;
+        }
+        let p = unsafe { libc::mmap(std::ptr::null_mut(), KGPU_SIZE, libc::PROT_READ, libc::MAP_SHARED, fd, 0) };
+        unsafe { libc::close(fd) };
+        if p == libc::MAP_FAILED {
+            return None;
+        }
+        g.0 = Some(Kgpu(p as *const u8));
+    }
+    let p = g.0.as_ref()?.0;
+    // magic "kgp1", seq, active, width, height
+    let (active, w, h) = (kgpu_u32(p, 8), kgpu_u32(p, 12), kgpu_u32(p, 16));
+    if kgpu_u32(p, 0) != 0x3170676b || active == 0 || w == 0 || h == 0 || w > 3840 || h > 2160 {
+        return None;
+    }
+    let mut seq = kgpu_u32(p, 4);
+    if last == Some(KGPU_FRAME | seq as u64) {
+        return Some((KGPU_FRAME | seq as u64, w, h, Vec::new()));
+    }
+    let n = w as usize * h as usize * 4;
+    let mut pix = vec![0u8; n];
+    // (the device writes a frame's rows and then counts seq up: a copy that a frame crossed is
+    // taken once more; a second crossing is shown as it is, the next poll replaces it)
+    for _ in 0..2 {
+        unsafe { std::ptr::copy_nonoverlapping(p.add(KGPU_PIXELS), pix.as_mut_ptr(), n) };
+        let now = kgpu_u32(p, 4);
+        if now == seq {
+            break;
+        }
+        seq = now;
+    }
+    Some((KGPU_FRAME | seq as u64, w, h, pix))
+}
+
 /// vgpu::snapshot for this engine.
 pub fn snapshot(last: Option<u64>) -> Option<(u64, u32, u32, Vec<u8>)> {
+    if let Some(f) = kgpu_snapshot(last) {
+        return Some(f);
+    }
     let s = SCREEN.lock().unwrap();
     let s = s.as_ref()?;
     if last == Some(s.frame) {
@@ -293,6 +405,58 @@ pub fn button(b: u16, down: bool) -> u64 {
     pointer(*p)
 }
 
+/// vinput::wheel for this engine: `steps` notches, up when positive. RFB's buttons 4 and 5 (mask
+/// 8 and 16) are the wheel; bhyve's tablet turns each pointer event that has one into a report
+/// with one wheel step of its own (keel/patch-usbmouse.py), so one event per notch and then the
+/// buttons as they are.
+///
+/// The notches go out one every WHEEL_GAP, from a thread of their own. Sent all at once, a
+/// Windows guest scrolled further than asked: 3 notches gave 4, 5 gave 7, while single notches
+/// were always exact (2026-11-11, a terminal's lines counted). The reports that wait in the
+/// tablet for the guest's next transfer are the ones that count twice; why is not known yet
+/// (the xHCI's serving of queued transfers, patches/keel/0001, is the suspect). At this pace
+/// each report finds the guest's transfer waiting, as a single notch does.
+pub fn wheel(steps: i32) -> u64 {
+    static TX: std::sync::OnceLock<std::sync::mpsc::Sender<i32>> = std::sync::OnceLock::new();
+    let tx = TX.get_or_init(|| {
+        let (tx, rx) = std::sync::mpsc::channel::<i32>();
+        std::thread::spawn(move || {
+            // what is still to send; a turn the other way cancels what is left of this one
+            let mut left = 0i32;
+            loop {
+                if left == 0 {
+                    match rx.recv() {
+                        Ok(n) => left = n,
+                        Err(_) => return,
+                    }
+                }
+                while let Ok(n) = rx.try_recv() {
+                    left = if (left > 0) == (n > 0) { left + n } else { n };
+                }
+                left = left.clamp(-WHEEL_MAX, WHEEL_MAX);
+                if left == 0 {
+                    continue;
+                }
+                let p = *POINTER.lock().unwrap();
+                pointer((p.0, p.1, p.2 | if left > 0 { 8 } else { 16 }));
+                left -= left.signum();
+                if left == 0 {
+                    let p = *POINTER.lock().unwrap();
+                    pointer(p);
+                }
+                std::thread::sleep(WHEEL_GAP);
+            }
+        });
+        tx
+    });
+    if steps != 0 && tx.send(steps).is_ok() { steps.unsigned_abs() as u64 } else { 0 }
+}
+
+/// One wheel notch to the guest at a time, this far apart (the tablet is polled every 8 ms or so).
+const WHEEL_GAP: std::time::Duration = std::time::Duration::from_millis(16);
+/// More notches than this waiting are not worth sending: the hand has stopped long ago.
+const WHEEL_MAX: i32 = 40;
+
 fn exact(s: &mut TcpStream, n: usize) -> std::io::Result<Vec<u8>> {
     let mut b = vec![0u8; n];
     s.read_exact(&mut b)?;
@@ -306,6 +470,10 @@ fn be16(b: &[u8], o: usize) -> usize {
 /// One connection to bhyve's VNC server, until it ends (bhyve exited).
 fn view(port: u16) -> anyhow::Result<()> {
     let mut s = TcpStream::connect(("127.0.0.1", port))?;
+    // a new bhyve: its 3D device's shared memory is a new object
+    if let Some(k) = KGPU.lock().unwrap().0.take() {
+        unsafe { libc::munmap(k.0 as *mut _, KGPU_SIZE) };
+    }
     s.set_nodelay(true)?;
     exact(&mut s, 12)?;
     s.write_all(b"RFB 003.008\n")?;
@@ -452,7 +620,7 @@ fn kill_stale(dir: &Path) {
     let _ = std::fs::remove_file(dir.join("bhyve.pid"));
 }
 
-fn arguments(name: &str, dir: &Path, conf: &VmConf, fw: &Path, tty: &str, fb_port: u16, iso: Option<&str>) -> Vec<String> {
+fn arguments(name: &str, dir: &Path, conf: &VmConf, fw: &Path, tty: &str, fb_port: u16, iso: Option<&str>, gpu3d: bool) -> Vec<String> {
     let d = |f: &str| dir.join(f).to_string_lossy().into_owned();
     let mut a: Vec<String> = vec!["-c".into(), conf.cpus.to_string(), "-m".into(), format!("{}G", conf.mem_gb)];
     let mut o = |v: String| a.extend(["-o".into(), v]);
@@ -491,9 +659,31 @@ fn arguments(name: &str, dir: &Path, conf: &VmConf, fw: &Path, tty: &str, fb_por
         },
     };
     s(format!("8,virtio-net,{net},mac={}", conf.mac));
+    if gpu3d {
+        // The 3D adapter, a device of its own beside fbuf (the layout Triton's driver knows from
+        // QEMU): the firmware, setup and a guest without the driver stay on fbuf; once the driver
+        // shows a picture, that is what fbuf's VNC (our viewer) gets. hostmem: the window the
+        // guest's processes share memory with the renderer in, a 64-bit BAR.
+        s(format!("9,virtio-gpu,3d=on,hostmem=4096,w={},h={}", conf.w.clamp(640, MAX_W), conf.h.clamp(480, MAX_H)));
+    }
+    if hda(conf) {
+        // The sound card: HD Audio, which Windows has its own driver for (hdaudio.sys). What the
+        // guest plays goes into a ring in a file (keelOS's: bhyve/keel/audio.h, 16-bit stereo at
+        // the guest's rate); nothing reads it yet. A slot of its own, away from the ones above,
+        // so that Windows keeps the same card when those change. HYPERMAC_HDA=0: no card.
+        s(format!("{HDA_SLOT},hda,play=keel:{}", d("sound.ring")));
+    }
     a.push(name.into());
     a
 }
+
+/// The VM gets a sound card.
+fn hda(conf: &VmConf) -> bool {
+    conf.os == "windows" && std::env::var("HYPERMAC_HDA").as_deref() != Ok("0")
+}
+
+/// The sound card's PCI slot.
+const HDA_SLOT: u32 = 16;
 
 /// `hypermac run NAME` for a VM on this engine: until the guest powers off or `ctl NAME kill`.
 /// `--install`: the first start is Windows setup from the CD (answers its "Press any key").
@@ -502,14 +692,30 @@ pub fn run(name: &str, args: &[String], conf: VmConf) -> anyhow::Result<()> {
     use objc2_app_kit::{NSApplication, NSApplicationActivationPolicy};
 
     let dir = vm_dir(name);
-    let exe = program().context("bhyve is missing: run build.sh (it builds vm/bhyve)")?;
+    let mut exe = program().context("bhyve is missing: run build.sh (it builds vm/bhyve)")?;
+    // (not while Windows setup runs: it stays on the framebuffer, with nothing else to find)
+    let g3 = if conf.gpu3d && !dir.join("installing").exists() { gpu3d() } else { None };
+    match &g3 {
+        Some(g) => {
+            eprintln!("gpu3d: {}", g.bhyve.display());
+            *KGPU_NAME.lock().unwrap() = Some(name.to_string());
+            exe = g.bhyve.clone();
+        }
+        None if conf.gpu3d && !dir.join("installing").exists() => eprintln!("gpu3d: the 3D engine (bhyve-3d, gpu3d/) is not installed: starting without"),
+        None => {}
+    }
     let fw = firmware().context("the UEFI firmware (QEMU_EFI.fd) is missing: run build.sh")?;
     let sock = dir.join("ctl.sock");
     kill_stale(&dir);
 
+    crate::no_app_nap();
     ACTIVE.store(true, Ordering::Relaxed);
     if let Err(e) = crate::shm::export(&dir) {
         eprintln!("screen.shm: {e:#}");
+    }
+    if hda(&conf) {
+        // the guest's sound on this Mac while its window is open (sound.rs)
+        crate::sound::start(&dir, crate::console::shown);
     }
     let vnc = crate::rfb::start(num(args, "--vnc-port", 0) as u16, conf.vnc_password.clone())?;
     VNC_PORT.store(vnc, Ordering::Relaxed);
@@ -570,7 +776,7 @@ pub fn run(name: &str, args: &[String], conf: VmConf) -> anyhow::Result<()> {
                 // (Windows only: FreeBSD's and Linux's CDs boot without a key, and the Enters
                 // would answer their installers on the serial console)
                 PRESS_KEY.store(conf.os == "windows" && iso.is_some() && ((install && runs == 1) || unpartitioned(&dir.join("disk.img"))), Ordering::Relaxed);
-                let mut a = arguments(&name, &dir, &conf, &fw, &tty, fb_port, iso.as_deref());
+                let mut a = arguments(&name, &dir, &conf, &fw, &tty, fb_port, iso.as_deref(), g3.is_some());
                 // Windows gets a TPM 2.0 where swtpm is installed
                 // the TPM inside bhyve when it has one (its state in DIR/tpm), else an swtpm process
                 let builtin = conf.os == "windows" && tpm_builtin();
@@ -587,7 +793,12 @@ pub fn run(name: &str, args: &[String], conf: VmConf) -> anyhow::Result<()> {
                         eprintln!("tpm: swtpm, state in {}", dir.join("tpm").display());
                     }
                 }
-                let mut child = match Command::new(&exe).args(&a).stdin(std::process::Stdio::null()).spawn() {
+                let mut cmd = Command::new(&exe);
+                cmd.args(&a).stdin(std::process::Stdio::null());
+                if let Some(g) = &g3 {
+                    g.env(&mut cmd);
+                }
+                let mut child = match cmd.spawn() {
                     Ok(c) => c,
                     Err(e) => {
                         eprintln!("bhyve: {e}");
@@ -646,10 +857,11 @@ pub fn run(name: &str, args: &[String], conf: VmConf) -> anyhow::Result<()> {
         let Ok(mut w) = c.try_clone() else { return };
         for line in BufReader::new(c).lines().map_while(Result::ok) {
             let r = match line.trim() {
-                l if l.starts_with("vkey ") || l.starts_with("vabs ") || l.starts_with("vbtn ") => {
+                l if l.starts_with("vkey ") || l.starts_with("vabs ") || l.starts_with("vbtn ") || l.starts_with("vwheel ") => {
                     let a: Vec<&str> = l.split_whitespace().collect();
                     let f = |i: usize| a.get(i).and_then(|x| x.parse::<f64>().ok());
                     let sent = match (a[0], f(1), f(2)) {
+                        ("vwheel", Some(n), _) => Some(wheel(n as i32)),
                         ("vkey", Some(k), Some(d)) => Some(key(k as u16, d != 0.0)),
                         ("vabs", Some(x), Some(y)) => Some(abs(x, y)),
                         ("vbtn", Some(b), Some(d)) => Some(button(b as u16, d != 0.0)),
@@ -657,7 +869,7 @@ pub fn run(name: &str, args: &[String], conf: VmConf) -> anyhow::Result<()> {
                     };
                     match sent {
                         Some(n) => serde_json::json!({"ok": true, "sent": n}),
-                        None => serde_json::json!({"error": "vkey CODE 1|0 | vabs X Y | vbtn B 1|0"}),
+                        None => serde_json::json!({"error": "vkey CODE 1|0 | vabs X Y | vbtn B 1|0 | vwheel STEPS"}),
                     }
                 }
                 // the picture as DIR/vscreen.bmp
@@ -790,6 +1002,14 @@ pub fn create_windows(name: &str, args: &[String]) -> anyhow::Result<()> {
     program().context("bhyve is missing: run build.sh (it builds vm/bhyve)")?;
     firmware().context("the UEFI firmware (QEMU_EFI.fd) is missing: run build.sh")?;
 
+    // --gpu3d: Direct3D on the Mac's GPU (vm.json "gpu3d"), where the 3D engine is installed
+    let want3d = args.iter().any(|a| a == "--gpu3d");
+    if want3d {
+        let g = gpu3d().context("--gpu3d: the 3D engine (bhyve-3d and gpu3d/ beside it) is not installed")?;
+        if g.driver.is_none() {
+            eprintln!("gpu3d: no driver for the guest (gpu3d/driver/viogpu3d.inf): install Triton's viogpu3d in Windows yourself");
+        }
+    }
     let dir = vm_dir(name);
     ensure!(!dir.join("vm.json").exists(), "VM {name:?} exists ({})", dir.display());
     std::fs::create_dir_all(&dir)?;
@@ -807,6 +1027,7 @@ pub fn create_windows(name: &str, args: &[String]) -> anyhow::Result<()> {
         c.w = c.w.clamp(640, MAX_W);
         c.h = c.h.clamp(480, MAX_H);
         c.os_version.get_or_insert_with(|| "11".into());
+        c.gpu3d = want3d;
     })?;
     // Secure Boot: the VM's UEFI variables start as the template with the keys in it
     let secure_boot = match vars_template() {
@@ -832,6 +1053,9 @@ pub fn create_windows(name: &str, args: &[String]) -> anyhow::Result<()> {
 /// setup.iso: autounattend.xml (setup looks for it on every drive), hypermac.cmd, the drivers.
 /// `account`: the unattended install's user and password; None = the manual install's file.
 fn setup_cd(name: &str, iso: &Path, virtio: &Path, account: Option<&(String, String)>, lab: &str, out: &Path) -> anyhow::Result<()> {
+    // a VM with "gpu3d": the 3D adapter's driver goes with the others (hypermac.cmd installs
+    // every .inf under \drivers); Windows binds it when it first sees the adapter
+    let driver3d = if crate::load(name)?.gpu3d { gpu3d().and_then(|g| g.driver) } else { None };
     let tmp = std::env::temp_dir().join(format!("hypermac-win-{}", std::process::id()));
     let stage = tmp.join("cd");
     std::fs::create_dir_all(&stage)?;
@@ -863,6 +1087,10 @@ fn setup_cd(name: &str, iso: &Path, virtio: &Path, account: Option<&(String, Str
             let from = m.path.join(d).join("w11/ARM64");
             ensure!(from.exists(), "{}: no {d}/w11/ARM64: not virtio-win.iso?", virtio.display());
             ws::copy_tree(&from, &stage.join("drivers").join(d), &|_| false)?;
+        }
+        if let Some(d) = &driver3d {
+            ws::copy_tree(d, &stage.join("drivers").join("viogpu3d"), &|_| false)?;
+            eprintln!("gpu3d: the guest's driver from {}", d.display());
         }
         let _ = std::fs::remove_file(out);
         ws::run(Command::new("/usr/bin/hdiutil").args(["makehybrid", "-quiet", "-iso", "-joliet", "-default-volume-name", "HMSETUP", "-o"]).arg(out).arg(&stage))?;

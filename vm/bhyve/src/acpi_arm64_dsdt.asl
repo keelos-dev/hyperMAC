@@ -11,6 +11,7 @@
  *	fw_cfg		0x09020000, 0x18 bytes
  *	PCI ECAM	0xe0000000, 256 MB (256 buses)
  *	PCI memory	0xa0000000 - 0xdeffffff
+ *	PCI memory, 64-bit	32 GB at 0x4000000000 (256 GB)
  *	PCI I/O		ports 0 - 0xffff at 0xdf000000
  *	PCI INTA-D	SPI 34 - 37, rotated by one per slot
  */
@@ -80,6 +81,9 @@ DefinitionBlock ("", "DSDT", 2, "BHYVE ", "BVDSDT  ", 0x00000001)
                     0x0000, 0x0000, 0x00FF, 0x0000, 0x0100)
                 DWordMemory (ResourceProducer, PosDecode, MinFixed, MaxFixed, NonCacheable, ReadWrite,
                     0x00000000, 0xA0000000, 0xDEFFFFFF, 0x00000000, 0x3F000000)
+                QWordMemory (ResourceProducer, PosDecode, MinFixed, MaxFixed, NonCacheable, ReadWrite,
+                    0x0000000000000000, 0x0000004000000000, 0x00000047FFFFFFFF, 0x0000000000000000,
+                    0x0000000800000000)
                 DWordIO (ResourceProducer, MinFixed, MaxFixed, PosDecode, EntireRange,
                     0x00000000, 0x00000000, 0x0000FFFF, 0xDF000000, 0x00010000,
                     ,, , TypeStatic, DenseTranslation)

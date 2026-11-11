@@ -1,0 +1,40 @@
+bhyve: hda: the sound ring may be a file (play=keel:/path/to/file)
+
+keelOS's ring is a POSIX shared memory object.  macOS limits those names to
+31 characters and fails ftruncate() on one that exists, so a restarted guest
+could not take its ring again.  A name with a second '/' is now opened as a
+file and mapped; the reader maps the same file.  The device name may be as
+long as a path.
+
+Applies to audio.c as keelOS has it (keel/audio.c).
+
+--- a/usr.sbin/bhyve/audio.c
++++ b/usr.sbin/bhyve/audio.c
+@@ -59,7 +59,7 @@
+ 	int fd;
+ 	uint8_t dir;
+ 	uint8_t inited;
+-	char dev_name[64];
++	char dev_name[1024];	/* (a path in the VM's folder is longer than 64) */
+ 
+ 	/* keel: play=keel:/keel-snd-NAME */
+ 	struct keel_snd *ring;	/* NULL: OSS */
+@@ -81,9 +81,16 @@
+ 	void *p;
+ 	int fd;
+ 
+-	fd = shm_open(path, O_RDWR | O_CREAT, 0600);
++	/*
++	 * A name with a second '/' is a file to map, not a POSIX shared memory object: macOS
++	 * limits those names to 31 characters and refuses to size an existing one again.
++	 */
++	if (strchr(path + 1, '/') != NULL)
++		fd = open(path, O_RDWR | O_CREAT, 0600);
++	else
++		fd = shm_open(path, O_RDWR | O_CREAT, 0600);
+ 	if (fd == -1) {
+-		warn("hda: shm_open %s", path);
++		warn("hda: open %s", path);
+ 		return (-1);
+ 	}
+ 	if (ftruncate(fd, KEEL_SND_HDR + KEEL_SND_RING) == -1) {

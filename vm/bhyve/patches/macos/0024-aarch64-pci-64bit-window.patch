@@ -1,0 +1,68 @@
+aarch64: a 64-bit PCI memory window (32 GB at 256 GB)
+
+The host bridge had only the 32-bit window (0xa0000000, 1008 MB): the firmware put
+64-bit BARs there too, and one of 1 GB or more (a GPU's host-visible memory window)
+made its resource allocation fail, after which it found no disk to boot from.
+pci_emul.c allocates 64-bit BARs from a fixed address now, which the device tree's
+"ranges" names; the DSDT's _CRS (src/acpi_arm64_dsdt.asl) names the same window.
+
+--- a/usr.sbin/bhyve/pci_emul.c
++++ b/usr.sbin/bhyve/pci_emul.c
+@@ -149,6 +149,14 @@
+ #define	PCI_EMUL_IOMASK		0xffff
+ #define	PCI_EMUL_IO_CPUBASE	0xdf000000UL
+ #define	PCI_EMUL_MEMBASE32	0xa0000000UL
++/*
++ * 64-bit BARs: a window at a fixed address, far above any guest's memory (which starts at
++ * 4 GB), so that the tables that are written ahead of time can name it: the device tree's
++ * "ranges" (aarch64/fdt.c) and the DSDT's _CRS (acpi_arm64_dsdt.asl). Without a window the
++ * firmware has to squeeze 64-bit BARs into the 32-bit one, and a large one (a GPU's memory
++ * window) does not fit.
++ */
++#define	PCI_EMUL_MEMBASE64_FIXED	0x4000000000UL	/* 256 GB */
+ #else
+ #error Unsupported platform
+ #endif
+@@ -1613,6 +1621,11 @@
+ 	pci_emul_membase64 = vm_get_highmem_base(ctx) +
+ 	    vm_get_highmem_size(ctx);
+ 	pci_emul_membase64 = roundup2(pci_emul_membase64, PCI_EMUL_MEMSIZE64);
++#ifdef PCI_EMUL_MEMBASE64_FIXED
++	if (pci_emul_membase64 > PCI_EMUL_MEMBASE64_FIXED)
++		errx(EX_OSERR, "the guest's memory reaches the 64-bit PCI window");
++	pci_emul_membase64 = PCI_EMUL_MEMBASE64_FIXED;
++#endif
+ 	pci_emul_memlim64 = pci_emul_membase64 + PCI_EMUL_MEMSIZE64;
+ 
+ 	TAILQ_INIT(&boot_devices);
+--- a/usr.sbin/bhyve/aarch64/fdt.c
++++ b/usr.sbin/bhyve/aarch64/fdt.c
+@@ -372,7 +372,7 @@
+ 	fdt_property_u64(fdt, "bus-range", (0ul << 32) | 1);
+ 	set_single_reg(fdt, 0xe0000000, 0x10000000);
+ 	fdt_property_placeholder(fdt, "ranges",
+-	    2 * 7 * sizeof(uint32_t), &prop);
++	    3 * 7 * sizeof(uint32_t), &prop);
+ 	/* I/O space: ports 0 to 0xffff are the 64K at 0xdf000000 */
+ 	SET_PROP_U32(prop, 0, 0x01000000);
+ 
+@@ -395,7 +395,19 @@
+ 
+ 	SET_PROP_U32(prop, 12, 0);
+ 	SET_PROP_U32(prop, 13, 0x3f000000);
++
++	/* 64-bit memory: 32 GB at 256 GB (pci_emul.c's PCI_EMUL_MEMBASE64_FIXED) */
++	SET_PROP_U32(prop, 14, 0x03000000);
++
++	SET_PROP_U32(prop, 15, 0x40);
++	SET_PROP_U32(prop, 16, 0);
+ 
++	SET_PROP_U32(prop, 17, 0x40);
++	SET_PROP_U32(prop, 18, 0);
++
++	SET_PROP_U32(prop, 19, 0x8);
++	SET_PROP_U32(prop, 20, 0);
++
+ 	fdt_property_placeholder(fdt, "msi-map", 4 * sizeof(uint32_t), &prop);
+ 	SET_PROP_U32(prop, 0, 0);		/* RID base */
+ 	SET_PROP_U32(prop, 1, msi_phandle);	/* MSI parent */

@@ -179,6 +179,9 @@ fn kCFBooleanFalse() -> &'static CFType {
     unsafe { objc2_core_foundation::kCFBooleanFalse }.expect("kCFBooleanFalse")
 }
 
+/// Frames the encoder took and gave nothing for (all sessions; vms.rs's timing line says it).
+pub static DROPPED: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+
 /// VideoToolbox's output callback: one compressed frame -> Annex B -> the channel.
 unsafe extern "C-unwind" fn output(
     refcon: *mut c_void,
@@ -192,7 +195,11 @@ unsafe extern "C-unwind" fn output(
         warn!(status, "VideoToolbox: frame failed");
         return;
     }
-    let Some(sb) = (unsafe { sample.as_ref() }) else { return };
+    let Some(sb) = (unsafe { sample.as_ref() }) else {
+        // the rate control left this frame out
+        DROPPED.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        return;
+    };
     match unsafe { annex_b(sb) } {
         Ok((data, key)) => {
             let _ = tx.send(Encoded { data, key, pts_us: frame_refcon as usize as u64 });

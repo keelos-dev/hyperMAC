@@ -1,0 +1,139 @@
+fbuf: keel's virtio-vga ("-s N,fbuf,...,virtio=on[,3d=on]")
+
+From keelOS (root/bhyve/patch-fbuf.py, its virtio-vga part only): with virtio=on the
+device is also a virtio-gpu (pci_virtio_gpu.c: PCI ID 1af4:1050, BAR 2 the virtio
+regions, BAR 3 MSI-X, BAR 4 the 3D memory window). BARs 0 and 1 and ramfb stay as they
+are for the firmware and a guest without the driver; once the driver shows a scanout
+that is the console's picture (VNC).
+
+--- a/usr.sbin/bhyve/pci_fbuf.c
++++ b/usr.sbin/bhyve/pci_fbuf.c
+@@ -50,6 +50,7 @@
+ #include "config.h"
+ #include "debug.h"
+ #include "console.h"
++#include "pci_virtio_gpu.h"
+ #include "pci_emul.h"
+ #include "qemu_fwcfg.h"
+ #include "rfb.h"
+@@ -115,6 +116,15 @@
+ 	void      *vgasc;
+ 	struct bhyvegc_image *gc_image;
+ 
++	/*
++	 * keel's virtio-vga ("virtio=on"): the device is a virtio-gpu too (pci_virtio_gpu.c:
++	 * BAR 2 its regions, BAR 3 MSI-X, BAR 4 the 3D window). While the guest's driver
++	 * shows a scanout that is the console's picture, not the framebuffer.
++	 */
++	void	  *keel_vtgpu;
++	void	  *keel_fbdata;		/* the console's own pixels while the scanout shows */
++	int	  keel_shown;
++
+ 	/* ramfb: what the guest wrote to the fw_cfg file, big endian */
+ 	struct {
+ 		uint64_t be_addr;
+@@ -142,10 +152,13 @@
+ 	struct pci_fbuf_softc *sc;
+ 	uint8_t *p;
+ 
++	sc = pi->pi_arg;
++	if (sc->keel_vtgpu != NULL && keel_vtgpu_owns(sc->keel_vtgpu, baridx)) {
++		keel_vtgpu_barwrite(sc->keel_vtgpu, pi, baridx, offset, size, value);
++		return;
++	}
+ 	assert(baridx == 0);
+ 
+-	sc = pi->pi_arg;
+-
+ 	DPRINTF(DEBUG_VERBOSE,
+ 	    ("fbuf wr: offset 0x%lx, size: %d, value: 0x%lx",
+ 	    offset, size, value));
+@@ -197,10 +210,11 @@
+ 	uint8_t *p;
+ 	uint64_t value;
+ 
++	sc = pi->pi_arg;
++	if (sc->keel_vtgpu != NULL && keel_vtgpu_owns(sc->keel_vtgpu, baridx))
++		return (keel_vtgpu_barread(sc->keel_vtgpu, pi, baridx, offset, size));
+ 	assert(baridx == 0);
+ 
+-	sc = pi->pi_arg;
+-
+ 	if (offset + size > DMEMSZ) {
+ 		printf("fbuf: read too large, offset %ld size %d\n",
+ 		       offset, size);
+@@ -243,10 +257,12 @@
+ 	struct pci_fbuf_softc *sc;
+ 	int prot;
+ 
++	sc = pi->pi_arg;
++	if (sc != NULL && sc->keel_vtgpu != NULL)
++		keel_vtgpu_baraddr(sc->keel_vtgpu, baridx, enabled, address);
+ 	if (baridx != 1)
+ 		return;
+ 
+-	sc = pi->pi_arg;
+ 	if (!enabled) {
+ 		if (vm_munmap_memseg(pi->pi_vmctx, sc->fbaddr, FB_SIZE) != 0)
+ 			EPRINTLN("pci_fbuf: munmap_memseg failed");
+@@ -434,6 +450,32 @@
+ 	uint32_t width, height;
+ 
+ 	sc = arg;
++	if (sc->keel_vtgpu != NULL || keel_vtgpu_standalone != NULL) {
++		struct bhyvegc_image *img = console_get_image();
++		void *vt = sc->keel_vtgpu != NULL ? sc->keel_vtgpu : keel_vtgpu_standalone;
++		void *pix;
++		int w, h;
++
++		if (keel_vtgpu_scanout(vt, &pix, &w, &h)) {
++			if (!sc->keel_shown) {
++				sc->keel_fbdata = img->data;
++				sc->keel_shown = 1;
++			}
++			/* not console_set_fbaddr(): the pixels are not bhyvegc's to free */
++			img->data = pix;
++			if (sc->gc_width != w || sc->gc_height != h) {
++				sc->gc_width = w;
++				sc->gc_height = h;
++				bhyvegc_resize(gc, w, h);
++			}
++			return;
++		}
++		if (sc->keel_shown) {
++			sc->keel_shown = 0;
++			img->data = sc->keel_fbdata;
++			sc->gc_width = sc->gc_height = 0;	/* resized below */
++		}
++	}
+ 	pthread_mutex_lock(&sc->mtx);
+ #ifdef __amd64__
+ 	if (sc->vga_full && sc->gc_image->vgamode) {
+@@ -484,6 +526,14 @@
+ 	pci_set_cfgdata16(pi, PCIR_VENDOR, 0xFB5D);
+ 	pci_set_cfgdata8(pi, PCIR_CLASS, PCIC_DISPLAY);
+ 	pci_set_cfgdata8(pi, PCIR_SUBCLASS, PCIS_DISPLAY_VGA);
++	if (get_config_bool_node_default(nvl, "virtio", false)) {
++		/* what Linux' virtio_gpu and the Windows drivers (viogpudo, viogpu3d) take */
++		pci_set_cfgdata16(pi, PCIR_VENDOR, 0x1af4);
++		pci_set_cfgdata16(pi, PCIR_DEVICE, 0x1050);
++		pci_set_cfgdata8(pi, PCIR_REVID, 1);
++		pci_set_cfgdata16(pi, PCIR_SUBVEND_0, 0xFB5D);
++		pci_set_cfgdata16(pi, PCIR_SUBDEV_0, 0x40FB);
++	}
+ 
+ 	sc->fb_base = vm_create_devmem(pi->pi_vmctx, VM_FRAMEBUFFER,
+ 	    "framebuffer", FB_SIZE);
+@@ -526,6 +576,12 @@
+ 	DPRINTF(DEBUG_INFO, ("fbuf frame buffer base: %p [sz %lu]",
+ 	        sc->fb_base, FB_SIZE));
+ 
++	if (get_config_bool_node_default(nvl, "virtio", false) &&
++	    (sc->keel_vtgpu = keel_vtgpu_attach(pi, nvl, 2, 3)) == NULL) {
++		error = -1;
++		goto done;
++	}
++
+ 	console_init(sc->memregs.width, sc->memregs.height, sc->fb_base);
+ 	console_fb_register(pci_fbuf_render, sc);
+ 

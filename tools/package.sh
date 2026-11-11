@@ -78,6 +78,17 @@ for n in THIRD_PARTY.md LICENSE-IronRDP-MIT THIRD_PARTY-crates.txt "$STAGE/THIRD
 # in Resources: it is data, and codesign wants only code in Contents/MacOS.
 cp "$VMBIN" "$APP/Contents/MacOS/hypermac-vm"
 cp "$BHYVE" "$APP/Contents/MacOS/bhyve"
+# The 3D engine for Windows guests (vm.json "gpu3d"; vm/bhyve/gpu3d.sh makes it, it is not built
+# here): bhyve-3d with the programs, its folder in Resources (it has the guest's driver and the
+# licenses in it besides code; vm/src/bhyve.rs gpu3d() and bhyve-3d's rpath look there).
+# A release without it has no 3D; nothing else changes.
+GPU3D=
+if [ -x vm/bhyve/build/bhyve-3d ] && [ -f vm/bhyve/build/gpu3d/virgl_render_server ]; then
+	GPU3D=1
+	otool -L vm/bhyve/build/bhyve-3d | grep -q -E "homebrew|/Volumes/|/Users/" && die "bhyve-3d depends on a library outside the app: run vm/bhyve/gpu3d.sh"
+	cp vm/bhyve/build/bhyve-3d "$APP/Contents/MacOS/bhyve-3d"
+	cp -R vm/bhyve/build/gpu3d "$APP/Contents/Resources/gpu3d"
+fi
 cp vm/bhyve/firmware/QEMU_EFI.fd "$APP/Contents/Resources/QEMU_EFI.fd"
 # the UEFI variables a new Windows VM starts with: Secure Boot on, Microsoft's certificates
 cp vm/bhyve/firmware/QEMU_VARS.secboot.fd "$APP/Contents/Resources/QEMU_VARS.secboot.fd"
@@ -115,6 +126,16 @@ codesign --force --options runtime --timestamp --sign "$ID" --identifier dev.kee
 	--entitlements vm/vz.entitlements "$APP/Contents/MacOS/hypermac-vm"
 codesign --force --options runtime --timestamp --sign "$ID" --identifier dev.keelos.hypermac.bhyve \
 	--entitlements vm/bhyve/hvf/bhyve.entitlements "$APP/Contents/MacOS/bhyve"
+if [ -n "$GPU3D" ]; then
+	# (the render server loads libdxmt-native.dylib, signed here like itself: library validation
+	# stays on. Someone who builds their own DXMT, as its LGPL lets them, names it in
+	# NPT_D3D11_LIBRARY_PATH and runs a build of their own: gpu3d/SOURCES.)
+	for f in "$APP/Contents/Resources/gpu3d"/*.dylib "$APP/Contents/Resources/gpu3d/virgl_render_server"; do
+		codesign --force --options runtime --timestamp --sign "$ID" "$f"
+	done
+	codesign --force --options runtime --timestamp --sign "$ID" --identifier dev.keelos.hypermac.bhyve \
+		--entitlements vm/bhyve/hvf/bhyve.entitlements "$APP/Contents/MacOS/bhyve-3d"
+fi
 codesign --force --options runtime --timestamp --sign "$ID" "$APP"
 codesign --verify --strict --deep "$APP"
 

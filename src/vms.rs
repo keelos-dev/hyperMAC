@@ -372,16 +372,63 @@ impl Drop for Shm {
 
 pub struct VmDisplay {
     slot: Slot,
+    /// keelOS::Video (video.rs): kRDPclient gets the VM's picture as H.264 too. Bitmaps of a
+    /// screen that changes everywhere (a game, a film) are megabytes a frame: 4 a second.
+    video: Option<crate::video::Video>,
+    /// the size the connection was last told (Display::size, also when it was this Mac's,
+    /// asked before the login named the VM): the first frame of another size says so
+    told: Arc<Mutex<(u32, u32)>>,
     /// counted up when the client asks for a redraw (RefreshRectangle): the picture is sent
     /// again even when it has not changed (kRDPclient asks once its window is up; a still
     /// screen, e.g. Windows setup's, otherwise stayed black but for the parts that moved)
     refresh: Arc<std::sync::atomic::AtomicU32>,
+    /// this connection's RDPSND (sound.rs): the VM's sound card feeds it (vmsound.rs)
+    sound: Option<crate::sound::Sound>,
 }
 
 impl VmDisplay {
-    pub fn new(slot: Slot, refresh: Arc<std::sync::atomic::AtomicU32>) -> Self {
-        Self { slot, refresh }
+    pub fn new(
+        slot: Slot,
+        refresh: Arc<std::sync::atomic::AtomicU32>,
+        video: Option<crate::video::Video>,
+        sound: Option<crate::sound::Sound>,
+    ) -> Self {
+        Self { slot, refresh, video, sound, told: Default::default() }
     }
+}
+
+/// B,G,R,X rows as a CVPixelBuffer for the H.264 encoder.
+fn pixel_buffer(w: usize, h: usize, pix: &[u8]) -> Option<objc2_core_foundation::CFRetained<objc2_core_video::CVPixelBuffer>> {
+    use objc2_core_video::{
+        CVPixelBufferCreate, CVPixelBufferGetBaseAddress, CVPixelBufferGetBytesPerRow, CVPixelBufferLockBaseAddress,
+        CVPixelBufferLockFlags, CVPixelBufferUnlockBaseAddress, kCVPixelFormatType_32BGRA,
+    };
+    let mut out: *mut objc2_core_video::CVPixelBuffer = std::ptr::null_mut();
+    // on an IOSurface: the media engine takes it as it is (plain memory it copies once more)
+    use objc2_core_foundation::{CFDictionary, CFType};
+    let none = CFDictionary::<CFType, CFType>::empty();
+    let key: &CFType = unsafe { objc2_core_video::kCVPixelBufferIOSurfacePropertiesKey };
+    let attrs = CFDictionary::<CFType, CFType>::from_slices(&[key], &[&**none as &CFType]);
+    let attrs: &CFDictionary = unsafe { std::mem::transmute::<&CFDictionary<CFType, CFType>, &CFDictionary>(&attrs) };
+    let st = unsafe { CVPixelBufferCreate(None, w, h, kCVPixelFormatType_32BGRA, Some(attrs), std::ptr::NonNull::from(&mut out)) };
+    if st != 0 {
+        return None;
+    }
+    let pb = unsafe { objc2_core_foundation::CFRetained::from_raw(std::ptr::NonNull::new(out)?) };
+    unsafe {
+        if CVPixelBufferLockBaseAddress(&pb, CVPixelBufferLockFlags::empty()) != 0 {
+            return None;
+        }
+        let base = CVPixelBufferGetBaseAddress(&pb) as *mut u8;
+        let stride = CVPixelBufferGetBytesPerRow(&pb);
+        if !base.is_null() && stride >= w * 4 && pix.len() >= w * h * 4 {
+            for y in 0..h {
+                std::ptr::copy_nonoverlapping(pix.as_ptr().add(y * w * 4), base.add(y * stride), w * 4);
+            }
+        }
+        CVPixelBufferUnlockBaseAddress(&pb, CVPixelBufferLockFlags::empty());
+    }
+    Some(pb)
 }
 
 #[async_trait]
@@ -405,28 +452,93 @@ impl RdpServerDisplay for VmDisplay {
         let (tx, rx) = tokio::sync::mpsc::channel(2);
         let name = self.slot.lock().unwrap().clone();
         let refresh = self.refresh.clone();
+        let video = self.video.clone();
+        let told = *self.told.lock().unwrap();
+        let told_now = self.told.clone();
         // a thread copies frames out of the shared file (~60 Hz poll) for this connection
         std::thread::spawn(move || {
             let mut asked = refresh.load(Ordering::Relaxed);
             let Some(s) = name.as_deref().and_then(Shm::open) else {
                 return warn!(vm = name, "no screen.shm");
             };
-            let (mut last, mut size) = (0u64, (0u32, 0u32));
+            let (mut last, mut size) = (0u64, told);
+            let mut enc: Option<(crate::encoder::Encoder, u32)> = None;
+            // what a frame costs here, said every 600 frames: (frames, busy, read, buffer, encode) µs
+            let mut cost = (0u32, 0u32, 0u64, 0u64, 0u64, std::time::Instant::now());
             loop {
+                if tx.is_closed() {
+                    return; // the connection, or this round of updates, is gone
+                }
                 s.want(2000);
                 let now = refresh.load(Ordering::Relaxed);
                 if now != asked {
                     asked = now;
                     last = 0; // the same frame once more, and the encoder sends it whole
                 }
+                let t0 = std::time::Instant::now();
                 if let Some((seq, w, h, pix)) = s.read(last) {
+                    let t_read = t0.elapsed().as_micros() as u64;
                     last = seq;
                     if size != (w, h) && size != (0, 0) {
-                        if tx.blocking_send(DisplayUpdate::Resize(DesktopSize { width: w as u16, height: h as u16 })).is_err() {
-                            return;
-                        }
+                        // The server answers a resize by activating the connection again and
+                        // asking for updates() anew: a new thread, so this one ends here. It
+                        // used to go on, and when the client takes video (where nothing is sent
+                        // through tx, so it never saw its receiver gone) both threads encoded
+                        // into the same stream, each with its own encoder: a picture of blocks
+                        // from two encoders' frames mixed (user 2026-11-11, 1600x1000 -> 1600x900).
+                        *told_now.lock().unwrap() = (w, h); // (so the next thread does not say it again)
+                        let _ = tx.blocking_send(DisplayUpdate::Resize(DesktopSize { width: w as u16, height: h as u16 }));
+                        return;
                     }
                     size = (w, h);
+                    if let Some(v) = &video {
+                        match v.begin(w, h) {
+                            crate::video::Go::Encode { stream, key } => {
+                                if enc.as_ref().map(|(_, s)| *s) != Some(stream) {
+                                    enc = None; // the old stream's encoder, and its drain thread, go
+                                    match crate::encoder::Encoder::new(w, h, v.fps() as u32, v.kbps()) {
+                                        Ok((e, rx)) => {
+                                            let v = v.clone();
+                                            std::thread::spawn(move || {
+                                                while let Ok(f) = rx.recv() {
+                                                    v.frame_out(stream, f.key, &f.data, f.pts_us);
+                                                }
+                                            });
+                                            enc = Some((e, stream));
+                                        }
+                                        Err(e) => {
+                                            warn!("H.264 encoder: {e:#} — this connection stays on bitmaps");
+                                            v.abort(stream);
+                                            v.disable();
+                                        }
+                                    }
+                                }
+                                if let Some((e, _)) = enc.as_ref() {
+                                    let t1 = std::time::Instant::now();
+                                    let pb = pixel_buffer(w as usize, h as usize, &pix);
+                                    let t_buf = t1.elapsed().as_micros() as u64;
+                                    let t2 = std::time::Instant::now();
+                                    let ok = pb.is_some_and(|pb| e.encode(&pb, crate::video::now_us(), key).map_err(|err| warn!("H.264 encode: {err:#}")).is_ok());
+                                    if !ok {
+                                        v.abort(stream);
+                                    }
+                                    cost = (cost.0 + 1, cost.1, cost.2 + t_read, cost.3 + t_buf, cost.4 + t2.elapsed().as_micros() as u64, cost.5);
+                                    if cost.0 == 600 {
+                                        let n = cost.0 as u64;
+                                        tracing::debug!(fps = format!("{:.1}", 600.0 / cost.5.elapsed().as_secs_f64()), busy = cost.1, encoder_dropped = crate::encoder::DROPPED.load(Ordering::Relaxed), read_us = cost.2 / n, buffer_us = cost.3 / n, encode_us = cost.4 / n, "VM video: 600 frames");
+                                        cost = (0, 0, 0, 0, 0, std::time::Instant::now());
+                                    }
+                                    continue; // (the next read waits for the next frame)
+                                }
+                            }
+                            crate::video::Go::Busy => {
+                                cost.1 += 1;
+                                std::thread::sleep(Duration::from_millis(4));
+                                continue; // the client has enough in flight: this frame is dropped
+                            }
+                            crate::video::Go::NoVideo => enc = None,
+                        }
+                    }
                     let (Some(wn), Some(hn), Some(st)) =
                         (NonZeroU16::new(w as u16), NonZeroU16::new(h as u16), NonZeroUsize::new(w as usize * 4))
                     else {
@@ -444,16 +556,26 @@ impl RdpServerDisplay for VmDisplay {
                     if tx.blocking_send(u).is_err() {
                         return; // the connection is gone
                     }
+                } else {
+                    std::thread::sleep(Duration::from_millis(4)); // no new frame yet
+                    continue;
                 }
                 std::thread::sleep(Duration::from_millis(16));
             }
         });
-        Ok(Box::new(VmUpdates { rx }))
+        // the VM's sound for as long as these updates are wanted
+        let alive = Arc::new(());
+        if let (Some(name), Some(sound)) = (self.slot.lock().unwrap().as_deref(), &self.sound) {
+            crate::vmsound::start(name, sound.clone(), Arc::downgrade(&alive));
+        }
+        Ok(Box::new(VmUpdates { rx, _alive: alive }))
     }
 }
 
 struct VmUpdates {
     rx: tokio::sync::mpsc::Receiver<DisplayUpdate>,
+    /// vmsound.rs's thread ends when this is dropped
+    _alive: Arc<()>,
 }
 
 #[async_trait]
@@ -469,11 +591,15 @@ pub struct VmInput {
     slot: Slot,
     ctl: Option<std::os::unix::net::UnixStream>,
     size: (u32, u32),
+    /// the VM's screen.shm, for its picture's present size (at)
+    shm: Option<Shm>,
+    /// wheel rotation not yet sent (RDP counts 120 to a notch; a touchpad sends less at a time)
+    wheel: i32,
 }
 
 impl VmInput {
     pub fn new(slot: Slot) -> Self {
-        Self { slot, ctl: None, size: (1920, 1080) }
+        Self { slot, ctl: None, size: (1920, 1080), shm: None, wheel: 0 }
     }
 
     /// One line to the VM's ctl.sock (kept open for the session; a thread drops its answers).
@@ -485,12 +611,7 @@ impl VmInput {
                 if let Ok(r) = c.try_clone() {
                     std::thread::spawn(move || for _ in BufReader::new(r).lines() {});
                 }
-                if let Some(s) = Shm::open(&name) {
-                    let (_, w, h) = s.peek();
-                    if w > 0 && h > 0 {
-                        self.size = (w, h);
-                    }
-                }
+                self.shm = Shm::open(&name);
                 self.ctl = Some(c);
             }
             if let Some(c) = self.ctl.as_mut() {
@@ -503,6 +624,17 @@ impl VmInput {
     }
 
     fn at(&mut self, x: u16, y: u16) {
+        // The picture's size as it is now, not as it was when the session began: after the
+        // guest changed its resolution the pointer landed beside where the client pointed
+        // (1600x1000 -> 1600x900: up to a tenth of the height off; user 2026-11-11).
+        if self.shm.is_none() {
+            self.shm = self.slot.lock().unwrap().as_deref().and_then(Shm::open);
+        }
+        if let Some((_, w, h)) = self.shm.as_ref().map(|s| s.peek()) {
+            if w > 0 && h > 0 {
+                self.size = (w, h);
+            }
+        }
         let (w, h) = self.size;
         let fx = x as f64 / (w.max(2) - 1) as f64;
         let fy = y as f64 / (h.max(2) - 1) as f64;
@@ -542,6 +674,16 @@ impl RdpServerInputHandler for VmInput {
                     _ => return,
                 };
                 self.send(&format!("vbtn {b} {}", pressed as u8));
+            }
+            // The wheel: whole notches to the VM's pointer (ctl.sock's vwheel; hyperMAC
+            // vm/src/bhyve.rs). It used to be dropped: nothing scrolled in a VM (user 2026-11-11).
+            MouseEvent::VerticalScroll { value } => {
+                self.wheel += value as i32;
+                let steps = self.wheel / 120;
+                if steps != 0 {
+                    self.wheel -= steps * 120;
+                    self.send(&format!("vwheel {steps}"));
+                }
             }
             _ => {}
         }
@@ -603,7 +745,9 @@ pub struct Display<M> {
 #[async_trait]
 impl<M: RdpServerDisplay + Send> RdpServerDisplay for Display<M> {
     async fn size(&mut self) -> DesktopSize {
-        if self.slot.lock().unwrap().is_some() { self.vm.size().await } else { self.mac.size().await }
+        let s = if self.slot.lock().unwrap().is_some() { self.vm.size().await } else { self.mac.size().await };
+        *self.vm.told.lock().unwrap() = (s.width as u32, s.height as u32);
+        s
     }
 
     async fn updates(&mut self) -> ServerResult<Box<dyn RdpServerDisplayUpdates>> {

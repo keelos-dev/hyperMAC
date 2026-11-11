@@ -38,7 +38,8 @@ Windows 11 ARM 的 EFI 补丁 `vm/tools/efiprobe`，自己的 virtio 显卡/键�
 - **声音**：ScreenCaptureKit 系统音频 → RDPSND，48k 立体声、20 ms 一包、静音不发。客户端支持 Opus
   （kRDPclient）就发 Opus（libopus 静态链接，默认 96 kbps，`MACRDP_OPUS_KBPS` 调），否则（mstsc）发
   PCM（约 1.5 Mbps）；`MACRDP_OPUS=0` 只给 PCM。日志每 10 s 一行 `RDPSND: 10 s` 带 codec 和 kbps。
-  `MACRDP_SOUND=0` 关
+  `MACRDP_SOUND=0` 关。连的是 Windows 虚拟机时，声音来自虚拟机的声卡（`vmsound.rs` 读 `<VM 目录>/sound.ring`，
+  见 [vm/README.md](vm/README.md)），同一条 RDPSND（2026-11-11 kRDPclient 连 w3d 实测有声音，Opus）
 - **剪贴板**：文本和图片双向（NSPasteboard ↔ CLIPRDR，含中文；图片：Mac 的 PNG/TIFF ↔ CF_DIB 和注册格式 "PNG"，`clipimg.rs`）；`MACRDP_CLIP=0` 或 app 里的开关关。文件不做（待办：CLIPRDR 文件流，kRDPclient 也要做）
 - **常驻服务**（2026-11-09 起 Mac mini 上就是这么跑的）：`hypermac install` 把二进制拷到
   `~/Library/Application Support/hyperMAC/bin/hypermac` 并装 LaunchAgent `dev.keelos.hypermac`

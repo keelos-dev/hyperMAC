@@ -33,7 +33,17 @@ struct Inner {
     seen: AtomicIsize,
     /// the format we asked the client for (on_remote_copy), answered in on_format_data_response
     asked: Mutex<Option<(ClipboardFormatId, Kind)>>,
+    /// the client's address (see FROM_CLIENT)
+    peer: std::net::IpAddr,
 }
+
+/// What is on the Mac's pasteboard came from a client: (changeCount of that write, the client's
+/// address). It is not offered back to a connection from that address. A PC with two sessions
+/// open (this Mac's desktop and a VM) otherwise went round for ever: one session's copy was put
+/// on the pasteboard, the other session's watcher offered it to the same PC, which took it as a
+/// new copy and sent it again: a 2.4 MB picture 2112 times in 13 minutes (2026-11-11).
+/// Connections from other addresses are still offered it (copy on one PC, paste on another).
+static FROM_CLIENT: Mutex<Option<(isize, std::net::IpAddr)>> = Mutex::new(None);
 
 #[derive(Clone, Copy, Debug)]
 enum Kind {
@@ -55,23 +65,35 @@ pub struct Clip(Arc<Inner>);
 pub struct Factory(Clip);
 
 /// The Mac's general pasteboard text, if any.
+/// NSPasteboard's general pasteboard is one object for the process and not safe to use from
+/// two threads at once: with two connections (each has a watcher thread) the service crashed
+/// in -[NSPasteboard _updateTypeCacheIfNeeded] (2026-11-11, three times). Every use takes this.
+pub static PASTEBOARD: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+pub fn pasteboard_lock() -> std::sync::MutexGuard<'static, ()> {
+    PASTEBOARD.lock().unwrap_or_else(|e| e.into_inner())
+}
+
 fn pasteboard_string() -> Option<String> {
+    let _g = pasteboard_lock();
     let pb = NSPasteboard::generalPasteboard();
     let s = unsafe { pb.stringForType(NSPasteboardTypeString) }?;
     Some(s.to_string())
 }
 
 fn change_count() -> isize {
+    let _g = pasteboard_lock();
     NSPasteboard::generalPasteboard().changeCount()
 }
 
 impl Clip {
-    pub fn new() -> (Self, Factory) {
+    pub fn new(peer: std::net::IpAddr) -> (Self, Factory) {
         let c = Clip(Arc::new(Inner {
             sender: Mutex::new(None),
             ready: AtomicBool::new(false),
             seen: AtomicIsize::new(change_count()),
             asked: Mutex::new(None),
+            peer: peer.to_canonical(),
         }));
         let weak = Arc::downgrade(&c.0);
         std::thread::Builder::new()
@@ -92,6 +114,11 @@ impl Clip {
         if !self.0.ready.load(Ordering::Relaxed) {
             return;
         }
+        // (what this client's own PC put there is not news to it)
+        let now = change_count(); // (first: the two locks are never held together)
+        if *FROM_CLIENT.lock().unwrap() == Some((now, self.0.peer)) {
+            return;
+        }
         let mut formats = Vec::new();
         if pasteboard_string().is_some() {
             formats.push(ClipboardFormat::new(ClipboardFormatId::CF_UNICODETEXT));
@@ -109,12 +136,18 @@ impl Clip {
 
     /// The client's text goes onto the Mac's pasteboard; our own change is remembered.
     fn put(&self, text: &str) {
+        let _g = pasteboard_lock();
         let pb = NSPasteboard::generalPasteboard();
         pb.clearContents();
         if !unsafe { pb.setString_forType(&NSString::from_str(text), NSPasteboardTypeString) } {
             warn!("CLIPRDR: NSPasteboard refused the text");
         }
-        self.0.seen.store(change_count(), Ordering::Relaxed);
+        // (not change_count(): this thread holds the pasteboard's lock, taking it again would
+        // wait for ever, and with it every later use of the clipboard, new connections too)
+        let count = pb.changeCount();
+        self.0.seen.store(count, Ordering::Relaxed);
+        drop(_g);
+        *FROM_CLIENT.lock().unwrap() = Some((count, self.0.peer));
         info!(chars = text.chars().count(), "CLIPRDR: the client's text is on the Mac's clipboard");
     }
 
@@ -127,6 +160,7 @@ impl Clip {
         match count {
             Some(c) => {
                 self.0.seen.store(c, Ordering::Relaxed);
+                *FROM_CLIENT.lock().unwrap() = Some((c, self.0.peer));
                 info!(bytes = data.len(), ?kind, "CLIPRDR: the client's picture is on the Mac's clipboard");
             }
             None => warn!(bytes = data.len(), ?kind, "CLIPRDR: could not take the client's picture"),
@@ -284,4 +318,43 @@ impl CliprdrBackend for Backend {
     fn on_lock(&mut self, _: LockDataId) {}
 
     fn on_unlock(&mut self, _: LockDataId) {}
+}
+
+#[cfg(test)]
+mod pasteboard_tests {
+    use super::*;
+
+    /// Uses the Mac's real clipboard (and leaves a line of text on it): run by hand,
+    /// `cargo test --release -- --ignored clipboard_text_and_echo`.
+    /// - a client's text is put on the pasteboard and the call returns (it once waited for ever
+    ///   on its own lock, and with it every later connection);
+    /// - it is not offered back to a connection from the same address, and is to another one.
+    #[test]
+    #[ignore]
+    fn clipboard_text_and_echo() {
+        let (done_tx, done_rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let here: std::net::IpAddr = "192.168.1.10".parse().unwrap();
+            let conn = |ip: std::net::IpAddr| {
+                let (c, _f) = Clip::new(ip);
+                let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+                *c.0.sender.lock().unwrap() = Some(tx);
+                c.0.ready.store(true, Ordering::Relaxed);
+                (c, rx)
+            };
+            let (a, mut a_rx) = conn(here);
+            let (b, mut b_rx) = conn(here);
+            let (other, mut other_rx) = conn("192.168.1.11".parse().unwrap());
+            a.put("hyperMAC clipboard test");
+            assert_eq!(pasteboard_string().as_deref(), Some("hyperMAC clipboard test"));
+            a.offer();
+            b.offer();
+            other.offer();
+            assert!(a_rx.try_recv().is_err(), "offered back to the session that sent it");
+            assert!(b_rx.try_recv().is_err(), "offered to another session of the same PC");
+            assert!(other_rx.try_recv().is_ok(), "not offered to another PC");
+            let _ = done_tx.send(());
+        });
+        done_rx.recv_timeout(Duration::from_secs(10)).expect("the clipboard calls did not return (a lock held twice?) or an assertion failed");
+    }
 }
