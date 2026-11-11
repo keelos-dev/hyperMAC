@@ -227,6 +227,21 @@ fn go(page: Page) {
     render();
 }
 
+/// Can this Mac run virtual machines? Not when it is one itself (hyperMAC installed in a macOS
+/// guest so that the guest serves its own desktop): there it is the RDP server only. Asked of
+/// the system: `kern.hv_vmm_present` (1 inside a virtual machine) and `kern.hv_support` (0 where
+/// neither Virtualization.framework nor Hypervisor.framework works). Not known = yes.
+/// (Should macOS guests ever get nested virtualization, hv_support alone is the test.)
+fn can_virtualize() -> bool {
+    static CAN: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    fn sysctl(name: &std::ffi::CStr) -> Option<libc::c_int> {
+        let (mut v, mut len): (libc::c_int, libc::size_t) = (0, std::mem::size_of::<libc::c_int>());
+        let r = unsafe { libc::sysctlbyname(name.as_ptr(), (&mut v as *mut libc::c_int).cast(), &mut len, std::ptr::null_mut(), 0) };
+        (r == 0).then_some(v)
+    }
+    *CAN.get_or_init(|| sysctl(c"kern.hv_support") != Some(0) && sysctl(c"kern.hv_vmm_present") != Some(1))
+}
+
 /// Everything the main / permissions pages show that can change behind our back.
 fn snapshot() -> String {
     if with(|u| u.page == Page::Main && u.tab == Tab::Vms) {
@@ -691,10 +706,14 @@ pub fn render() {
         Page::Tokens => page_tokens(&root),
         Page::Main => {
             main_header(&root);
-            tabs(&root);
+            // a Mac that is itself a virtual machine has no hypervisor to offer: no Virtual
+            // Machines tab there, only the host's page
+            if can_virtualize() {
+                tabs(&root);
+            }
             match with(|u| u.tab) {
-                Tab::Host => page_main(&root),
-                Tab::Vms => vmui::page(&root, MAIN_WIDTH),
+                Tab::Vms if can_virtualize() => vmui::page(&root, MAIN_WIDTH),
+                _ => page_main(&root),
             }
         }
     }
@@ -877,7 +896,7 @@ fn page_permissions(root: &NSStackView) {
                 go_on();
             }),
             primary(t("继续", "Continue"), go_on),
-        ],
+        ][if can_virtualize() { 0 } else { 1 }..],
     );
 }
 
