@@ -12,7 +12,7 @@ hyperMAC does two things, and they fit together:
    FreeBSD run on **bhyve**, FreeBSD's hypervisor, ported to Apple's Hypervisor.framework: as far
    as we know the first bhyve on Apple Silicon. macOS and Linux guests run on Apple's own
    Virtualization.framework.
-2. **An RDP server.** Your Mac's own desktop and every virtual machine are reachable with plain RDP:
+2. **An RDP server.** Your Mac's own desktop and its virtual machines are reachable with plain RDP:
    Windows' built-in `mstsc` connects with nothing to install. A Mac mini in a closet becomes a
    Windows-and-Mac server you use from any PC.
 
@@ -63,7 +63,7 @@ Apple**, and it installs by itself. Linux and FreeBSD: point it at the distribut
 | Guest | Engine | How it installs | State |
 |---|---|---|---|
 | **Windows 11 ARM** | bhyve on Hypervisor.framework | Microsoft's ISO: by hand, or unattended | TPM 2.0, Secure Boot, network, 1920x1080, Windows Update |
-| **macOS** | Virtualization.framework | by itself, from Apple's restore image (downloaded for you) | as Apple's framework gives it |
+| **macOS** | Virtualization.framework | by itself, from Apple's restore image (downloaded for you) | graphics acceleration (Apple's paravirtual GPU), smooth |
 | **Linux** (arm64) | Virtualization.framework | the distribution's ISO | Fedora tested |
 | **FreeBSD** (arm64) | bhyve on Hypervisor.framework | the release's ISO | 15.1 tested |
 
@@ -80,7 +80,7 @@ welcome as an issue.
 | Windows 11 ARM | ✅ | ✅ | ✅ | ✅ | ✅ (7.2 and later) |
 | macOS guests | ✅ | ✅ | ✅ | ❌ | ❌ |
 | 3D acceleration in Windows | ❌ not yet | ❌ | ✅ | ✅ | ❌ |
-| RDP to the Mac's own desktop and to every VM | ✅ built in | ❌ | ❌ | ❌ | VMs only (VRDE) |
+| RDP to the Mac's own desktop and to the VMs | ✅ built in (a macOS guest runs hyperMAC itself) | ❌ | ❌ | ❌ | VMs only (VRDE) |
 
 Honestly: if you need games or 3D in Windows, Parallels is ahead and will be for a while. If you
 want Windows 11 for Office, a browser, development tools or that one Windows-only program, on a
@@ -95,6 +95,9 @@ hyperMAC began as an RDP server for the Mac itself, and that part is the mature 
 - With **[kRDPclient](https://github.com/keelos-dev/kRDPclient-releases)** (Windows, free) you get
   hardware H.264: 1080p at 30 fps (60 on a LAN), about 6–10 Mbps, with sound and the clipboard. It
   lists the Mac and each virtual machine; one click opens any of them.
+- Windows, Linux and FreeBSD guests are served by the host: nothing to install in them. A **macOS
+  guest** is a Mac: install hyperMAC inside it too and it serves its own desktop (give it bridged
+  networking so other computers reach it).
 - The login is your Mac account. No cloud service sits in between.
 - Free, also where NoMachine no longer is: its version 10 dropped the free server edition, and a
   server now needs a yearly subscription, for personal use too.

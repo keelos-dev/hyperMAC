@@ -11,7 +11,7 @@ hyperMAC 做两件事，而且两件事正好配套：
 1. **虚拟机。** 在 Apple Silicon 上跑 macOS、Windows 11 ARM、Linux、FreeBSD。Windows 和 FreeBSD 跑在 **bhyve** 上：
    FreeBSD 的 hypervisor，移植到了苹果的 Hypervisor.framework——据我们所知这是 Apple Silicon 上的第一个 bhyve。
    macOS 和 Linux 跑在苹果自己的 Virtualization.framework 上。
-2. **RDP 服务端。** 这台 Mac 自己的桌面和每一台虚拟机都能用标准 RDP 连：Windows 自带的 `mstsc` 直接连，什么都不用装。
+2. **RDP 服务端。** 这台 Mac 自己的桌面和它上面的虚拟机都能用标准 RDP 连：Windows 自带的 `mstsc` 直接连，什么都不用装。
    柜子里的一台 Mac mini，就成了能从任何 PC 上用的 Windows + Mac 服务器。
 
 不想要第二件？一个开关关掉所有端口，它就是个本机的虚拟机软件。
@@ -50,7 +50,7 @@ macOS 虚拟机一样短：「新建虚拟机… → macOS → 从苹果下载�
 | 系统 | 引擎 | 怎么装 | 状态 |
 |---|---|---|---|
 | **Windows 11 ARM** | bhyve + Hypervisor.framework | 微软的 ISO：手动，或无人值守 | TPM 2.0、Secure Boot、网络、1920x1080、Windows Update |
-| **macOS** | Virtualization.framework | 全自动，用苹果的恢复映像（可代为下载） | 苹果框架给什么就是什么 |
+| **macOS** | Virtualization.framework | 全自动，用苹果的恢复映像（可代为下载） | 有图形加速（苹果的半虚拟化显卡），流畅 |
 | **Linux**（arm64） | Virtualization.framework | 发行版的 ISO | 测过 Fedora |
 | **FreeBSD**（arm64） | bhyve + Hypervisor.framework | 官方 ISO | 测过 15.1 |
 
@@ -66,7 +66,7 @@ macOS 虚拟机一样短：「新建虚拟机… → macOS → 从苹果下载�
 | Windows 11 ARM | ✅ | ✅ | ✅ | ✅ | ✅（7.2 起） |
 | macOS 虚拟机 | ✅ | ✅ | ✅ | ❌ | ❌ |
 | Windows 里的 3D 加速 | ❌ 还没有 | ❌ | ✅ | ✅ | ❌ |
-| RDP 连 Mac 自己的桌面和每台虚拟机 | ✅ 内置 | ❌ | ❌ | ❌ | 只有虚拟机（VRDE） |
+| RDP 连 Mac 自己的桌面和虚拟机 | ✅ 内置（macOS 虚拟机里自己装一份 hyperMAC） | ❌ | ❌ | ❌ | 只有虚拟机（VRDE） |
 
 说实话：要在 Windows 里打游戏、跑 3D，Parallels 领先，而且还会领先一阵。要的是用 Windows 11 跑 Office、浏览器、
 开发工具，或者那一个只有 Windows 版的程序，Mac 甚至可能没接显示器，又不想每年为此付费——那就是它了。
@@ -78,6 +78,8 @@ hyperMAC 最早就是 Mac 自己的 RDP 服务端，这部分是成熟的。
 - **`mstsc` 直接连**（`Mac地址:3389`，用 Mac 的用户名和密码）。
 - 用 **[kRDPclient](https://github.com/keelos-dev/kRDPclient-releases)**（Windows，免费）有硬件 H.264：1080p 30 fps
   （局域网 60），约 6–10 Mbps，带声音和剪贴板。它列出这台 Mac 和每一台虚拟机，点一下就进。
+- Windows、Linux、FreeBSD 虚拟机由宿主机直接提供画面，里面什么都不用装。**macOS 虚拟机**本身就是一台 Mac：
+  在它里面也装一份 hyperMAC，由它自己提供桌面（给它用桥接网络，别的电脑才连得到）。
 - 登录用的就是你的 Mac 账号，中间不经过任何云服务。
 - 免费——NoMachine 已经不是了：它从 10 版起取消了免费的服务端，个人使用也要按年订阅。
 
