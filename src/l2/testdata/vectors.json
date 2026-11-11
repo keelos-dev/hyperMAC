@@ -1,0 +1,525 @@
+{
+  "comment": "docs/113 §4.6, made by keel/internal/l2 (go test -run Vectors -update). Hex is the UDP payload; tlvs lists every TLV in order, unknown tags included; fields is what a reader must get (unknown tags and flag bits ignored, absent strings \"\", absent lists []).",
+  "protocol_version": 1,
+  "port": 7385,
+  "packets": [
+    {
+      "name": "discover",
+      "hex": "4b4c32010100ffffffffffff000000000000000000000000000000130000000001001000112233445566778899aabbccddeeff",
+      "header": {
+        "type": 1,
+        "type_name": "DISCOVER",
+        "flags": 0,
+        "target_mac": "ff:ff:ff:ff:ff:ff",
+        "session": 0,
+        "seq": 0,
+        "ack": 0,
+        "window": 0,
+        "length": 19
+      },
+      "tlvs": [
+        {
+          "tag": 1,
+          "value": "00112233445566778899aabbccddeeff"
+        }
+      ],
+      "fields": {
+        "nonce": "00112233445566778899aabbccddeeff"
+      }
+    },
+    {
+      "name": "offer_full",
+      "hex": "4b4c320102000cc47a65f92c000000000000000000000000000000d10000000001001000112233445566778899aabbccddeeff02002430303030303030302d303030302d303030302d303030302d3063633437613635663932630300056b65656c32040018376530663138362d3230323631303236543031303230335a0500095831315350572d54460600010007000101080008696762302e3130300900060cc47a65f92c0a0005c0a80c5e180a00050a000005080b0011fd000012000000000000000000000094400c000201bb0d00206d1c6e0f4f4b2c3a9a7b5d1e3f2a4c6b8d0e1f2a3b4c5d6e7f8091a2b3c4d5e6",
+      "header": {
+        "type": 2,
+        "type_name": "OFFER",
+        "flags": 0,
+        "target_mac": "0c:c4:7a:65:f9:2c",
+        "session": 0,
+        "seq": 0,
+        "ack": 0,
+        "window": 0,
+        "length": 209
+      },
+      "tlvs": [
+        {
+          "tag": 1,
+          "value": "00112233445566778899aabbccddeeff"
+        },
+        {
+          "tag": 2,
+          "value": "30303030303030302d303030302d303030302d303030302d306363343761363566393263"
+        },
+        {
+          "tag": 3,
+          "value": "6b65656c32"
+        },
+        {
+          "tag": 4,
+          "value": "376530663138362d3230323631303236543031303230335a"
+        },
+        {
+          "tag": 5,
+          "value": "5831315350572d5446"
+        },
+        {
+          "tag": 6,
+          "value": "00"
+        },
+        {
+          "tag": 7,
+          "value": "01"
+        },
+        {
+          "tag": 8,
+          "value": "696762302e313030"
+        },
+        {
+          "tag": 9,
+          "value": "0cc47a65f92c"
+        },
+        {
+          "tag": 10,
+          "value": "c0a80c5e18"
+        },
+        {
+          "tag": 10,
+          "value": "0a00000508"
+        },
+        {
+          "tag": 11,
+          "value": "fd00001200000000000000000000009440"
+        },
+        {
+          "tag": 12,
+          "value": "01bb"
+        },
+        {
+          "tag": 13,
+          "value": "6d1c6e0f4f4b2c3a9a7b5d1e3f2a4c6b8d0e1f2a3b4c5d6e7f8091a2b3c4d5e6"
+        }
+      ],
+      "fields": {
+        "hostname": "keel2",
+        "https_port": 443,
+        "ifmac": "0c:c4:7a:65:f9:2c",
+        "ifname": "igb0.100",
+        "ipv4": [
+          "192.168.12.94/24",
+          "10.0.0.5/8"
+        ],
+        "ipv6": [
+          "fd00:12::94/64"
+        ],
+        "managed": 1,
+        "model": "X11SPW-TF",
+        "nonce": "00112233445566778899aabbccddeeff",
+        "setup": false,
+        "spki": "6d1c6e0f4f4b2c3a9a7b5d1e3f2a4c6b8d0e1f2a3b4c5d6e7f8091a2b3c4d5e6",
+        "uuid": "00000000-0000-0000-0000-0cc47a65f92c",
+        "version": "7e0f186-20261026T010203Z"
+      }
+    },
+    {
+      "name": "offer_unset_no_ip",
+      "hex": "4b4c320102000cc47a65f92c000000000000000000000000000000750000000001001000112233445566778899aabbccddeeff02002434633463343534342d303034322d333531302d383035312d6234633034663462346433320300066b65656c6f73040018376530663138362d3230323631303236543031303230335a0600010107000100080003656d300900060cc47a65f92c",
+      "header": {
+        "type": 2,
+        "type_name": "OFFER",
+        "flags": 0,
+        "target_mac": "0c:c4:7a:65:f9:2c",
+        "session": 0,
+        "seq": 0,
+        "ack": 0,
+        "window": 0,
+        "length": 117
+      },
+      "tlvs": [
+        {
+          "tag": 1,
+          "value": "00112233445566778899aabbccddeeff"
+        },
+        {
+          "tag": 2,
+          "value": "34633463343534342d303034322d333531302d383035312d623463303466346234643332"
+        },
+        {
+          "tag": 3,
+          "value": "6b65656c6f73"
+        },
+        {
+          "tag": 4,
+          "value": "376530663138362d3230323631303236543031303230335a"
+        },
+        {
+          "tag": 6,
+          "value": "01"
+        },
+        {
+          "tag": 7,
+          "value": "00"
+        },
+        {
+          "tag": 8,
+          "value": "656d30"
+        },
+        {
+          "tag": 9,
+          "value": "0cc47a65f92c"
+        }
+      ],
+      "fields": {
+        "hostname": "keelos",
+        "https_port": 0,
+        "ifmac": "0c:c4:7a:65:f9:2c",
+        "ifname": "em0",
+        "ipv4": [],
+        "ipv6": [],
+        "managed": 0,
+        "model": "",
+        "nonce": "00112233445566778899aabbccddeeff",
+        "setup": true,
+        "spki": "",
+        "uuid": "4c4c4544-0042-3510-8051-b4c04f4b4d32",
+        "version": "7e0f186-20261026T010203Z"
+      }
+    },
+    {
+      "name": "offer_unknown_tag_and_flag",
+      "hex": "4b4c320102800cc47a65f92c000000000000000000000000000000d90000000001001000112233445566778899aabbccddeeff02002430303030303030302d303030302d303030302d303030302d3063633437613635663932630300056b65656c32040018376530663138362d3230323631303236543031303230335a0500095831315350572d54460600010007000101080008696762302e3130300900060cc47a65f92c0a0005c0a80c5e180a00050a000005080b0011fd000012000000000000000000000094400c000201bb0d00206d1c6e0f4f4b2c3a9a7b5d1e3f2a4c6b8d0e1f2a3b4c5d6e7f8091a2b3c4d5e6c800056c61746572",
+      "header": {
+        "type": 2,
+        "type_name": "OFFER",
+        "flags": 128,
+        "target_mac": "0c:c4:7a:65:f9:2c",
+        "session": 0,
+        "seq": 0,
+        "ack": 0,
+        "window": 0,
+        "length": 217
+      },
+      "tlvs": [
+        {
+          "tag": 1,
+          "value": "00112233445566778899aabbccddeeff"
+        },
+        {
+          "tag": 2,
+          "value": "30303030303030302d303030302d303030302d303030302d306363343761363566393263"
+        },
+        {
+          "tag": 3,
+          "value": "6b65656c32"
+        },
+        {
+          "tag": 4,
+          "value": "376530663138362d3230323631303236543031303230335a"
+        },
+        {
+          "tag": 5,
+          "value": "5831315350572d5446"
+        },
+        {
+          "tag": 6,
+          "value": "00"
+        },
+        {
+          "tag": 7,
+          "value": "01"
+        },
+        {
+          "tag": 8,
+          "value": "696762302e313030"
+        },
+        {
+          "tag": 9,
+          "value": "0cc47a65f92c"
+        },
+        {
+          "tag": 10,
+          "value": "c0a80c5e18"
+        },
+        {
+          "tag": 10,
+          "value": "0a00000508"
+        },
+        {
+          "tag": 11,
+          "value": "fd00001200000000000000000000009440"
+        },
+        {
+          "tag": 12,
+          "value": "01bb"
+        },
+        {
+          "tag": 13,
+          "value": "6d1c6e0f4f4b2c3a9a7b5d1e3f2a4c6b8d0e1f2a3b4c5d6e7f8091a2b3c4d5e6"
+        },
+        {
+          "tag": 200,
+          "value": "6c61746572"
+        }
+      ],
+      "fields": {
+        "hostname": "keel2",
+        "https_port": 443,
+        "ifmac": "0c:c4:7a:65:f9:2c",
+        "ifname": "igb0.100",
+        "ipv4": [
+          "192.168.12.94/24",
+          "10.0.0.5/8"
+        ],
+        "ipv6": [
+          "fd00:12::94/64"
+        ],
+        "managed": 1,
+        "model": "X11SPW-TF",
+        "nonce": "00112233445566778899aabbccddeeff",
+        "setup": false,
+        "spki": "6d1c6e0f4f4b2c3a9a7b5d1e3f2a4c6b8d0e1f2a3b4c5d6e7f8091a2b3c4d5e6",
+        "uuid": "00000000-0000-0000-0000-0cc47a65f92c",
+        "version": "7e0f186-20261026T010203Z"
+      }
+    },
+    {
+      "name": "open",
+      "hex": "4b4c320103000cc47a65f92c1badb00200000000000000000000001b000000000e000568747470730100100f1e2d3c4b5a69788796a5b4c3d2e1f0",
+      "header": {
+        "type": 3,
+        "type_name": "OPEN",
+        "flags": 0,
+        "target_mac": "0c:c4:7a:65:f9:2c",
+        "session": 464367618,
+        "seq": 0,
+        "ack": 0,
+        "window": 0,
+        "length": 27
+      },
+      "tlvs": [
+        {
+          "tag": 14,
+          "value": "6874747073"
+        },
+        {
+          "tag": 1,
+          "value": "0f1e2d3c4b5a69788796a5b4c3d2e1f0"
+        }
+      ],
+      "fields": {
+        "nonce": "0f1e2d3c4b5a69788796a5b4c3d2e1f0",
+        "service": "https"
+      }
+    },
+    {
+      "name": "open_ok",
+      "hex": "4b4c320104000cc47a65f92c1badb002000000000000000000400013000000000100100f1e2d3c4b5a69788796a5b4c3d2e1f0",
+      "header": {
+        "type": 4,
+        "type_name": "OPEN_OK",
+        "flags": 0,
+        "target_mac": "0c:c4:7a:65:f9:2c",
+        "session": 464367618,
+        "seq": 0,
+        "ack": 0,
+        "window": 64,
+        "length": 19
+      },
+      "tlvs": [
+        {
+          "tag": 1,
+          "value": "0f1e2d3c4b5a69788796a5b4c3d2e1f0"
+        }
+      ],
+      "fields": {
+        "nonce": "0f1e2d3c4b5a69788796a5b4c3d2e1f0"
+      }
+    },
+    {
+      "name": "open_fail",
+      "hex": "4b4c320105000cc47a65f92c1badb002000000000000000000000014000000000f0011746f6f5f6d616e795f73657373696f6e73",
+      "header": {
+        "type": 5,
+        "type_name": "OPEN_FAIL",
+        "flags": 0,
+        "target_mac": "0c:c4:7a:65:f9:2c",
+        "session": 464367618,
+        "seq": 0,
+        "ack": 0,
+        "window": 0,
+        "length": 20
+      },
+      "tlvs": [
+        {
+          "tag": 15,
+          "value": "746f6f5f6d616e795f73657373696f6e73"
+        }
+      ],
+      "fields": {
+        "reason": "too_many_sessions"
+      }
+    },
+    {
+      "name": "data",
+      "hex": "4b4c320106000cc47a65f92c1badb00200000000000000000040000a0000000016030100050100000100",
+      "header": {
+        "type": 6,
+        "type_name": "DATA",
+        "flags": 0,
+        "target_mac": "0c:c4:7a:65:f9:2c",
+        "session": 464367618,
+        "seq": 0,
+        "ack": 0,
+        "window": 64,
+        "length": 10
+      },
+      "data": "16030100050100000100"
+    },
+    {
+      "name": "data_wrapped",
+      "hex": "4b4c320106000cc47a65f92c1badb002fffffffe00000558003c00040000000061626364",
+      "header": {
+        "type": 6,
+        "type_name": "DATA",
+        "flags": 0,
+        "target_mac": "0c:c4:7a:65:f9:2c",
+        "session": 464367618,
+        "seq": 4294967294,
+        "ack": 1368,
+        "window": 60,
+        "length": 4
+      },
+      "data": "61626364"
+    },
+    {
+      "name": "ack",
+      "hex": "4b4c320107000cc47a65f92c1badb00200000000000000020040000000000000",
+      "header": {
+        "type": 7,
+        "type_name": "ACK",
+        "flags": 0,
+        "target_mac": "0c:c4:7a:65:f9:2c",
+        "session": 464367618,
+        "seq": 0,
+        "ack": 2,
+        "window": 64,
+        "length": 0
+      }
+    },
+    {
+      "name": "fin",
+      "hex": "4b4c320108000cc47a65f92c1badb00200001000000000020040000000000000",
+      "header": {
+        "type": 8,
+        "type_name": "FIN",
+        "flags": 0,
+        "target_mac": "0c:c4:7a:65:f9:2c",
+        "session": 464367618,
+        "seq": 4096,
+        "ack": 2,
+        "window": 64,
+        "length": 0
+      }
+    },
+    {
+      "name": "reset",
+      "hex": "4b4c320109000cc47a65f92c1badb002000000000000000000000012000000000f000f756e6b6e6f776e5f73657373696f6e",
+      "header": {
+        "type": 9,
+        "type_name": "RESET",
+        "flags": 0,
+        "target_mac": "0c:c4:7a:65:f9:2c",
+        "session": 464367618,
+        "seq": 0,
+        "ack": 0,
+        "window": 0,
+        "length": 18
+      },
+      "tlvs": [
+        {
+          "tag": 15,
+          "value": "756e6b6e6f776e5f73657373696f6e"
+        }
+      ],
+      "fields": {
+        "reason": "unknown_session"
+      }
+    },
+    {
+      "name": "ping",
+      "hex": "4b4c32010a000cc47a65f92c1badb00200001000000000020040000000000000",
+      "header": {
+        "type": 10,
+        "type_name": "PING",
+        "flags": 0,
+        "target_mac": "0c:c4:7a:65:f9:2c",
+        "session": 464367618,
+        "seq": 4096,
+        "ack": 2,
+        "window": 64,
+        "length": 0
+      }
+    }
+  ],
+  "invalid": [
+    {
+      "name": "short",
+      "hex": "4b4c32010100ffffffffffff00000000000000000000000000000013000000",
+      "error": "short"
+    },
+    {
+      "name": "bad_magic",
+      "hex": "4b4c33010100ffffffffffff000000000000000000000000000000130000000001001000112233445566778899aabbccddeeff",
+      "error": "magic"
+    },
+    {
+      "name": "version_2",
+      "hex": "4b4c32020100ffffffffffff000000000000000000000000000000130000000001001000112233445566778899aabbccddeeff",
+      "error": "version"
+    },
+    {
+      "name": "length_beyond_packet",
+      "hex": "4b4c32010100ffffffffffff000000000000000000000000000000140000000001001000112233445566778899aabbccddeeff",
+      "error": "length"
+    },
+    {
+      "name": "truncated_tlv",
+      "hex": "4b4c3201020000000000000000000000000000000000000000000005000000000200100102",
+      "error": "tlv"
+    }
+  ],
+  "frames": [
+    {
+      "name": "offer_reply",
+      "hex": "0211223344550cc47a65f92c08004500010d0000400040116cdac0a80c5effffffff1cd9c3cb00f900004b4c320102000cc47a65f92c000000000000000000000000000000d10000000001001000112233445566778899aabbccddeeff02002430303030303030302d303030302d303030302d303030302d3063633437613635663932630300056b65656c32040018376530663138362d3230323631303236543031303230335a0500095831315350572d54460600010007000101080008696762302e3130300900060cc47a65f92c0a0005c0a80c5e180a00050a000005080b0011fd000012000000000000000000000094400c000201bb0d00206d1c6e0f4f4b2c3a9a7b5d1e3f2a4c6b8d0e1f2a3b4c5d6e7f8091a2b3c4d5e6",
+      "eth_dst": "02:11:22:33:44:55",
+      "eth_src": "0c:c4:7a:65:f9:2c",
+      "ip_src": "192.168.12.94",
+      "ip_dst": "255.255.255.255",
+      "udp_src": 7385,
+      "udp_dst": 50123,
+      "payload": "4b4c320102000cc47a65f92c000000000000000000000000000000d10000000001001000112233445566778899aabbccddeeff02002430303030303030302d303030302d303030302d303030302d3063633437613635663932630300056b65656c32040018376530663138362d3230323631303236543031303230335a0500095831315350572d54460600010007000101080008696762302e3130300900060cc47a65f92c0a0005c0a80c5e180a00050a000005080b0011fd000012000000000000000000000094400c000201bb0d00206d1c6e0f4f4b2c3a9a7b5d1e3f2a4c6b8d0e1f2a3b4c5d6e7f8091a2b3c4d5e6"
+    },
+    {
+      "name": "offer_reply_no_host_ip",
+      "hex": "0211223344550cc47a65f92c08004500010d00004000401139e100000000ffffffff1cd9c3cb00f900004b4c320102000cc47a65f92c000000000000000000000000000000d10000000001001000112233445566778899aabbccddeeff02002430303030303030302d303030302d303030302d303030302d3063633437613635663932630300056b65656c32040018376530663138362d3230323631303236543031303230335a0500095831315350572d54460600010007000101080008696762302e3130300900060cc47a65f92c0a0005c0a80c5e180a00050a000005080b0011fd000012000000000000000000000094400c000201bb0d00206d1c6e0f4f4b2c3a9a7b5d1e3f2a4c6b8d0e1f2a3b4c5d6e7f8091a2b3c4d5e6",
+      "eth_dst": "02:11:22:33:44:55",
+      "eth_src": "0c:c4:7a:65:f9:2c",
+      "ip_src": "0.0.0.0",
+      "ip_dst": "255.255.255.255",
+      "udp_src": 7385,
+      "udp_dst": 50123,
+      "payload": "4b4c320102000cc47a65f92c000000000000000000000000000000d10000000001001000112233445566778899aabbccddeeff02002430303030303030302d303030302d303030302d303030302d3063633437613635663932630300056b65656c32040018376530663138362d3230323631303236543031303230335a0500095831315350572d54460600010007000101080008696762302e3130300900060cc47a65f92c0a0005c0a80c5e180a00050a000005080b0011fd000012000000000000000000000094400c000201bb0d00206d1c6e0f4f4b2c3a9a7b5d1e3f2a4c6b8d0e1f2a3b4c5d6e7f8091a2b3c4d5e6"
+    },
+    {
+      "name": "discover_request",
+      "hex": "ffffffffffff02112233445508004500004f000040004011868ca9fe0a14ffffffffc3cb1cd9003b00004b4c32010100ffffffffffff000000000000000000000000000000130000000001001000112233445566778899aabbccddeeff",
+      "eth_dst": "ff:ff:ff:ff:ff:ff",
+      "eth_src": "02:11:22:33:44:55",
+      "ip_src": "169.254.10.20",
+      "ip_dst": "255.255.255.255",
+      "udp_src": 50123,
+      "udp_dst": 7385,
+      "payload": "4b4c32010100ffffffffffff000000000000000000000000000000130000000001001000112233445566778899aabbccddeeff"
+    }
+  ]
+}

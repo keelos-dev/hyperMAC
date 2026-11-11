@@ -1,0 +1,1707 @@
+diff --git a/.keel-rev b/.keel-rev
+new file mode 100644
+index 00000000..37738dac
+--- /dev/null
++++ b/.keel-rev
+@@ -0,0 +1 @@
++8f9bf5b8102dd3c4cdb4841939d4dbba35c7bff8 10ff8e6896fe6b64290d297a12b36ca712ab23f5d3917ed3a791f28ae6e1acfc
+diff --git a/Cargo.lock b/Cargo.lock
+index 9dfa30a6..225229a7 100644
+--- a/Cargo.lock
++++ b/Cargo.lock
+@@ -3347,6 +3347,7 @@ dependencies = [
+  "rand 0.9.4",
+  "rayon",
+  "rustls-pemfile",
++ "socket2",
+  "tokio",
+  "tokio-rustls",
+  "tracing",
+diff --git a/crates/ironrdp-acceptor/src/connection.rs b/crates/ironrdp-acceptor/src/connection.rs
+index c342625d..8ebaa6e1 100644
+--- a/crates/ironrdp-acceptor/src/connection.rs
++++ b/crates/ironrdp-acceptor/src/connection.rs
+@@ -51,6 +51,8 @@ pub struct Acceptor {
+     static_channels: StaticChannelSet,
+     saved_for_reactivation: AcceptorState,
+     pub(crate) creds: Option<Credentials>,
++    /// keel: CredSSP looks the password up by user name (instead of `creds`), see [`CredentialsLookup`].
++    pub(crate) creds_lookup: Option<CredentialsLookup>,
+     received_credentials: Option<Credentials>,
+     received_auto_reconnect: Option<ClientAutoReconnect>,
+     reactivation: bool,
+@@ -213,7 +215,25 @@ pub struct AcceptorResult {
+     pub auto_reconnect: Option<ClientAutoReconnect>,
+ }
+ 
++/// keel: user name (account name, without domain) -> password or NT hash for CredSSP, or None
++/// to refuse.
++pub type CredentialsLookup = std::sync::Arc<dyn Fn(&str) -> Option<LookupSecret> + Send + Sync>;
++
++/// keel: what [`CredentialsLookup`] finds for a user. NTLMv2 needs only the NT hash
++/// (MD4 of the UTF-16LE password): NTOWFv2 = HMAC-MD5(NT hash, UPPER(user) + domain).
++#[derive(Clone)]
++pub enum LookupSecret {
++    Password(String),
++    NtHash([u8; 16]),
++}
++
+ impl Acceptor {
++    /// keel: CredSSP asks `lookup` for the password of the user name the client sent, instead
++    /// of comparing with the one set of credentials given to [`Acceptor::new`].
++    pub fn set_credentials_lookup(&mut self, lookup: Option<CredentialsLookup>) {
++        self.creds_lookup = lookup;
++    }
++
+     pub fn new(
+         security: SecurityProtocol,
+         desktop_size: DesktopSize,
+@@ -236,6 +256,7 @@ impl Acceptor {
+             static_channels: StaticChannelSet::new(),
+             saved_for_reactivation: Default::default(),
+             creds,
++            creds_lookup: None,
+             received_credentials: None,
+             received_auto_reconnect: None,
+             reactivation: false,
+@@ -471,6 +492,7 @@ impl Acceptor {
+             static_channels,
+             saved_for_reactivation,
+             creds: consumed.creds,
++            creds_lookup: consumed.creds_lookup,
+             received_credentials: consumed.received_credentials,
+             received_auto_reconnect: consumed.received_auto_reconnect,
+             reactivation: true,
+diff --git a/crates/ironrdp-acceptor/src/credssp.rs b/crates/ironrdp-acceptor/src/credssp.rs
+index e665724d..d19d5284 100644
+--- a/crates/ironrdp-acceptor/src/credssp.rs
++++ b/crates/ironrdp-acceptor/src/credssp.rs
+@@ -42,14 +42,24 @@ pub struct CredsspSequence<'a> {
+     state: CredsspState,
+ }
+ 
+-#[derive(Debug)]
+-struct CredentialsProxyImpl<'a> {
+-    credentials: &'a AuthIdentity,
++enum CredentialsProxyImpl<'a> {
++    Fixed(&'a AuthIdentity),
++    /// keel: the password comes from a lookup by user name
++    Lookup(crate::connection::CredentialsLookup),
++}
++
++impl core::fmt::Debug for CredentialsProxyImpl<'_> {
++    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
++        match self {
++            Self::Fixed(c) => f.debug_tuple("Fixed").field(c).finish(),
++            Self::Lookup(_) => f.write_str("Lookup"),
++        }
++    }
+ }
+ 
+ impl<'a> CredentialsProxyImpl<'a> {
+     fn new(credentials: &'a AuthIdentity) -> Self {
+-        Self { credentials }
++        Self::Fixed(credentials)
+     }
+ }
+ 
+@@ -57,18 +67,42 @@ impl CredentialsProxy for CredentialsProxyImpl<'_> {
+     type AuthenticationData = AuthIdentity;
+ 
+     fn auth_data_by_user(&mut self, username: &Username) -> std::io::Result<Self::AuthenticationData> {
+-        if username.account_name() != self.credentials.username.account_name() {
++        let credentials = match self {
++            Self::Fixed(c) => c,
++            Self::Lookup(lookup) => {
++                let secret = lookup(username.account_name()).ok_or_else(|| std::io::Error::other("invalid username"))?;
++                // sspi's NTLM takes "$NTLM$:<hex>" in the password field as the NT hash itself
++                let password = match secret {
++                    crate::connection::LookupSecret::Password(p) if p.starts_with(sspi::NTLM_HASH_PREFIX) => {
++                        return Err(std::io::Error::other("a password that looks like an NT hash"));
++                    }
++                    crate::connection::LookupSecret::Password(p) => p,
++                    crate::connection::LookupSecret::NtHash(h) => {
++                        let hex: String = h.iter().map(|b| format!("{b:02x}")).collect();
++                        format!("{}{hex}", sspi::NTLM_HASH_PREFIX)
++                    }
++                };
++                return Ok(AuthIdentity {
++                    username: username.clone(),
++                    password: password.into(),
++                });
++            }
++        };
++        if username.account_name() != credentials.username.account_name() {
+             return Err(std::io::Error::other("invalid username"));
+         }
+ 
+-        let mut data = self.credentials.clone();
++        let mut data = (*credentials).clone();
+         // keep the original user/domain
+         data.username = username.clone();
+         Ok(data)
+     }
+ 
+     fn auth_data(&mut self) -> Result<Vec<Self::AuthenticationData>, std::io::Error> {
+-        Ok(vec![self.credentials.clone()])
++        match self {
++            Self::Fixed(c) => Ok(vec![(*c).clone()]),
++            Self::Lookup(_) => Ok(Vec::new()),
++        }
+     }
+ }
+ 
+@@ -106,9 +140,27 @@ impl<'a> CredsspSequence<'a> {
+         client_computer_name: ServerName,
+         public_key: Vec<u8>,
+         krb_config: Option<KerberosServerConfig>,
++    ) -> ConnectorResult<Self> {
++        Self::init_proxy(CredentialsProxyImpl::new(creds), client_computer_name, public_key, krb_config)
++    }
++
++    /// keel: like `init`, the password looked up by the user name the client sends
++    pub(crate) fn init_lookup(
++        lookup: crate::connection::CredentialsLookup,
++        client_computer_name: ServerName,
++        public_key: Vec<u8>,
++        krb_config: Option<KerberosServerConfig>,
++    ) -> ConnectorResult<Self> {
++        Self::init_proxy(CredentialsProxyImpl::Lookup(lookup), client_computer_name, public_key, krb_config)
++    }
++
++    fn init_proxy(
++        credentials: CredentialsProxyImpl<'a>,
++        client_computer_name: ServerName,
++        public_key: Vec<u8>,
++        krb_config: Option<KerberosServerConfig>,
+     ) -> ConnectorResult<Self> {
+         let client_computer_name = client_computer_name.into_inner();
+-        let credentials = CredentialsProxyImpl::new(creds);
+ 
+         let server_mode = if let Some(krb_config) = krb_config {
+             ServerMode::Negotiate(NegotiateConfig {
+diff --git a/crates/ironrdp-acceptor/src/lib.rs b/crates/ironrdp-acceptor/src/lib.rs
+index 8f186029..9090da4a 100644
+--- a/crates/ironrdp-acceptor/src/lib.rs
++++ b/crates/ironrdp-acceptor/src/lib.rs
+@@ -18,7 +18,7 @@ pub use ironrdp_connector::DesktopSize;
+ use ironrdp_pdu::nego;
+ 
+ pub use self::channel_connection::{ChannelConnectionSequence, ChannelConnectionState};
+-pub use self::connection::{Acceptor, AcceptorResult, AcceptorState, MultitransportSecurityRng};
++pub use self::connection::{CredentialsLookup, LookupSecret, Acceptor, AcceptorResult, AcceptorState, MultitransportSecurityRng};
+ pub use self::finalization::{FinalizationSequence, FinalizationState};
+ use crate::credssp::resolve_generator;
+ 
+@@ -223,19 +223,22 @@ where
+         S: FramedRead + FramedWrite,
+         N: NetworkClient,
+     {
+-        let creds = acceptor
+-            .creds
+-            .as_ref()
+-            .ok_or_else(|| general_err!("no credentials while doing credssp"))?;
+-        let username = Username::new(&creds.username, None).map_err(|e| custom_err!("invalid username", e))?;
+-        let identity = AuthIdentity {
+-            username,
+-            password: creds.password.clone().into(),
++        let identity;
++        let mut sequence = if let Some(lookup) = acceptor.creds_lookup.clone() {
++            credssp::CredsspSequence::init_lookup(lookup, client_computer_name, public_key, kerberos_config)?
++        } else {
++            let creds = acceptor
++                .creds
++                .as_ref()
++                .ok_or_else(|| general_err!("no credentials while doing credssp"))?;
++            let username = Username::new(&creds.username, None).map_err(|e| custom_err!("invalid username", e))?;
++            identity = AuthIdentity {
++                username,
++                password: creds.password.clone().into(),
++            };
++            credssp::CredsspSequence::init(&identity, client_computer_name, public_key, kerberos_config)?
+         };
+ 
+-        let mut sequence =
+-            credssp::CredsspSequence::init(&identity, client_computer_name, public_key, kerberos_config)?;
+-
+         loop {
+             let Some(next_pdu_hint) = sequence.next_pdu_hint()? else {
+                 break;
+diff --git a/crates/ironrdp-dvc/src/server.rs b/crates/ironrdp-dvc/src/server.rs
+index c3d4ca8f..71064951 100644
+--- a/crates/ironrdp-dvc/src/server.rs
++++ b/crates/ironrdp-dvc/src/server.rs
+@@ -184,6 +184,16 @@ impl DrdynvcServer {
+         self.type_id_to_channel_id.get(&TypeId::of::<T>()).copied()
+     }
+ 
++    /// keel: the open channels with one of these names (channels of other crates' types, for
++    /// the Soft-Sync request).
++    pub fn opened_channel_ids_named(&self, names: &[&str]) -> Vec<u32> {
++        self.dynamic_channels
++            .into_iter()
++            .filter(|(_, c)| c.state == ChannelState::Opened && names.contains(&c.processor.channel_name()))
++            .map(|(id, _)| *id)
++            .collect()
++    }
++
+     /// Returns `true` if the DVC channel with the given ID has completed
+     /// its creation handshake and is in the `Opened` state.
+     pub fn is_channel_opened(&self, channel_id: u32) -> bool {
+diff --git a/crates/ironrdp-egfx/src/server.rs b/crates/ironrdp-egfx/src/server.rs
+index 5096607f..0b89261b 100644
+--- a/crates/ironrdp-egfx/src/server.rs
++++ b/crates/ironrdp-egfx/src/server.rs
+@@ -1946,6 +1946,22 @@ impl GraphicsPipelineServer {
+         Some(frame_id)
+     }
+ 
++    /// keel: one frame made of the given surface commands (copies, fills, cache operations,
++    /// codec updates), in that order, between StartFrame and EndFrame. Returns `Some(frame_id)`
++    /// if queued, `None` if not ready or backpressured.
++    pub fn send_frame(&mut self, commands: Vec<GfxPdu>, timestamp_ms: u32) -> Option<u32> {
++        if !self.is_ready() || self.should_backpressure() {
++            return None;
++        }
++        let timestamp = Self::make_timestamp(timestamp_ms);
++        let frame_id = self.frames.begin_frame(timestamp);
++        self.output_queue
++            .push_back(GfxPdu::StartFrame(StartFramePdu { timestamp, frame_id }));
++        self.output_queue.extend(commands);
++        self.output_queue.push_back(GfxPdu::EndFrame(EndFramePdu { frame_id }));
++        Some(frame_id)
++    }
++
+     /// Queue a ClearCodec frame for transmission.
+     ///
+     /// ClearCodec is a mandatory lossless codec for all EGFX versions. It
+diff --git a/crates/ironrdp-rdpeudp-tokio/src/driver.rs b/crates/ironrdp-rdpeudp-tokio/src/driver.rs
+index 82010bbb..dc076d2e 100644
+--- a/crates/ironrdp-rdpeudp-tokio/src/driver.rs
++++ b/crates/ironrdp-rdpeudp-tokio/src/driver.rs
+@@ -286,11 +286,16 @@ impl Driver {
+                 pad_handshake_datagram(transmit.contents)
+             };
+ 
+-            self.socket
+-                .send(&bytes)
+-                .await
+-                .map_err(|error| DriverError::socket("send datagram", error))?;
+-            trace!(len = bytes.len(), "Sent datagram");
++            match self.socket.send(&bytes).await {
++                Ok(_) => trace!(len = bytes.len(), "Sent datagram"),
++                // A full interface or socket queue (ENOBUFS, e.g. a slow guest NIC behind a
++                // tap) is congestion, not a dead peer: the datagram is lost like one dropped
++                // on the wire, and the reliable mode retransmits it.
++                Err(error) if is_congestion(&error) => {
++                    debug!(len = bytes.len(), %error, "Datagram dropped: send queue full");
++                }
++                Err(error) => return Err(DriverError::socket("send datagram", error)),
++            }
+         }
+         Ok(())
+     }
+@@ -973,3 +978,16 @@ mod tests {
+         drop(unresponsive_peer);
+     }
+ }
++
++/// A send error that only means the queue below is full right now.
++fn is_congestion(error: &std::io::Error) -> bool {
++    // ENOBUFS: FreeBSD and macOS 55, Linux 105, Windows WSAENOBUFS 10055
++    const ENOBUFS: i32 = if cfg!(target_os = "linux") {
++        105
++    } else if cfg!(windows) {
++        10055
++    } else {
++        55
++    };
++    error.kind() == std::io::ErrorKind::WouldBlock || error.raw_os_error() == Some(ENOBUFS)
++}
+diff --git a/crates/ironrdp-rdpeusb/src/pdu/completion/mod.rs b/crates/ironrdp-rdpeusb/src/pdu/completion/mod.rs
+index d6a41b34..eace8a65 100644
+--- a/crates/ironrdp-rdpeusb/src/pdu/completion/mod.rs
++++ b/crates/ironrdp-rdpeusb/src/pdu/completion/mod.rs
+@@ -97,8 +97,10 @@ impl IoControlCompletion {
+                         "HResult is: 0x0 (IOCTL success), but Information != OutputBufferSize"
+                     , in: src));
+                 }
+-                ensure_size!(in: src, size: n);
+-                src.read_slice(n).to_vec()
++                // keel: FreeRDP's urbdrc client (xfreerdp3 3.15) answers IOCTL_INTERNAL_USB_RESET_PORT
++                // (output buffer size 0) with Information = OutputBufferSize = 4 and no bytes
++                // (docs/66 §10.7): take what is there
++                src.read_slice(core::cmp::min::<usize>(n, src.len())).to_vec()
+             }
+             HRESULT_FROM_WIN32_ERROR_INSUFFICIENT_BUFFER => {
+                 ensure_size!(in: src, size: n);
+@@ -126,7 +128,8 @@ impl IoControlCompletion {
+             request_id,
+             hresult,
+             information,
+-            output_buffer_size,
++            // keel: what arrived (see above)
++            output_buffer_size: output_buffer_size.min(u32::try_from(output_buffer.len()).unwrap_or(u32::MAX)),
+             output_buffer,
+         })
+     }
+diff --git a/crates/ironrdp-rdpeusb/src/server.rs b/crates/ironrdp-rdpeusb/src/server.rs
+index 7e7375c8..80ba8567 100644
+--- a/crates/ironrdp-rdpeusb/src/server.rs
++++ b/crates/ironrdp-rdpeusb/src/server.rs
+@@ -233,9 +233,34 @@ pub struct UrbdrcDeviceServer {
+     comp_iface: InterfaceId,
+     no_ack_isoch_write_jitter_buf_size: Option<NoAckIsochWriteJitterBufSizeInMs>,
+     pending_io: BTreeMap<RequestId, Pending>,
++    /// keel: the data of a TRANSFER_IN_REQUEST sent ahead in KEEL_IN_PART messages, until its
++    /// completion brings the rest (`None`: a part did not fit, the request fails).
++    keel_parts: BTreeMap<RequestId, Option<Vec<u8>>>,
+     backend: Box<dyn UrbdrcDeviceServerBackend>,
+ }
+ 
++/// keel (keelOS docs/73 §9): the server asks QUERY_DEVICE_TEXT with this TextType (and the
++/// version in LocaleId) once per device; a client that knows it may then send a big bulk IN's
++/// data ahead, while the device is still reading, in messages with FunctionId `KEEL_IN_PART`:
++/// the shared header (InterfaceId, MessageId: not used), RequestId (u32), Offset (u32: where
++/// this data goes in the request's buffer, = what came before) and the data. The request's
++/// URB_COMPLETION (or URB_COMPLETION_NO_DATA) brings the rest of the data, and its status.
++/// Other clients answer the query as an unknown text type and never send a part.
++pub const KEEL_USB_QUERY: u32 = 0x4B45_454C;
++pub const KEEL_USB_VERSION: u32 = 1;
++pub const KEEL_IN_PART: u32 = 0x4B45_0001;
++/// E_FAIL: the completion of a request whose parts did not fit.
++const KEEL_E_FAIL: u32 = 0x8000_4005;
++
++/// A KEEL_IN_PART message: (RequestId, Offset, data).
++fn keel_in_part(payload: &[u8]) -> Option<(RequestId, usize, &[u8])> {
++    let u32_at = |at: usize| Some(u32::from_le_bytes(payload.get(at..at + 4)?.try_into().ok()?));
++    if u32_at(8)? != KEEL_IN_PART {
++        return None;
++    }
++    Some((u32_at(12)?, usize::try_from(u32_at(16)?).ok()?, payload.get(20..)?))
++}
++
+ #[derive(Debug, Clone, Copy, PartialEq)]
+ enum DeviceState {
+     AwaitingCaps,
+@@ -310,6 +335,7 @@ impl UrbdrcDeviceServer {
+             comp_iface,
+             no_ack_isoch_write_jitter_buf_size: None,
+             pending_io: BTreeMap::new(),
++            keel_parts: BTreeMap::new(),
+             backend,
+         })
+     }
+@@ -574,6 +600,37 @@ impl UrbdrcDeviceServer {
+         Ok(Vec::new())
+     }
+ 
++    /// keel: data of a pending TRANSFER_IN_REQUEST sent ahead. A part out of order or past the
++    /// request's buffer fails the request when its completion comes; one for no pending
++    /// TRANSFER_IN_REQUEST (cancelled and answered meanwhile) is dropped.
++    fn keel_part(&mut self, request_id: RequestId, offset: usize, data: &[u8]) {
++        let Some(Pending::TransferIn { max_output_buf_size, .. }) = self.pending_io.get(&request_id) else {
++            return;
++        };
++        let max = *max_output_buf_size as usize;
++        let entry = self.keel_parts.entry(request_id).or_insert_with(|| Some(Vec::new()));
++        let fits = entry
++            .as_ref()
++            .is_some_and(|b| b.len() == offset && offset + data.len() <= max);
++        match entry {
++            Some(buffer) if fits => buffer.extend_from_slice(data),
++            _ => *entry = None,
++        }
++    }
++
++    /// keel: a TRANSFER_IN_REQUEST's data sent ahead, followed by what its completion brought;
++    /// `None` when a part did not fit.
++    fn keel_join(&mut self, request_id: RequestId, rest: Vec<u8>) -> Option<Vec<u8>> {
++        match self.keel_parts.remove(&request_id) {
++            None => Some(rest),
++            Some(Some(mut head)) => {
++                head.extend_from_slice(&rest);
++                Some(head)
++            }
++            Some(None) => None,
++        }
++    }
++
+     fn handle_urb_completion(&mut self, channel_id: u32, completion: UrbCompletion) -> PduResult<Vec<DvcMessage>> {
+         if completion.completion_iface != self.comp_iface {
+             return Ok(Vec::new());
+@@ -581,16 +638,51 @@ impl UrbdrcDeviceServer {
+ 
+         let request_id = RequestId::from(completion.req_id);
+ 
+-        let Some(Pending::TransferIn {
+-            max_output_buf_size,
+-            expected_result,
+-        }) = self.pending_io.remove(&request_id)
+-        else {
+-            return Err(pdu_other_err!("completion mismatch"));
++        let (max_output_buf_size, expected_result) = match self.pending_io.remove(&request_id) {
++            Some(Pending::TransferIn {
++                max_output_buf_size,
++                expected_result,
++            }) => (max_output_buf_size, expected_result),
++            // keel: FreeRDP's urbdrc client (xfreerdp3 3.15) answers a TRANSFER_OUT_REQUEST
++            // with URB_COMPLETION carrying the data it wrote, not URB_COMPLETION_NO_DATA
++            // (docs/66 §10.7): take it as the no-data completion, the length as what was written.
++            Some(Pending::TransferOut {
++                max_output_buf_size,
++                expected_result,
++            }) => {
++                self.keel_parts.remove(&request_id);
++                let written = u32::try_from(completion.output_buffer.len())
++                    .map_err(|_| pdu_other_err!("convert usize to u32 failed"))?;
++                if written > max_output_buf_size {
++                    return Err(pdu_other_err!("output buffer exceeds maximum amount"));
++                }
++                let ts_urb_result = completion
++                    .ts_urb_result
++                    .into_expected(expected_result)
++                    .map_err(|e| decode_err!(e))?;
++                self.backend.transfer_out_completed(
++                    channel_id,
++                    request_id,
++                    TransferOutCompletionResult {
++                        ts_urb_result,
++                        hresult: completion.hresult,
++                        output_buffer_size: written,
++                    },
++                )?;
++                return Ok(Vec::new());
++            }
++            _ => {
++                self.keel_parts.remove(&request_id);
++                return Err(pdu_other_err!("completion mismatch"));
++            }
+         };
+ 
++        let (hresult, output_buffer) = match self.keel_join(request_id, completion.output_buffer) {
++            Some(data) => (completion.hresult, data),
++            None => (KEEL_E_FAIL, Vec::new()),
++        };
+         let output_buffer_size =
+-            u32::try_from(completion.output_buffer.len()).map_err(|_| pdu_other_err!("convert usize to u32 failed"))?;
++            u32::try_from(output_buffer.len()).map_err(|_| pdu_other_err!("convert usize to u32 failed"))?;
+         if output_buffer_size > max_output_buf_size {
+             return Err(pdu_other_err!("output buffer exceeds maximum amount"));
+         }
+@@ -605,8 +697,8 @@ impl UrbdrcDeviceServer {
+             request_id,
+             TransferInCompletionResult {
+                 ts_urb_result,
+-                hresult: completion.hresult,
+-                output_buffer: completion.output_buffer,
++                hresult,
++                output_buffer,
+             },
+         )?;
+ 
+@@ -624,14 +716,26 @@ impl UrbdrcDeviceServer {
+ 
+         let request_id = RequestId::from(completion.req_id);
+         let Some(pending) = self.pending_io.remove(&request_id) else {
++            self.keel_parts.remove(&request_id);
+             return Err(pdu_other_err!("completion mismatch"));
+         };
++        // keel: a bulk IN whose data all went ahead ends with no data of its own
++        let (hresult, keel_data) = match self.keel_join(request_id, Vec::new()) {
++            Some(data) => (completion.hresult, data),
++            None => (KEEL_E_FAIL, Vec::new()),
++        };
+ 
+         let (is_transfer_out, expected_result) = match pending {
+-            Pending::TransferIn { expected_result, .. } => {
++            Pending::TransferIn {
++                max_output_buf_size,
++                expected_result,
++            } => {
+                 if completion.output_buffer_size != 0 {
+                     return Err(pdu_other_err!("output buffer size must be zero"));
+                 }
++                if keel_data.len() > max_output_buf_size as usize {
++                    return Err(pdu_other_err!("output buffer exceeds maximum amount"));
++                }
+                 (false, expected_result)
+             }
+             Pending::TransferOut {
+@@ -669,8 +773,8 @@ impl UrbdrcDeviceServer {
+                 request_id,
+                 TransferInCompletionResult {
+                     ts_urb_result,
+-                    hresult: completion.hresult,
+-                    output_buffer: Vec::new(),
++                    hresult,
++                    output_buffer: keel_data,
+                 },
+             )?;
+         }
+@@ -700,6 +804,11 @@ impl DvcProcessor for UrbdrcDeviceServer {
+             return Ok(Vec::new());
+         }
+ 
++        if let Some((request_id, offset, data)) = keel_in_part(payload) {
++            self.keel_part(request_id, offset, data);
++            return Ok(Vec::new());
++        }
++
+         let pdu = UrbdrcClientDevicePdu::decode(&mut ReadCursor::new(payload)).map_err(|e| decode_err!(e))?;
+         let mut resp: Vec<DvcMessage> = Vec::new();
+ 
+diff --git a/crates/ironrdp-server/Cargo.toml b/crates/ironrdp-server/Cargo.toml
+index ae73ff23..7d2eacd9 100644
+--- a/crates/ironrdp-server/Cargo.toml
++++ b/crates/ironrdp-server/Cargo.toml
+@@ -37,6 +37,7 @@ __bench = ["dep:visibility"]
+ rand = "0.9"
+ tokio = { version = "1", features = ["net", "macros", "sync", "rt", "time"] }
+ tokio-rustls = "0.26" # public
++socket2 = { version = "0.6", features = ["all"] } # keel: SO_REUSEPORT for the UDP sideband
+ async-trait = "0.1"
+ ironrdp-async = { path = "../ironrdp-async", version = "0.10" }
+ ironrdp-ainput = { path = "../ironrdp-ainput", version = "0.8" }
+diff --git a/crates/ironrdp-server/src/builder.rs b/crates/ironrdp-server/src/builder.rs
+index d1d3e93f..83777bcb 100644
+--- a/crates/ironrdp-server/src/builder.rs
++++ b/crates/ironrdp-server/src/builder.rs
+@@ -14,7 +14,7 @@ use super::gfx::GfxServerFactory;
+ use super::handler::{KeyboardEvent, MouseEvent, RdpServerInputHandler};
+ use super::server::{
+     ConnectionHandler, ConnectionPolicy, CredentialValidator, RdpServer, RdpServerOptions, RdpServerSecurity,
+-    StaticChannelFactory,
++    DvcServerFactory, StaticChannelFactory,
+ };
+ use crate::error::ServerResult;
+ #[cfg(feature = "usb")]
+@@ -45,6 +45,7 @@ pub struct BuilderDone {
+     handler: Box<dyn RdpServerInputHandler>,
+     display: Box<dyn RdpServerDisplay>,
+     static_channel_factories: Vec<Box<dyn StaticChannelFactory>>,
++    dvc_factories: Vec<Box<dyn DvcServerFactory>>,
+     cliprdr_factory: Option<Box<dyn CliprdrServerFactory>>,
+     sound_factory: Option<Box<dyn SoundServerFactory>>,
+     rdpei_factory: Option<Box<dyn RdpeiServerFactory>>,
+@@ -159,6 +160,7 @@ impl RdpServerBuilder<WantsDisplay> {
+                 handler: self.state.handler,
+                 display: Box::new(display),
+                 static_channel_factories: Vec::new(),
++                dvc_factories: Vec::new(),
+                 sound_factory: None,
+                 cliprdr_factory: None,
+                 rdpei_factory: None,
+@@ -196,6 +198,7 @@ impl RdpServerBuilder<WantsDisplay> {
+                 handler: self.state.handler,
+                 display: Box::new(NoopDisplay),
+                 static_channel_factories: Vec::new(),
++                dvc_factories: Vec::new(),
+                 sound_factory: None,
+                 cliprdr_factory: None,
+                 rdpei_factory: None,
+@@ -232,6 +235,12 @@ impl RdpServerBuilder<BuilderDone> {
+         self
+     }
+ 
++    /// keel: adds an application-defined dynamic channel (see [`DvcServerFactory`]).
++    pub fn with_dvc_factory(mut self, factory: Box<dyn DvcServerFactory>) -> Self {
++        self.state.dvc_factories.push(factory);
++        self
++    }
++
+     pub fn with_cliprdr_factory(mut self, cliprdr_factory: Option<Box<dyn CliprdrServerFactory>>) -> Self {
+         self.state.cliprdr_factory = cliprdr_factory;
+         self
+@@ -549,6 +558,9 @@ impl RdpServerBuilder<BuilderDone> {
+             self.state.autodetect_bandwidth,
+             self.state.autodetect_bandwidth_generation,
+         );
++        for factory in self.state.dvc_factories {
++            server.add_dvc_factory(factory);
++        }
+         server.set_credential_validator(self.state.credential_validator);
+         server.set_auto_reconnect_cookie(self.state.auto_reconnect_cookie);
+         server
+diff --git a/crates/ironrdp-server/src/encoder/bitmap.rs b/crates/ironrdp-server/src/encoder/bitmap.rs
+index 9ad364c8..01ebfee3 100644
+--- a/crates/ironrdp-server/src/encoder/bitmap.rs
++++ b/crates/ironrdp-server/src/encoder/bitmap.rs
+@@ -1,5 +1,3 @@
+-use core::num::NonZeroUsize;
+-
+ use ironrdp_core::{Encode as _, WriteCursor, cast_int, cast_length, invalid_field_err};
+ use ironrdp_graphics::image_processing::PixelFormat;
+ use ironrdp_graphics::rdp6::{
+@@ -35,54 +33,57 @@ impl BitmapEncoder {
+             )));
+         }
+ 
+-        let bytes_per_pixel = u16::from(bitmap.format.bytes_per_pixel());
+-        let row_len = bitmap.width.get() * bytes_per_pixel;
+-        let chunk_height = u16::MAX / row_len;
+-
+-        let mut cursor = WriteCursor::new(output);
++        // keel: rectangles of at most 64x64, as Windows servers (and FreeRDP's, xrdp) send them;
++        // mstsc drew some of the 1280x12 strips this used to send black (docs/19)
++        const TILE: usize = 64;
++        let bpp = usize::from(bitmap.format.bytes_per_pixel());
++        let (width, height) = (usize::from(bitmap.width.get()), usize::from(bitmap.height.get()));
+         let stride = bitmap.stride.get();
+-        let chunks = bitmap.data.chunks(stride * usize::from(chunk_height));
+ 
+-        let total = cast_int!("chunks length lower bound", chunks.size_hint().0).map_err(BitmapEncodeError::Encode)?;
++        let mut cursor = WriteCursor::new(output);
++        let total = cast_int!("rectangle count", width.div_ceil(TILE) * height.div_ceil(TILE))
++            .map_err(BitmapEncodeError::Encode)?;
+         BitmapUpdateData::encode_header(total, &mut cursor).map_err(BitmapEncodeError::Encode)?;
+ 
+-        for (i, chunk) in chunks.enumerate() {
+-            let height = cast_int!("bitmap height", chunk.len() / stride).map_err(BitmapEncodeError::Encode)?;
+-            let i: u16 = cast_int!("chunk idx", i).map_err(BitmapEncodeError::Encode)?;
+-            let top = bitmap.y + i * chunk_height;
+-
+-            let encoder = BitmapStreamEncoder::new(NonZeroUsize::from(bitmap.width).get(), usize::from(height));
+-
+-            let len = {
+-                let pixels = chunk
+-                    .chunks(stride)
+-                    .map(|row| &row[..usize::from(row_len)])
++        for ty in (0..height).step_by(TILE) {
++            let th = TILE.min(height - ty);
++            for tx in (0..width).step_by(TILE) {
++                let tw = TILE.min(width - tx);
++                let encoder = BitmapStreamEncoder::new(tw, th);
++                let data = &bitmap.data;
++                // bottom-up
++                let pixels = (ty..ty + th)
+                     .rev()
+-                    .flat_map(|row| row.chunks(usize::from(bytes_per_pixel)));
+-
+-                Self::encode_iter(encoder, bitmap.format, pixels, self.buffer.as_mut_slice())?
+-            };
+-
+-            let data = BitmapData {
+-                rectangle: InclusiveRectangle {
+-                    left: bitmap.x,
+-                    top,
+-                    right: bitmap.x + bitmap.width.get() - 1,
+-                    bottom: top + height - 1,
+-                },
+-                width: u16::from(bitmap.width),
+-                height,
+-                bits_per_pixel: u16::from(bitmap.format.bytes_per_pixel()) * 8,
+-                compression_flags: Compression::BITMAP_COMPRESSION,
+-                compressed_data_header: Some(bitmap::CompressedDataHeader {
+-                    main_body_size: cast_length!("main body size", len).map_err(BitmapEncodeError::Encode)?,
+-                    scan_width: u16::from(bitmap.width),
+-                    uncompressed_size: height * row_len,
+-                }),
+-                bitmap_data: &self.buffer[..len],
+-            };
+-
+-            data.encode(&mut cursor).map_err(BitmapEncodeError::Encode)?;
++                    .flat_map(move |row| data[row * stride + tx * bpp..][..tw * bpp].chunks(bpp));
++                let len = Self::encode_iter(encoder, bitmap.format, pixels, self.buffer.as_mut_slice())?;
++
++                let x: u16 = cast_int!("tile x", tx).map_err(BitmapEncodeError::Encode)?;
++                let y: u16 = cast_int!("tile y", ty).map_err(BitmapEncodeError::Encode)?;
++                let w: u16 = cast_int!("tile width", tw).map_err(BitmapEncodeError::Encode)?;
++                let h: u16 = cast_int!("tile height", th).map_err(BitmapEncodeError::Encode)?;
++                let (left, top) = (bitmap.x + x, bitmap.y + y);
++                let data = BitmapData {
++                    rectangle: InclusiveRectangle {
++                        left,
++                        top,
++                        right: left + w - 1,
++                        bottom: top + h - 1,
++                    },
++                    width: w,
++                    height: h,
++                    bits_per_pixel: u16::from(bitmap.format.bytes_per_pixel()) * 8,
++                    compression_flags: Compression::BITMAP_COMPRESSION,
++                    compressed_data_header: Some(bitmap::CompressedDataHeader {
++                        main_body_size: cast_length!("main body size", len).map_err(BitmapEncodeError::Encode)?,
++                        scan_width: w,
++                        uncompressed_size: cast_length!("uncompressed size", tw * th * bpp)
++                            .map_err(BitmapEncodeError::Encode)?,
++                    }),
++                    bitmap_data: &self.buffer[..len],
++                };
++
++                data.encode(&mut cursor).map_err(BitmapEncodeError::Encode)?;
++            }
+         }
+ 
+         Ok(cursor.pos())
+diff --git a/crates/ironrdp-server/src/encoder/fast_path.rs b/crates/ironrdp-server/src/encoder/fast_path.rs
+index e6e728fe..1f97e100 100644
+--- a/crates/ironrdp-server/src/encoder/fast_path.rs
++++ b/crates/ironrdp-server/src/encoder/fast_path.rs
+@@ -57,6 +57,9 @@ impl UpdateFragmenter {
+ 
+     fn encode_next(&mut self, dst: &mut [u8]) -> Option<(usize, usize)> {
+         match self.data.len() - self.position {
++            // keel: an update without data (hidden pointer, default pointer) is still one
++            // fragment; with none they were never sent
++            0 if self.index == 0 => self.encode_fastpath(Fragmentation::Single, &[], dst).map(|written| (0, written)),
+             0 => None,
+ 
+             1..=MAX_FASTPATH_UPDATE_SIZE => {
+diff --git a/crates/ironrdp-server/src/encoder/mod.rs b/crates/ironrdp-server/src/encoder/mod.rs
+index 46505a85..29da3503 100644
+--- a/crates/ironrdp-server/src/encoder/mod.rs
++++ b/crates/ironrdp-server/src/encoder/mod.rs
+@@ -12,7 +12,9 @@ use ironrdp_pdu::pointer::{
+     PointerPositionAttribute,
+ };
+ use ironrdp_pdu::rdp::capability_sets::{CmdFlags, EntropyBits, LargePointerSupportFlags};
+-use ironrdp_pdu::surface_commands::{ExtendedBitmapDataPdu, SurfaceBitsPdu, SurfaceCommand};
++use ironrdp_pdu::surface_commands::{
++    ExtendedBitmapDataPdu, FrameAction, FrameMarkerPdu, SurfaceBitsPdu, SurfaceCommand,
++};
+ use tracing::{debug, warn};
+ 
+ use self::bitmap::BitmapEncoder;
+@@ -169,7 +171,13 @@ impl UpdateEncoder {
+                     remotefx: Some((algo, id)),
+                     remotefx_quant,
+                     ..
+-                } => BitmapUpdater::RemoteFx(RemoteFxHandler::new(algo, remotefx_quant, id, desktop_size)),
++                } => BitmapUpdater::RemoteFx(RemoteFxHandler::new(
++                    algo,
++                    remotefx_quant,
++                    id,
++                    desktop_size,
++                    surface_flags.contains(CmdFlags::FRAME_MARKER),
++                )),
+                 // NSCodec is the lowest-priority codec because it predates
+                 // RemoteFX and produces larger output. It's relevant mainly
+                 // for clients (notably macOS Microsoft Remote Desktop /
+@@ -243,6 +251,9 @@ impl UpdateEncoder {
+ 
+     fn rgba_pointer(ptr: RGBAPointer) -> ServerResult<UpdateFragmenter> {
+         let xor_mask = ptr.data;
++        // keel: an all-zero AND mask (1 bpp, rows padded to 16 bits) instead of none: mstsc
++        // wants one with a 32 bpp pointer; the alpha channel decides
++        let and_mask = vec![0u8; usize::from(ptr.width).div_ceil(16) * 2 * usize::from(ptr.height)];
+ 
+         let hot_spot = Point16 {
+             x: ptr.hot_x,
+@@ -254,7 +265,7 @@ impl UpdateEncoder {
+             width: ptr.width,
+             height: ptr.height,
+             xor_mask: &xor_mask,
+-            and_mask: &[],
++            and_mask: &and_mask,
+         };
+         let ptr = PointerAttribute {
+             xor_bpp: 32,
+@@ -714,14 +725,19 @@ struct RemoteFxHandler {
+     remotefx: RfxEncoder,
+     codec_id: u8,
+     desktop_size: Option<DesktopSize>,
++    /// keel: the client takes frame markers: each update goes between a begin and an end
++    frame_markers: bool,
++    frame_id: u32,
+ }
+ 
+ impl RemoteFxHandler {
+-    fn new(algo: EntropyBits, quant: Quant, codec_id: u8, desktop_size: DesktopSize) -> Self {
++    fn new(algo: EntropyBits, quant: Quant, codec_id: u8, desktop_size: DesktopSize, frame_markers: bool) -> Self {
+         Self {
+             remotefx: RfxEncoder::new(algo, quant),
+             desktop_size: Some(desktop_size),
+             codec_id,
++            frame_markers,
++            frame_id: 0,
+         }
+     }
+ 
+@@ -732,11 +748,21 @@ impl RemoteFxHandler {
+ 
+ impl BitmapUpdateHandler for RemoteFxHandler {
+     fn handle(&mut self, bitmap: &BitmapUpdate) -> ServerResult<UpdateFragmenter> {
++        // keel: the destination is the whole desktop and the region and tiles are in desktop
++        // coordinates, as in FreeRDP's server; with the destination only the bitmap and
++        // coordinates from 0, mstsc drew everything black (docs/19)
++        let whole = self
++            .desktop_size
++            .filter(|_| bitmap.x.is_multiple_of(64) && bitmap.y.is_multiple_of(64));
++        let origin = if whole.is_some() { (bitmap.x, bitmap.y) } else { (0, 0) };
+         let mut buffer = vec![0; bitmap.data.len()];
+         let len = loop {
+             match self
+                 .remotefx
+-                .encode(bitmap, buffer.as_mut_slice(), self.desktop_size.take())
++                // keel: the header messages in every message, not only the first: the context
++                // says image mode, where each message stands alone (MS-RDPRFX 3.1.1.1); mstsc
++                // drew nothing after the first one (all black, docs/19)
++                .encode(bitmap, buffer.as_mut_slice(), self.desktop_size, origin)
+             {
+                 Err(e) => match e.kind() {
+                     ironrdp_core::EncodeErrorKind::NotEnoughBytes { .. } => {
+@@ -749,7 +775,47 @@ impl BitmapUpdateHandler for RemoteFxHandler {
+             }
+         };
+ 
+-        set_surface(bitmap, self.codec_id, &buffer[..len])
++        match whole {
++            Some(ds) => {
++                let dest = ExclusiveRectangle {
++                    left: 0,
++                    top: 0,
++                    right: ds.width,
++                    bottom: ds.height,
++                };
++                // keel: as FreeRDP's server: Stream Surface Bits, between frame markers when
++                // the client takes them (mstsc may show nothing until a frame ends)
++                let bits = SurfaceCommand::StreamSurfaceBits(SurfaceBitsPdu {
++                    destination: dest,
++                    extended_bitmap_data: ExtendedBitmapDataPdu {
++                        bpp: bitmap.format.bytes_per_pixel() * 8,
++                        width: ds.width,
++                        height: ds.height,
++                        codec_id: self.codec_id,
++                        header: None,
++                        data: &buffer[..len],
++                    },
++                });
++                let mut out = Vec::new();
++                let id = self.frame_id;
++                self.frame_id = self.frame_id.wrapping_add(1);
++                let marker = |frame_action| {
++                    SurfaceCommand::FrameMarker(FrameMarkerPdu {
++                        frame_action,
++                        frame_id: Some(id),
++                    })
++                };
++                if self.frame_markers {
++                    out.extend(encode_vec(&marker(FrameAction::Begin)).map_err(ServerError::encode)?);
++                }
++                out.extend(encode_vec(&bits).map_err(ServerError::encode)?);
++                if self.frame_markers {
++                    out.extend(encode_vec(&marker(FrameAction::End)).map_err(ServerError::encode)?);
++                }
++                Ok(UpdateFragmenter::new(UpdateCode::SurfaceCommands, out))
++            }
++            None => set_surface(bitmap, self.codec_id, &buffer[..len]),
++        }
+     }
+ }
+ 
+diff --git a/crates/ironrdp-server/src/encoder/rfx.rs b/crates/ironrdp-server/src/encoder/rfx.rs
+index 39443bf1..03155c5e 100644
+--- a/crates/ironrdp-server/src/encoder/rfx.rs
++++ b/crates/ironrdp-server/src/encoder/rfx.rs
+@@ -37,6 +37,7 @@ impl RfxEncoder {
+         bitmap: &BitmapUpdate,
+         output: &mut [u8],
+         desktop_size: Option<DesktopSize>,
++        origin: (u16, u16),
+     ) -> EncodeResult<usize> {
+         let mut cursor = WriteCursor::new(output);
+         let entropy_algorithm = self.entropy_algorithm;
+@@ -52,13 +53,14 @@ impl RfxEncoder {
+             };
+             Block::CodecChannel(CodecChannel::Context(context)).encode(&mut cursor)?;
+ 
++            // keel: FreeRDP's order (its server works with mstsc)
++            Block::CodecVersions(CodecVersionsPdu).encode(&mut cursor)?;
++
+             let channels = ChannelsPdu(vec![RfxChannel {
+                 width: cast_length!("width", width)?,
+                 height: cast_length!("height", height)?,
+             }]);
+             Block::Channels(channels).encode(&mut cursor)?;
+-
+-            Block::CodecVersions(CodecVersionsPdu).encode(&mut cursor)?;
+         }
+ 
+         // data messages
+@@ -70,9 +72,11 @@ impl RfxEncoder {
+ 
+         let width = bitmap.width.get();
+         let height = bitmap.height.get();
++        // keel: origin = where the bitmap is in the surface command's destination (the whole
++        // desktop, as FreeRDP's server does it), a multiple of 64
+         let rectangles = vec![rfx::RfxRectangle {
+-            x: 0,
+-            y: 0,
++            x: origin.0,
++            y: origin.1,
+             width,
+             height,
+         }];
+@@ -83,7 +87,11 @@ impl RfxEncoder {
+         quant.validate()?;
+ 
+         let (encoder, mut data) = UpdateEncoder::new(bitmap, quant.clone(), entropy_algorithm);
+-        let tiles = encoder.encode(&mut data)?;
++        let mut tiles = encoder.encode(&mut data)?;
++        for t in &mut tiles {
++            t.x += origin.0 / 64;
++            t.y += origin.1 / 64;
++        }
+ 
+         let quants = vec![quant];
+         let tile_set = TileSetPdu {
+diff --git a/crates/ironrdp-server/src/lib.rs b/crates/ironrdp-server/src/lib.rs
+index b1f95540..3faa0a45 100644
+--- a/crates/ironrdp-server/src/lib.rs
++++ b/crates/ironrdp-server/src/lib.rs
+@@ -39,7 +39,7 @@ pub use gfx::{EgfxServerMessage, GfxDvcBridge, GfxServerFactory, GfxServerHandle
+ pub use handler::{KeyboardEvent, MouseButton, MouseEvent, RdpServerInputHandler};
+ #[cfg(feature = "helper")]
+ pub use helper::TlsIdentityCtx;
+-pub use ironrdp_acceptor::Acceptor;
++pub use ironrdp_acceptor::{Acceptor, CredentialsLookup, LookupSecret};
+ pub use ironrdp_pdu::rdp::server_error_info::ErrorInfo;
+ pub use ironrdp_pdu::rdp::session_info::ServerAutoReconnect;
+ #[cfg(feature = "usb")]
+@@ -56,7 +56,7 @@ pub use server::{
+     AutoReconnectCookieHandle, ConnectionHandler, ConnectionInfo, ConnectionPolicy, CredentialDecision,
+     CredentialValidationError, CredentialValidator, Credentials, ErrorInfoDisconnectHandle,
+     ExactMatchCredentialValidator, PostConnectionAction, RdpServer, RdpServerOptions, RdpServerSecurity, ServerEvent,
+-    ServerEventSender, StaticChannelFactory, TransportTls, pick_remotefx_entropy_coder,
++    DvcServerFactory, ServerEventSender, StaticChannelFactory, TransportTls, pick_remotefx_entropy_coder,
+ };
+ pub use sound::{RdpsndServerHandler, RdpsndServerMessage, SoundServerFactory};
+ #[cfg(feature = "usb")]
+diff --git a/crates/ironrdp-server/src/multitransport.rs b/crates/ironrdp-server/src/multitransport.rs
+index 78a03e9d..7aff50e5 100644
+--- a/crates/ironrdp-server/src/multitransport.rs
++++ b/crates/ironrdp-server/src/multitransport.rs
+@@ -110,7 +110,21 @@ pub(crate) async fn accept(
+     tls_config: Arc<rustls::ServerConfig>,
+     request: &MultitransportRequestPdu,
+ ) -> Option<UdpTransportHandle> {
+-    let socket = match UdpSocket::bind(udp_bind_addr).await {
++    // keel: several sessions share the port (one per guest, two clients of one guest): each
++    // session's socket stays bound (connected to its client) for the whole session, so the
++    // next session's socket must be able to bind the same address (SO_REUSEPORT; the kernel
++    // gives a datagram to the socket connected to its sender first)
++    let bound = (|| -> std::io::Result<UdpSocket> {
++        let domain = socket2::Domain::for_address(udp_bind_addr);
++        let socket = socket2::Socket::new(domain, socket2::Type::DGRAM, Some(socket2::Protocol::UDP))?;
++        socket.set_reuse_address(true)?;
++        #[cfg(unix)]
++        socket.set_reuse_port(true)?;
++        socket.set_nonblocking(true)?;
++        socket.bind(&udp_bind_addr.into())?;
++        UdpSocket::from_std(socket.into())
++    })();
++    let socket = match bound {
+         Ok(socket) => socket,
+         Err(error) => {
+             warn!(%error, %udp_bind_addr, "Failed to bind UDP socket for multitransport, continuing TCP-only");
+diff --git a/crates/ironrdp-server/src/server.rs b/crates/ironrdp-server/src/server.rs
+index 37af8476..f852354c 100644
+--- a/crates/ironrdp-server/src/server.rs
++++ b/crates/ironrdp-server/src/server.rs
+@@ -39,7 +39,7 @@ use ironrdp_pdu::{Action, PduResult, decode_err, mcs, nego, rdp};
+ use ironrdp_rdpdr as rdpdr;
+ use ironrdp_rdpeai as rdpeai;
+ use ironrdp_rdpsnd as rdpsnd;
+-use ironrdp_svc::{ChannelFlags, StaticChannelId, StaticChannelSet, SvcProcessor, server_encode_svc_messages};
++use ironrdp_svc::{ChannelFlags, StaticChannelId, StaticChannelSet, SvcMessage, SvcProcessor, server_encode_svc_messages};
+ use ironrdp_tokio::{FramedRead, FramedWrite, TokioFramed, split_tokio_framed, unsplit_tokio_framed};
+ use rand::RngCore as _;
+ use rdpdr::server::{RdpdrServer, RdpdrServerMessage};
+@@ -556,7 +556,10 @@ impl RdpServerSecurity {
+         match self {
+             RdpServerSecurity::None => nego::SecurityProtocol::empty(),
+             RdpServerSecurity::Tls(_) => nego::SecurityProtocol::SSL,
+-            RdpServerSecurity::Hybrid(_) => nego::SecurityProtocol::HYBRID | nego::SecurityProtocol::HYBRID_EX,
++            // keel: TLS-only clients too (the acceptor prefers HYBRID_EX, then HYBRID, then SSL)
++            RdpServerSecurity::Hybrid(_) => {
++                nego::SecurityProtocol::HYBRID | nego::SecurityProtocol::HYBRID_EX | nego::SecurityProtocol::SSL
++            }
+         }
+     }
+ 
+@@ -736,6 +739,8 @@ pub struct RdpServer {
+     handler: Arc<Mutex<Box<dyn RdpServerInputHandler>>>,
+     display: Arc<Mutex<Box<dyn RdpServerDisplay>>>,
+     static_channel_factories: Vec<Box<dyn StaticChannelFactory>>,
++    /// keel: see [`DvcServerFactory`]
++    dvc_factories: Vec<Box<dyn DvcServerFactory>>,
+     sound_factory: Option<Box<dyn SoundServerFactory>>,
+     cliprdr_factory: Option<Box<dyn CliprdrServerFactory>>,
+     rdpei_factory: Option<Box<dyn RdpeiServerFactory>>,
+@@ -751,6 +756,12 @@ pub struct RdpServer {
+     ev_sender: mpsc::UnboundedSender<ServerEvent>,
+     ev_receiver: Arc<Mutex<mpsc::UnboundedReceiver<ServerEvent>>>,
+     creds: Option<Credentials>,
++    /// keel: see [`ironrdp_acceptor::CredentialsLookup`]
++    creds_lookup: Option<ironrdp_acceptor::CredentialsLookup>,
++    /// keel: see [`Self::set_auto_reconnect_as_new_login`]
++    auto_reconnect_as_new_login: bool,
++    /// keel: see [`Self::set_display_refresh_handle`]
++    display_refresh: Option<Arc<AtomicU32>>,
+     credential_validator: Option<Arc<dyn CredentialValidator>>,
+     local_addr: Option<SocketAddr>,
+     /// The local address the current client reached. See
+@@ -955,8 +966,45 @@ pub enum ServerEvent {
+     AutoDetectRttRequest,
+     #[cfg(feature = "usb")]
+     Usb(UrbdrcServerMessage),
++    /// keel: messages of an application's dynamic channel (see [`DvcServerFactory`]), already
++    /// encoded for DRDYNVC with `ironrdp_dvc::encode_dvc_messages`.
++    Dvc(Vec<SvcMessage>),
++}
++
++/// keel: an application-defined server dynamic channel. `build` is called once per connection
++/// (in `attach_channels`); the channel is created like the built-in ones once the client's
++/// DRDYNVC capabilities arrive (a client that refuses it only fails that channel). The factory
++/// gets the server's event sender, so the application can send on the channel from any thread
++/// with [`ServerEvent::Dvc`].
++pub trait DvcServerFactory: ServerEventSender + Send {
++    fn build(&self) -> Box<dyn dvc::DvcServerProcessor>;
+ }
+ 
++/// `DrdynvcServer::with_dynamic_channel` takes a concrete type; this carries a boxed one.
++struct BoxedDvc(Box<dyn dvc::DvcServerProcessor>);
++
++impl_as_any!(BoxedDvc);
++
++impl dvc::DvcProcessor for BoxedDvc {
++    fn channel_name(&self) -> &str {
++        self.0.channel_name()
++    }
++
++    fn start(&mut self, channel_id: u32) -> PduResult<Vec<dvc::DvcMessage>> {
++        self.0.start(channel_id)
++    }
++
++    fn process(&mut self, channel_id: u32, payload: &[u8]) -> PduResult<Vec<dvc::DvcMessage>> {
++        self.0.process(channel_id, payload)
++    }
++
++    fn close(&mut self, channel_id: u32) {
++        self.0.close(channel_id)
++    }
++}
++
++impl dvc::DvcServerProcessor for BoxedDvc {}
++
+ /// Creates a fresh static-channel processor for each accepted RDP connection.
+ ///
+ /// Factories are invoked before the Basic Settings Exchange so their channels
+@@ -985,6 +1033,7 @@ impl fmt::Debug for ServerEvent {
+             Self::Egfx(..) => f.write_str("Egfx(..)"),
+             #[cfg(feature = "usb")]
+             Self::Usb(..) => f.write_str("Usb(..)"),
++            Self::Dvc(..) => f.write_str("Dvc(..)"),
+             Self::AutoDetectRttRequest => f.write_str("AutoDetectRttRequest"),
+         }
+     }
+@@ -994,6 +1043,14 @@ pub trait ServerEventSender {
+     fn set_sender(&mut self, sender: mpsc::UnboundedSender<ServerEvent>);
+ }
+ 
++impl RdpServer {
++    /// keel: adds an application-defined dynamic channel (see [`DvcServerFactory`]).
++    pub fn add_dvc_factory(&mut self, mut factory: Box<dyn DvcServerFactory>) {
++        factory.set_sender(self.ev_sender.clone());
++        self.dvc_factories.push(factory);
++    }
++}
++
+ impl ServerEvent {
+     pub fn create_channel() -> (mpsc::UnboundedSender<Self>, mpsc::UnboundedReceiver<Self>) {
+         mpsc::unbounded_channel()
+@@ -1253,6 +1310,9 @@ struct ConnectionState {
+     early_tunnel_payloads: VecDeque<Vec<u8>>,
+ }
+ 
++/// keel: dynamic channels that move to the UDP tunnel together with EGFX (keel-rdp's video).
++const KEEL_UDP_CHANNELS: &[&str] = &["keelOS::Video"];
++
+ impl ConnectionState {
+     fn get_svc_processor<T: SvcProcessor + 'static>(&mut self) -> Option<&mut T> {
+         self.static_channels
+@@ -1616,6 +1676,7 @@ impl RdpServer {
+             handler: Arc::new(Mutex::new(handler)),
+             display: Arc::new(Mutex::new(display)),
+             static_channel_factories,
++            dvc_factories: Vec::new(),
+             sound_factory,
+             cliprdr_factory,
+             rdpei_factory,
+@@ -1631,6 +1692,9 @@ impl RdpServer {
+             ev_sender,
+             ev_receiver: Arc::new(Mutex::new(ev_receiver)),
+             creds: None,
++            creds_lookup: None,
++            auto_reconnect_as_new_login: false,
++            display_refresh: None,
+             credential_validator: None,
+             local_addr: None,
+             connection_local_addr: None,
+@@ -2105,6 +2169,11 @@ impl RdpServer {
+             dvc
+         };
+ 
++        let dvc = self
++            .dvc_factories
++            .iter()
++            .fold(dvc, |dvc, factory| dvc.with_dynamic_channel(BoxedDvc(factory.build())));
++
+         acceptor.attach_static_channel(dvc);
+ 
+         for factory in &self.static_channel_factories {
+@@ -2356,6 +2425,7 @@ impl RdpServer {
+         );
+ 
+         self.attach_channels(pending.acceptor_mut(), monitor_count);
++        pending.acceptor_mut().set_credentials_lookup(self.creds_lookup.clone());
+ 
+         let Some(negotiated) = pending.negotiate_and_authenticate(stream, tls).await? else {
+             return Ok(());
+@@ -3513,6 +3583,14 @@ impl RdpServer {
+                             .await?;
+                     }
+                 },
++                ServerEvent::Dvc(messages) => {
++                    // keel: a channel the Soft-Sync request moved goes over the UDP tunnel
++                    let drdynvc_channel_id = conn
++                        .get_channel_id_by_type::<dvc::DrdynvcServer>()
++                        .ok_or_else(|| ServerError::channel("DRDYNVC channel not found"))?;
++                    self.write_drdynvc_output(conn, messages, writer, drdynvc_channel_id, user_channel_id, udp_transport)
++                        .await?;
++                }
+                 ServerEvent::AutoDetectRttRequest => {
+                     // Auto-detect requests ride the MCS message channel
+                     // ([MS-RDPBCGR] 2.2.14.3). With none negotiated (the client
+@@ -3611,7 +3689,10 @@ impl RdpServer {
+             // to migrate it. "Already requested" (a previous batch already
+             // asked) and "channel not open" (raced with the client closing
+             // it) are both expected steady-state outcomes here, not errors.
+-            match drdynvc.request_reliable_udp(vec![egfx_dvc_id]) {
++            // keel: keel-rdp's own video channel moves with EGFX (docs/71 §4.9)
++            let mut moved = vec![egfx_dvc_id];
++            moved.extend(drdynvc.opened_channel_ids_named(KEEL_UDP_CHANNELS));
++            match drdynvc.request_reliable_udp(moved.clone()) {
+                 Ok(request) => {
+                     let data = server_encode_svc_messages(vec![request], drdynvc_channel_id, user_channel_id)
+                         .map_err(ServerError::encode)?;
+@@ -3619,8 +3700,8 @@ impl RdpServer {
+                         .write_all(&data)
+                         .await
+                         .map_err(|e| ServerError::io("write_all", e))?;
+-                    debug!(
+-                        egfx_dvc_id,
++                    info!(
++                        ?moved,
+                         "Soft-Sync request sent, asking to move EGFX to reliable UDP"
+                     );
+                 }
+@@ -3674,6 +3755,52 @@ impl RdpServer {
+             .map_err(|e| ServerError::io("write_all", e))
+     }
+ 
++    /// keel: sends the Soft-Sync request from keel's own channels' traffic
++    /// when EGFX has not: while keelOS::Video carries the picture EGFX is
++    /// silent, and a client that connects over TCP first and answers the
++    /// multitransport request only once UDP is up (mstsc's order, kRDPclient
++    /// since it stopped waiting for UDP) gives its success after video has
++    /// already started. Moves EGFX too when it is open; "already requested"
++    /// is the steady state and only traced.
++    async fn request_keel_udp_migration(
++        conn: &mut ConnectionState,
++        writer: &mut impl FramedWrite,
++        drdynvc_channel_id: u16,
++        user_channel_id: u16,
++    ) -> ServerResult<()> {
++        let Some(drdynvc) = conn.get_svc_processor::<dvc::DrdynvcServer>() else {
++            return Ok(());
++        };
++        let keel_channels = drdynvc.opened_channel_ids_named(KEEL_UDP_CHANNELS);
++        if keel_channels
++            .iter()
++            .all(|id| drdynvc.tunnel_for_outgoing_channel(*id).is_some())
++        {
++            // none open, or already moved
++            return Ok(());
++        }
++        #[cfg(feature = "egfx")]
++        let mut moved: Vec<u32> = crate::gfx::egfx_channel_id(drdynvc).into_iter().collect();
++        #[cfg(not(feature = "egfx"))]
++        let mut moved: Vec<u32> = Vec::new();
++        moved.extend(keel_channels);
++        match drdynvc.request_reliable_udp(moved.clone()) {
++            Ok(request) => {
++                let data = server_encode_svc_messages(vec![request], drdynvc_channel_id, user_channel_id)
++                    .map_err(ServerError::encode)?;
++                writer
++                    .write_all(&data)
++                    .await
++                    .map_err(|e| ServerError::io("write_all", e))?;
++                info!(?moved, "Soft-Sync request sent, asking to move keel's channels to reliable UDP");
++                // the picture is on UDP from here on, so losing UDP ends the connection
++                conn.egfx_on_udp = true;
++            }
++            Err(error) => trace!(%error, "No Soft-Sync request sent"),
++        }
++        Ok(())
++    }
++
+     /// Writes DRDYNVC output, sending the data of any channel the Soft-Sync
+     /// request moved over the tunnel and everything else over TCP.
+     ///
+@@ -3690,6 +3817,9 @@ impl RdpServer {
+         user_channel_id: u16,
+         udp_transport: Option<&multitransport::UdpTransportHandle>,
+     ) -> ServerResult<()> {
++        if conn.udp_migration_allowed && udp_transport.is_some() {
++            Self::request_keel_udp_migration(conn, writer, drdynvc_channel_id, user_channel_id).await?;
++        }
+         let mut over_tcp = Vec::with_capacity(messages.len());
+         match (udp_transport, conn.get_svc_processor::<dvc::DrdynvcServer>()) {
+             (Some(udp_transport), Some(drdynvc)) => {
+@@ -3867,37 +3997,59 @@ impl RdpServer {
+         let this = Rc::clone(&s);
+         let dispatch_pdu = async move {
+             loop {
+-                let (action, bytes) = reader.read_pdu().await.map_err(|e| ServerError::io("read pdu", e))?;
+-                // D8: per-PDU lock-acquisition + dispatch timing. The `this`
+-                // mutex is shared with dispatch_events; when an outbound
+-                // event batch is in flight, this lock wait is the latency
+-                // that a FrameAcknowledge sees before it reaches its
+-                // handler. Log when the dispatch itself or the lock wait
+-                // exceeds 50ms.
+-                let pdu_len = bytes.len();
++                let first = reader.read_pdu().await.map_err(|e| ServerError::io("read pdu", e))?;
++                // keel: the client's PDUs keep being read while an outbound batch holds the lock
++                // (read_pdu is cancel safe), and all of them are dispatched under one lock. One
++                // PDU per lock let a 4K EGFX frame (~300 ms per write) hold every mouse event
++                // back by 300 ms: the backlog grew without end, clicks came seconds later and
++                // old pointer positions kept pulling the guest's pointer back (user 2026-10-10,
++                // P330 at 4K without the agent).
++                let mut pdus = vec![first];
+                 let lock_start = Instant::now();
+-                let mut this = this.lock().await;
++                let mut this = {
++                    let lock = this.lock();
++                    tokio::pin!(lock);
++                    loop {
++                        if pdus.len() >= 4096 {
++                            break (&mut lock).await;
++                        }
++                        tokio::select! {
++                            biased;
++                            guard = &mut lock => break guard,
++                            pdu = reader.read_pdu() => pdus.push(pdu.map_err(|e| ServerError::io("read pdu", e))?),
++                        }
++                    }
++                };
+                 let lock_wait_ms = u64::try_from(lock_start.elapsed().as_millis()).unwrap_or(u64::MAX);
+ 
+                 let dispatch_start = Instant::now();
+                 let current_udp_transport = udp_transport_for_pdus.borrow().clone();
+                 let (server, conn) = &mut *this;
+-                let result = server
+-                    .dispatch_pdu(
+-                        conn,
+-                        action,
+-                        bytes,
+-                        &mut writer,
+-                        io_channel_id,
+-                        user_channel_id,
+-                        message_channel_id,
+-                        current_udp_transport.as_ref(),
+-                    )
+-                    .await?;
++                let batch = pdus.len();
++                let pdu_len: usize = pdus.iter().map(|(_, b)| b.len()).sum();
++                let mut state = RunState::Continue;
++                for (action, bytes) in pdus {
++                    state = server
++                        .dispatch_pdu(
++                            conn,
++                            action,
++                            bytes,
++                            &mut writer,
++                            io_channel_id,
++                            user_channel_id,
++                            message_channel_id,
++                            current_udp_transport.as_ref(),
++                        )
++                        .await?;
++                    if !matches!(state, RunState::Continue) {
++                        break;
++                    }
++                }
+                 let dispatch_ms = u64::try_from(dispatch_start.elapsed().as_millis()).unwrap_or(u64::MAX);
+ 
+                 if lock_wait_ms >= 50 {
+                     tracing::warn!(
++                        batch,
+                         pdu_len,
+                         lock_wait_ms,
+                         dispatch_ms,
+@@ -3905,16 +4057,17 @@ impl RdpServer {
+                     );
+                 } else if dispatch_ms >= 50 {
+                     tracing::warn!(
++                        batch,
+                         pdu_len,
+                         lock_wait_ms,
+                         dispatch_ms,
+                         "dispatch_pdu ran long after acquiring this.lock immediately, handler or runtime stall, not lock contention"
+                     );
+                 } else {
+-                    tracing::debug!(pdu_len, lock_wait_ms, dispatch_ms, "dispatch_pdu");
++                    tracing::debug!(batch, pdu_len, lock_wait_ms, dispatch_ms, "dispatch_pdu");
+                 }
+ 
+-                match result {
++                match state {
+                     RunState::Continue => continue,
+                     state => break Ok(state),
+                 }
+@@ -4196,14 +4349,22 @@ impl RdpServer {
+             .contains(ironrdp_pdu::gcc::ClientEarlyCapabilityFlags::SUPPORT_ERR_INFO_PDU);
+ 
+         let is_auto_reconnect = if let Some(reconnect) = result.auto_reconnect.as_ref() {
+-            if !self.verify_auto_reconnect_cookie(reconnect) {
+-                warn!("Auto-reconnect cookie validation rejected");
+-                send_access_denied(result.io_channel_id, result.user_channel_id, supports_err_info, writer).await?;
+-                return Err(ServerError::reason("auto-reconnect validation", "cookie rejected"));
+-            }
++            let verified = self.verify_auto_reconnect_cookie(reconnect);
++            if !verified && self.auto_reconnect_as_new_login {
++                // keel: the cookie only tells the client that it may reconnect; the login is
++                // checked as for a new connection (CredSSP, or the credential validator)
++                debug!("Auto-reconnect cookie not ours: a new login");
++                false
++            } else {
++                if !verified {
++                    warn!("Auto-reconnect cookie validation rejected");
++                    send_access_denied(result.io_channel_id, result.user_channel_id, supports_err_info, writer).await?;
++                    return Err(ServerError::reason("auto-reconnect validation", "cookie rejected"));
++                }
+ 
+-            debug!("Auto-reconnect cookie validation accepted");
+-            true
++                debug!("Auto-reconnect cookie validation accepted");
++                true
++            }
+         } else {
+             false
+         };
+@@ -4292,8 +4453,18 @@ impl RdpServer {
+         // which per MS-RDPBCGR 2.2.7.2.7 leaves the pointer size ceiling at 32x32 (the
+         // base Color/New Pointer Update limit with no large-pointer flags set).
+         let mut large_pointer_flags = LargePointerSupportFlags::empty();
++        let mut max_request_size = self.opts.max_request_size;
+         for c in result.capabilities {
+             match c {
++                // keel: the client cannot reassemble a fragmented update larger than this (mstsc
++                // drops it: parts of the picture stay black); sending more than the server's own
++                // limit was always wrong too
++                CapabilitySet::MultiFragmentUpdate(m) => {
++                    info!(client = m.max_request_size, "MultifragmentUpdate max request size");
++                    if m.max_request_size != 0 {
++                        max_request_size = max_request_size.min(m.max_request_size);
++                    }
++                }
+                 CapabilitySet::General(c) => {
+                     let fastpath = c.extra_flags.contains(GeneralExtraFlags::FASTPATH_OUTPUT_SUPPORTED);
+                     if !fastpath {
+@@ -4398,11 +4569,12 @@ impl RdpServer {
+         }
+ 
+         let desktop_size = self.display.lock().await.size().await;
++        info!(?surface_flags, ?update_codecs, max_request_size, early = ?result.client_early_capability_flags, "keel: negotiated output"); // keel
+         let encoder = UpdateEncoder::new(
+             desktop_size,
+             surface_flags,
+             update_codecs,
+-            self.opts.max_request_size,
++            max_request_size,
+             pointer_cache_size,
+             large_pointer_flags,
+         )?;
+@@ -4567,6 +4739,9 @@ impl RdpServer {
+                     let suppress = pdu.desktop_rect.is_none();
+                     self.display_suppressed.store(suppress, Ordering::Relaxed);
+                     debug!(suppress, "client suppress-output state changed");
++                    if !suppress {
++                        self.bump_display_refresh();
++                    }
+                 }
+ 
+                 // Client asks the server to redraw a rectangle — typical on
+@@ -4577,11 +4752,16 @@ impl RdpServer {
+                 // this; clearing here is belt-and-braces against clients
+                 // that send only one of the two.)
+                 rdp::headers::ShareDataPdu::RefreshRectangle(_) => {
++                    self.bump_display_refresh();
+                     if self.display_suppressed.swap(false, Ordering::Relaxed) {
+                         debug!("client RefreshRectangle cleared suppress-output state");
+                     }
+                 }
+ 
++                // macRDP (ironrdp-keel.patch): the legacy TS_FRAME_ACKNOWLEDGE_PDU a client
++                // sends for surface-bits frames with frame markers when there is no EGFX.
++                // Nothing waits for it here; without this arm every frame logged a warning.
++                rdp::headers::ShareDataPdu::FrameAcknowledge(_) => {}
+                 unexpected => {
+                     warn!(?unexpected, "Unexpected share data pdu");
+                 }
+@@ -4902,6 +5082,31 @@ impl RdpServer {
+         }
+     }
+ 
++    /// keel: counted up when the client asks for a redraw (RefreshRectangle, or SuppressOutput
++    /// with a rectangle): the display sends its whole picture again. The server itself keeps no
++    /// copy of what was sent, so without this a part the client lost stays lost.
++    pub fn set_display_refresh_handle(&mut self, handle: Option<Arc<AtomicU32>>) {
++        self.display_refresh = handle;
++    }
++
++    fn bump_display_refresh(&self) {
++        if let Some(r) = &self.display_refresh {
++            r.fetch_add(1, Ordering::Relaxed);
++        }
++    }
++
++    /// keel: under Hybrid security, CredSSP takes the password (or its NT hash) for the user name the client sent
++    /// from `lookup` (None refuses the user) instead of the one set of credentials.
++    pub fn set_credentials_lookup(&mut self, lookup: Option<ironrdp_acceptor::CredentialsLookup>) {
++        self.creds_lookup = lookup;
++    }
++
++    /// keel: an auto-reconnect cookie this server did not hand out (another connection, or a
++    /// server that was restarted) is not refused but taken as a new login, checked like one.
++    pub fn set_auto_reconnect_as_new_login(&mut self, on: bool) {
++        self.auto_reconnect_as_new_login = on;
++    }
++
+     pub fn set_credentials(&mut self, creds: Option<Credentials>) {
+         debug!(?creds, "Changing credentials");
+         self.creds = creds
+diff --git a/crates/ironrdp-testsuite-core/tests/rdpeusb/keel_parts.rs b/crates/ironrdp-testsuite-core/tests/rdpeusb/keel_parts.rs
+new file mode 100644
+index 00000000..8fd513d0
+--- /dev/null
++++ b/crates/ironrdp-testsuite-core/tests/rdpeusb/keel_parts.rs
+@@ -0,0 +1,204 @@
++//! keel (keelOS docs/73 §9): a bulk IN's data sent ahead in KEEL_IN_PART messages joins the data
++//! its completion brings.
++
++use std::sync::mpsc::{self, Sender};
++
++use ironrdp_core::{decode, encode_vec};
++use ironrdp_dvc::{DvcMessage, DvcProcessor as _};
++use ironrdp_pdu::PduResult;
++use ironrdp_rdpeusb::io::device::add_device_from_info;
++use ironrdp_rdpeusb::io::{
++    DeviceAnnounce, DeviceText, IoControlCompletionResult, RequestId, TransferInCompletionResult, TransferInPacket,
++    TransferOutCompletionResult, TsUrbInPacket,
++};
++use ironrdp_rdpeusb::pdu::caps::{Capability, RimExchangeCapabilityResponse};
++use ironrdp_rdpeusb::pdu::header::InterfaceId;
++use ironrdp_rdpeusb::pdu::notify::{ChannelCreated, Direction};
++use ironrdp_rdpeusb::pdu::usb_dev::ts_urb::utils::UrbFunction;
++use ironrdp_rdpeusb::pdu::usb_dev::ts_urb::{TsUrbBulkOrInterruptTransfer, TsUrbInKind};
++use ironrdp_rdpeusb::pdu::{UrbdrcClientDevicePdu, UrbdrcServerDevicePdu};
++use ironrdp_rdpeusb::server::{KEEL_IN_PART, UrbdrcDeviceServer, UrbdrcDeviceServerBackend};
++
++use super::{encode_pdu, proxy_iface_id, simple_device_info};
++
++const CHANNEL: u32 = 11;
++const COMPLETION_IFACE: u32 = 5;
++const E_FAIL: u32 = 0x8000_4005;
++
++struct Recorder(Sender<TransferInCompletionResult>);
++
++impl UrbdrcDeviceServerBackend for Recorder {
++    fn add_device(&mut self, _device: DeviceAnnounce) -> PduResult<()> {
++        Ok(())
++    }
++
++    fn device_text(&mut self, _device_text: DeviceText) {}
++
++    fn io_control_completed(&mut self, _: u32, _: RequestId, _: IoControlCompletionResult) -> PduResult<()> {
++        Ok(())
++    }
++
++    fn internal_io_control_completed(&mut self, _: u32, _: RequestId, _: IoControlCompletionResult) -> PduResult<()> {
++        Ok(())
++    }
++
++    fn transfer_in_completed(&mut self, _: u32, _: RequestId, completion: TransferInCompletionResult) -> PduResult<()> {
++        self.0.send(completion).expect("receiver alive");
++        Ok(())
++    }
++
++    fn transfer_out_completed(&mut self, _: u32, _: RequestId, _: TransferOutCompletionResult) -> PduResult<()> {
++        Ok(())
++    }
++}
++
++fn decode_device_msg(message: &DvcMessage) -> UrbdrcServerDevicePdu {
++    let encoded = encode_vec(message.as_ref()).expect("encode should succeed");
++    decode(&encoded).expect("decode should succeed")
++}
++
++/// A device server past the handshake and ADD_DEVICE, and where its IN completions go.
++fn ready() -> (UrbdrcDeviceServer, mpsc::Receiver<TransferInCompletionResult>) {
++    let (tx, rx) = mpsc::channel();
++    let completion_iface = InterfaceId::try_from(COMPLETION_IFACE).expect("valid");
++    let mut server = UrbdrcDeviceServer::new(Box::new(Recorder(tx)), completion_iface).expect("created");
++    let resp = server.start(CHANNEL).expect("start");
++    let UrbdrcServerDevicePdu::Caps(request) = decode_device_msg(&resp[0]) else {
++        panic!("expected capability request");
++    };
++    let resp = server
++        .process(
++            CHANNEL,
++            &encode_pdu(&UrbdrcClientDevicePdu::Caps(RimExchangeCapabilityResponse {
++                msg_id: request.msg_id,
++                capability: Capability::RimCapabilityVersion01,
++                result: 0,
++            })),
++        )
++        .expect("caps");
++    let UrbdrcServerDevicePdu::ChanCreated(created) = decode_device_msg(&resp[1]) else {
++        panic!("expected channel-created request");
++    };
++    server
++        .process(
++            CHANNEL,
++            &encode_pdu(&UrbdrcClientDevicePdu::ChanCreated(ChannelCreated {
++                msg_id: created.msg_id,
++                direction: Direction::ToServer,
++            })),
++        )
++        .expect("channel created");
++    let udev_iface = InterfaceId::try_from(4).expect("valid");
++    let add = add_device_from_info(udev_iface, &simple_device_info()).expect("ADD_DEVICE");
++    server
++        .process(CHANNEL, &encode_pdu(&UrbdrcClientDevicePdu::AddDev(add)))
++        .expect("add device");
++    (server, rx)
++}
++
++fn bulk_in(server: &mut UrbdrcDeviceServer, length: u32) -> RequestId {
++    server
++        .transfer_in(TransferInPacket {
++            ts_urb: TsUrbInPacket {
++                kind: TsUrbInKind::BulkInterruptTransfer(TsUrbBulkOrInterruptTransfer {
++                    pipe_handle: 0x0181,
++                    transfer_flags: 0x3,
++                }),
++                func: UrbFunction::URB_FUNCTION_BULK_OR_INTERRUPT_TRANSFER,
++            },
++            output_buffer_size: length,
++        })
++        .expect("TRANSFER_IN_REQUEST")
++        .request_id
++}
++
++fn part(request_id: RequestId, offset: u32, data: &[u8]) -> Vec<u8> {
++    let mut m = Vec::new();
++    m.extend_from_slice(&0u32.to_le_bytes());
++    m.extend_from_slice(&0u32.to_le_bytes());
++    m.extend_from_slice(&KEEL_IN_PART.to_le_bytes());
++    m.extend_from_slice(&request_id.to_le_bytes());
++    m.extend_from_slice(&offset.to_le_bytes());
++    m.extend_from_slice(data);
++    m
++}
++
++/// URB_COMPLETION (0x101) with data, or URB_COMPLETION_NO_DATA (0x102) when `data` is None
++/// (MS-RDPEUSB 2.2.7.2, 2.2.7.3).
++fn completion(request_id: RequestId, data: Option<&[u8]>) -> Vec<u8> {
++    let iface = InterfaceId::try_from(COMPLETION_IFACE).expect("valid");
++    let mut m = Vec::new();
++    m.extend_from_slice(&proxy_iface_id(iface).to_le_bytes());
++    m.extend_from_slice(&9u32.to_le_bytes());
++    m.extend_from_slice(&(if data.is_some() { 0x101u32 } else { 0x102 }).to_le_bytes());
++    m.extend_from_slice(&request_id.to_le_bytes());
++    m.extend_from_slice(&8u32.to_le_bytes()); // CbTsUrbResult
++    m.extend_from_slice(&8u16.to_le_bytes()); // TS_URB_RESULT_HEADER: Size
++    m.extend_from_slice(&0u16.to_le_bytes()); // Padding
++    m.extend_from_slice(&0u32.to_le_bytes()); // UsbdStatus
++    m.extend_from_slice(&0u32.to_le_bytes()); // HResult
++    let data = data.unwrap_or_default();
++    m.extend_from_slice(&u32::try_from(data.len()).expect("small").to_le_bytes());
++    m.extend_from_slice(data);
++    m
++}
++
++#[test]
++fn parts_and_the_completions_data_join() {
++    let (mut server, rx) = ready();
++    let id = bulk_in(&mut server, 300);
++    server.process(CHANNEL, &part(id, 0, &[1; 100])).expect("part");
++    server.process(CHANNEL, &part(id, 100, &[2; 100])).expect("part");
++    server.process(CHANNEL, &completion(id, Some(&[3; 50]))).expect("completion");
++    let done = rx.try_recv().expect("completed");
++    assert_eq!(done.hresult, 0);
++    let mut want = vec![1u8; 100];
++    want.extend([2; 100]);
++    want.extend([3; 50]);
++    assert_eq!(done.output_buffer, want);
++}
++
++#[test]
++fn all_data_ahead_and_a_no_data_completion() {
++    let (mut server, rx) = ready();
++    let id = bulk_in(&mut server, 300);
++    server.process(CHANNEL, &part(id, 0, &[7; 200])).expect("part");
++    server.process(CHANNEL, &completion(id, None)).expect("completion");
++    let done = rx.try_recv().expect("completed");
++    assert_eq!(done.hresult, 0);
++    assert_eq!(done.output_buffer, vec![7u8; 200]);
++}
++
++#[test]
++fn a_part_out_of_order_or_too_long_fails_the_request() {
++    let (mut server, rx) = ready();
++    let id = bulk_in(&mut server, 300);
++    server.process(CHANNEL, &part(id, 0, &[1; 100])).expect("part");
++    server.process(CHANNEL, &part(id, 150, &[2; 100])).expect("part");
++    server.process(CHANNEL, &completion(id, Some(&[3; 10]))).expect("completion");
++    let done = rx.try_recv().expect("completed");
++    assert_eq!(done.hresult, E_FAIL);
++    assert!(done.output_buffer.is_empty());
++
++    let id = bulk_in(&mut server, 300);
++    server.process(CHANNEL, &part(id, 0, &[1; 301])).expect("part");
++    server.process(CHANNEL, &completion(id, None)).expect("completion");
++    assert_eq!(rx.try_recv().expect("completed").hresult, E_FAIL);
++}
++
++#[test]
++fn a_part_for_no_pending_request_is_dropped() {
++    let (mut server, rx) = ready();
++    server.process(CHANNEL, &part(99, 0, &[1; 10])).expect("a stray part is not an error");
++    let id = bulk_in(&mut server, 300);
++    server.process(CHANNEL, &completion(id, Some(&[9; 13]))).expect("completion");
++    assert_eq!(rx.try_recv().expect("completed").output_buffer, vec![9u8; 13]);
++}
++
++#[test]
++fn a_completion_without_parts_is_as_before() {
++    let (mut server, rx) = ready();
++    let id = bulk_in(&mut server, 300);
++    server.process(CHANNEL, &completion(id, Some(&[9; 13]))).expect("completion");
++    assert_eq!(rx.try_recv().expect("completed").output_buffer, vec![9u8; 13]);
++}
+diff --git a/crates/ironrdp-testsuite-core/tests/rdpeusb/mod.rs b/crates/ironrdp-testsuite-core/tests/rdpeusb/mod.rs
+index c281adc9..0e3b37bc 100644
+--- a/crates/ironrdp-testsuite-core/tests/rdpeusb/mod.rs
++++ b/crates/ironrdp-testsuite-core/tests/rdpeusb/mod.rs
+@@ -49,6 +49,7 @@ fn encode_pdu<T: ironrdp_core::Encode>(pdu: &T) -> Vec<u8> {
+ mod client;
+ mod device;
+ mod io;
++mod keel_parts;
+ mod server;
+ mod sink;
+ mod ts_urb;

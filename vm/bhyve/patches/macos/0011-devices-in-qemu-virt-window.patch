@@ -1,0 +1,33 @@
+macOS: the UART, RTC and fw_cfg where EDK2's ArmVirt firmware expects devices
+
+The stock ArmVirtQemuKernel firmware maps one fixed window for platform
+devices (QEMU virt's, 0x08000000-0x3c000000) before it reads the device
+tree.  Move the three devices that were just above 64K into it, at
+QEMU's own addresses.  Guests take the addresses from the device tree.
+
+--- a/usr.sbin/bhyve/aarch64/bhyverun_machdep.c
++++ b/usr.sbin/bhyve/aarch64/bhyverun_machdep.c
+@@ -83,13 +83,19 @@
+ #define	FDT_ALIGN	0x200000
+ #define	FDT_SIZE	(64 * 1024)
+ 
+-/* Start of lowmem + 64K */
+-#define	UART_MMIO_BASE	0x10000
++/*
++ * Where QEMU's "virt" machine has them.  EDK2's ArmVirt firmware maps a fixed
++ * window for the platform's devices before it has read the device tree
++ * (0x08000000 to 0x3c000000, MACH_VIRT_PERIPH_BASE): FreeBSD's addresses just
++ * above 64K are outside it and the firmware faults in its first write to the
++ * UART.  The GIC (0x2f000000) is inside already.
++ */
++#define	UART_MMIO_BASE	0x09000000
+ #define	UART_MMIO_SIZE	0x1000
+ #define	UART_INTR	32
+-#define	RTC_MMIO_BASE	0x11000
++#define	RTC_MMIO_BASE	0x09010000
+ #define	RTC_MMIO_SIZE	0x1000
+-#define	FWCFG_MMIO_BASE	0x12000
++#define	FWCFG_MMIO_BASE	0x09020000
+ #define	RTC_INTR	33
+ 
+ #define	GIC_DIST_BASE		0x2f000000

@@ -1,0 +1,132 @@
+macOS: describe the GICv2m frame of Hypervisor.framework's GIC
+
+FreeBSD's vgic takes MSIs as writes to GICD_SETSPI_NSR and the device
+tree says so with "mbi-ranges".  Hypervisor.framework's GIC has no
+message-based SPIs in the distributor (GICD_TYPER.MBIS is clear, so
+Linux ignores "mbi-ranges" and falls back to INTx); it has a GICv2m
+frame instead.  Put that frame in the device tree, make it the PCI
+bridge's MSI parent, and tell hvf/ where it is.
+
+--- a/usr.sbin/bhyve/aarch64/fdt.c
++++ b/usr.sbin/bhyve/aarch64/fdt.c
+@@ -58,6 +58,7 @@
+ 
+ static void *fdtroot;
+ static uint32_t gic_phandle = 0;
++static uint32_t msi_phandle = 0;
+ static uint32_t apb_pclk_phandle;
+ 
+ static uint32_t
+@@ -173,7 +174,9 @@
+ 
+ void
+ fdt_add_gic(uint64_t dist_base, uint64_t dist_size,
+-    uint64_t redist_base, uint64_t redist_size)
++    uint64_t redist_base, uint64_t redist_size,
++    uint64_t msi_base, uint64_t msi_size, uint32_t msi_spi_base,
++    uint32_t msi_spi_count)
+ {
+ 	char node_name[32];
+ 	void *fdt, *prop;
+@@ -187,9 +190,10 @@
+ 	gic_phandle = assign_phandle(fdt);
+ 	fdt_property_string(fdt, "compatible", "arm,gic-v3");
+ 	fdt_property(fdt, "interrupt-controller", NULL, 0);
+-	fdt_property(fdt, "msi-controller", NULL, 0);
+ 	/* XXX: Needed given the root #address-cells? */
+ 	fdt_property_u32(fdt, "#address-cells", 2);
++	fdt_property_u32(fdt, "#size-cells", 2);
++	fdt_property(fdt, "ranges", NULL, 0);
+ 	fdt_property_u32(fdt, "#interrupt-cells", 3);
+ 	fdt_property_placeholder(fdt, "reg", 4 * sizeof(uint64_t), &prop);
+ 	/* GICD */
+@@ -199,10 +203,21 @@
+ 	SET_PROP_U64(prop, 2, redist_base);
+ 	SET_PROP_U64(prop, 3, redist_size);
+ 
+-	fdt_property_placeholder(fdt, "mbi-ranges", 2 * sizeof(uint32_t),
+-	    &prop);
+-	SET_PROP_U32(prop, 0, 256);
+-	SET_PROP_U32(prop, 1, 64);
++	/*
++	 * Hypervisor.framework's GIC takes MSIs through a GICv2m frame; it has
++	 * no message-based SPIs in the distributor (GICD_TYPER.MBIS is clear,
++	 * and Linux does not use "mbi-ranges" without it).
++	 */
++	snprintf(node_name, sizeof(node_name), "v2m@%lx",
++	    (unsigned long)msi_base);
++	fdt_begin_node(fdt, node_name);
++	msi_phandle = assign_phandle(fdt);
++	fdt_property_string(fdt, "compatible", "arm,gic-v2m-frame");
++	fdt_property(fdt, "msi-controller", NULL, 0);
++	set_single_reg(fdt, msi_base, msi_size);
++	fdt_property_u32(fdt, "arm,msi-base-spi", msi_spi_base);
++	fdt_property_u32(fdt, "arm,msi-num-spis", msi_spi_count);
++	fdt_end_node(fdt);
+ 
+ 	fdt_end_node(fdt);
+ 
+@@ -346,10 +361,10 @@
+ 
+ 	fdt_property_placeholder(fdt, "msi-map", 4 * sizeof(uint32_t), &prop);
+ 	SET_PROP_U32(prop, 0, 0);		/* RID base */
+-	SET_PROP_U32(prop, 1, gic_phandle);	/* MSI parent */
++	SET_PROP_U32(prop, 1, msi_phandle);	/* MSI parent */
+ 	SET_PROP_U32(prop, 2, 0);		/* MSI base */
+ 	SET_PROP_U32(prop, 3, 0x10000);		/* RID length */
+-	fdt_property_u32(fdt, "msi-parent", gic_phandle);
++	fdt_property_u32(fdt, "msi-parent", msi_phandle);
+ 
+ 	fdt_property_u32(fdt, "#interrupt-cells", 1);
+ 	fdt_property_u32(fdt, "interrupt-parent", gic_phandle);
+--- a/usr.sbin/bhyve/aarch64/fdt.h
++++ b/usr.sbin/bhyve/aarch64/fdt.h
+@@ -38,7 +38,9 @@
+ int	fdt_init(struct vmctx *ctx, int ncpu, vm_paddr_t addrp,
+ 	    vm_size_t size);
+ void	fdt_add_gic(uint64_t dist_base, uint64_t dist_size,
+-	    uint64_t redist_base, uint64_t redist_size);
++	    uint64_t redist_base, uint64_t redist_size,
++	    uint64_t msi_base, uint64_t msi_size, uint32_t msi_spi_base,
++	    uint32_t msi_spi_count);
+ void	fdt_add_timer(void);
+ void	fdt_add_pcie(int intrs[static 4]);
+ void	fdt_add_uart(uint64_t uart_base, uint64_t uart_size, int intr);
+--- a/usr.sbin/bhyve/aarch64/bhyverun_machdep.c
++++ b/usr.sbin/bhyve/aarch64/bhyverun_machdep.c
+@@ -42,6 +42,7 @@
+ #include <unistd.h>
+ 
+ #include <vmmapi.h>
++#include <vmmapi_hvf.h>
+ 
+ #include "bhyve_machdep.h"
+ #include "bhyverun.h"
+@@ -89,6 +90,11 @@
+ #define	GIC_DIST_SIZE		0x10000
+ #define	GIC_REDIST_BASE		0x2f100000
+ #define	GIC_REDIST_SIZE(ncpu)	((ncpu) * 2 * PAGE_SIZE_64K)
++/* The GICv2m frame of Hypervisor.framework's GIC, and the SPIs MSIs use. */
++#define	GIC_MSI_BASE		0x2f010000
++#define	GIC_MSI_SIZE		0x10000
++#define	GIC_MSI_SPI_BASE	256
++#define	GIC_MSI_SPI_COUNT	64
+ 
+ #define	PCIE_INTA	34
+ #define	PCIE_INTB	35
+@@ -439,7 +445,14 @@
+ 		return (error);
+ 
+ 	fdt_add_gic(GIC_DIST_BASE, GIC_DIST_SIZE, GIC_REDIST_BASE,
+-	    GIC_REDIST_SIZE(guest_ncpus));
++	    GIC_REDIST_SIZE(guest_ncpus), GIC_MSI_BASE, GIC_MSI_SIZE,
++	    GIC_MSI_SPI_BASE, GIC_MSI_SPI_COUNT);
++	error = vm_hvf_set_msi_frame(ctx, GIC_MSI_BASE, GIC_MSI_SIZE,
++	    GIC_MSI_SPI_BASE, GIC_MSI_SPI_COUNT);
++	if (error != 0) {
++		warn("vm_hvf_set_msi_frame()");
++		return (error);
++	}
+ 	error = vm_attach_vgic(ctx, GIC_DIST_BASE, GIC_DIST_SIZE,
+ 	    GIC_REDIST_BASE, GIC_REDIST_SIZE(guest_ncpus));
+ 	if (error != 0) {

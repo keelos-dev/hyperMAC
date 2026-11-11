@@ -1,0 +1,92 @@
+bhyve/arm64: a NOR flash for UEFI variables
+
+EDK2's ArmVirt firmware keeps the UEFI variables in a CFI flash that it
+finds in the device tree, and its variable driver does not start
+without one.  Add the flash (pflash.c, the Intel command set as QEMU's
+pflash_cfi01 has it) where QEMU's "virt" machine has its second one,
+backed by the file the "bootvars" option names.
+
+(pflash.c itself is a new file and not part of this diff.)
+
+--- a/usr.sbin/bhyve/aarch64/bhyverun_machdep.c
++++ b/usr.sbin/bhyve/aarch64/bhyverun_machdep.c
+@@ -54,6 +54,7 @@
+ #include "ipc.h"
+ #include "pci_emul.h"
+ #include "pci_irq.h"
++#include "pflash.h"
+ #include "qemu_fwcfg.h"
+ #include "rtc_pl031.h"
+ #include "uart_emul.h"
+@@ -65,6 +66,7 @@
+ 	{ "rtc.use_localtime", CONFIG_OPTION_BOOL },
+ 	{ "console", CONFIG_OPTION_STRING },
+ 	{ "fdt.bootargs", CONFIG_OPTION_STRING },
++	{ "bootvars", CONFIG_OPTION_STRING },
+ };
+ 
+ void
+@@ -96,6 +98,9 @@
+ #define	RTC_MMIO_BASE	0x09010000
+ #define	RTC_MMIO_SIZE	0x1000
+ #define	FWCFG_MMIO_BASE	0x09020000
++/* The flash EDK2 keeps the UEFI variables in: QEMU virt's second flash. */
++#define	PFLASH_BASE	0x04000000
++#define	PFLASH_SIZE	0x04000000
+ #define	RTC_INTR	33
+ 
+ #define	GIC_DIST_BASE		0x2f000000
+@@ -485,6 +490,17 @@
+ 		return (error);
+ 	init_mmio_rtc(ctx);
+ 	fdt_add_rtc(RTC_MMIO_BASE, RTC_MMIO_SIZE, RTC_INTR);
++	/*
++	 * UEFI variables: in the file "bootvars" names, or lost at exit
++	 * without one.
++	 */
++	error = pflash_init(PFLASH_BASE, PFLASH_SIZE,
++	    get_config_value("bootvars"));
++	if (error != 0) {
++		warnc(error, "pflash_init()");
++		return (error);
++	}
++	fdt_add_flash(PFLASH_BASE, PFLASH_SIZE);
+ 	/* qemu_fwcfg_init() registers it; firmware finds it in the device tree */
+ 	qemu_fwcfg_enable_mmio(FWCFG_MMIO_BASE);
+ 	fdt_add_fwcfg(FWCFG_MMIO_BASE, QEMU_FWCFG_MMIO_SIZE);
+--- a/usr.sbin/bhyve/aarch64/fdt.c
++++ b/usr.sbin/bhyve/aarch64/fdt.c
+@@ -315,6 +315,23 @@
+ }
+ 
+ void
++fdt_add_flash(uint64_t flash_base, uint64_t flash_size)
++{
++	void *fdt;
++	char node_name[32];
++
++	fdt = fdtroot;
++
++	snprintf(node_name, sizeof(node_name), "flash@%lx",
++	    (unsigned long)flash_base);
++	fdt_begin_node(fdt, node_name);
++	fdt_property_string(fdt, "compatible", "cfi-flash");
++	set_single_reg(fdt, flash_base, flash_size);
++	fdt_property_u32(fdt, "bank-width", 4);
++	fdt_end_node(fdt);
++}
++
++void
+ fdt_add_timer(void)
+ {
+ 	void *fdt, *interrupts;
+--- a/usr.sbin/bhyve/aarch64/fdt.h
++++ b/usr.sbin/bhyve/aarch64/fdt.h
+@@ -46,6 +46,7 @@
+ void	fdt_add_uart(uint64_t uart_base, uint64_t uart_size, int intr);
+ void	fdt_add_rtc(uint64_t rtc_base, uint64_t rtc_size, int intr);
+ void	fdt_add_fwcfg(uint64_t fwcfg_base, uint64_t fwcfg_size);
++void	fdt_add_flash(uint64_t flash_base, uint64_t flash_size);
+ void	fdt_finalize(void);
+ 
+ #endif	/* _FDT_H_ */

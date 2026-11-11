@@ -1,0 +1,113 @@
+bhyve: fbuf: QEMU's ramfb
+
+With "ramfb=on" the framebuffer device offers the fw_cfg file etc/ramfb.
+Firmware with QEMU's ramfb driver (EDK2's QemuRamfbDxe, part of the
+ArmVirt platforms) allocates a framebuffer in guest RAM and writes its
+address and mode there; the console then shows that memory.  This gives
+a guest a UEFI GOP with a linear framebuffer where the firmware has no
+driver for bhyve's own framebuffer BAR, which is every platform but
+amd64; it is on by default there.
+
+--- a/usr.sbin/bhyve/pci_fbuf.c
++++ b/usr.sbin/bhyve/pci_fbuf.c
+@@ -51,6 +51,7 @@
+ #include "debug.h"
+ #include "console.h"
+ #include "pci_emul.h"
++#include "qemu_fwcfg.h"
+ #include "rfb.h"
+ #ifdef __amd64__
+ #include "amd64/vga.h"
+@@ -113,7 +114,20 @@
+ 	uint16_t  gc_height;
+ 	void      *vgasc;
+ 	struct bhyvegc_image *gc_image;
++
++	/* ramfb: what the guest wrote to the fw_cfg file, big endian */
++	struct {
++		uint64_t be_addr;
++		uint32_t be_fourcc;
++		uint32_t be_flags;
++		uint32_t be_width;
++		uint32_t be_height;
++		uint32_t be_stride;
++	} __packed ramfb_cfg;
+ };
++
++#define	RAMFB_FWCFG_FILE	"etc/ramfb"
++#define	RAMFB_FOURCC_XR24	0x34325258	/* DRM_FORMAT_XRGB8888 */
+ 
+ static struct pci_fbuf_softc *fbuf_sc;
+ 
+@@ -365,6 +379,50 @@
+ 		sc->rfb_password = strdup(value);
+ 
+ 	return (0);
++}
++
++/*
++ * QEMU's "ramfb": firmware (EDK2's QemuRamfbDxe) allocates a framebuffer in
++ * the guest's RAM and writes its address and mode to a fw_cfg file.  The
++ * picture is then that memory instead of BAR 1's, which needs a driver for
++ * this device in the firmware.  An operating system without a display driver
++ * keeps drawing there (UEFI GOP's linear framebuffer).
++ */
++static void
++pci_fbuf_ramfb_write(void *arg)
++{
++	struct pci_fbuf_softc *sc = arg;
++	uint64_t addr;
++	uint32_t fourcc, width, height, stride;
++	void *fb;
++
++	addr = be64toh(sc->ramfb_cfg.be_addr);
++	fourcc = be32toh(sc->ramfb_cfg.be_fourcc);
++	width = be32toh(sc->ramfb_cfg.be_width);
++	height = be32toh(sc->ramfb_cfg.be_height);
++	stride = be32toh(sc->ramfb_cfg.be_stride);
++
++	if (fourcc != RAMFB_FOURCC_XR24 || width == 0 || height == 0 ||
++	    width > GC_COLS_MAX || height > GC_ROWS_MAX ||
++	    stride != width * sizeof(uint32_t)) {
++		EPRINTLN("fbuf: ramfb: unsupported mode %ux%u stride %u "
++		    "format %#x", width, height, stride, fourcc);
++		return;
++	}
++	fb = paddr_guest2host(sc->fsc_pi->pi_vmctx, addr,
++	    (size_t)stride * height);
++	if (fb == NULL) {
++		EPRINTLN("fbuf: ramfb: framebuffer at %#lx is not in RAM",
++		    (unsigned long)addr);
++		return;
++	}
++
++	pthread_mutex_lock(&sc->mtx);
++	sc->memregs.width = width;
++	sc->memregs.height = height;
++	sc->memregs.depth = 32;
++	console_set_fbaddr(fb);
++	pthread_mutex_unlock(&sc->mtx);
+ }
+ 
+ static void
+@@ -479,6 +537,20 @@
+ 
+ 	memset((void *)sc->fb_base, 0, FB_SIZE);
+ 
++	/*
++	 * Offer ramfb where firmware has no driver for this device's own
++	 * framebuffer (ramfb=off not to).  Without fw_cfg there is no file and
++	 * nothing changes.
++	 */
++#ifdef __amd64__
++	if (get_config_bool_node_default(nvl, "ramfb", false))
++#else
++	if (get_config_bool_node_default(nvl, "ramfb", true))
++#endif
++		(void)qemu_fwcfg_add_file_writable(RAMFB_FWCFG_FILE,
++		    sizeof(sc->ramfb_cfg), &sc->ramfb_cfg,
++		    pci_fbuf_ramfb_write, sc);
++
+ 	error = rfb_init(sc->rfb_family, sc->rfb_host, sc->rfb_port,
+ 	    sc->rfb_wait, sc->rfb_password);
+ done:

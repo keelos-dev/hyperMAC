@@ -1,0 +1,20 @@
+bhyve/arm64: the PSCI node is also compatible with arm,psci-0.2
+
+PSCI 1.0 keeps the 0.2 function IDs and the binding has a 1.0 node list
+"arm,psci-0.2" as well for clients that only know that one.  EDK2's
+ArmVirt reset library is one: without it the firmware stops at an
+assertion in ResetSystemRuntimeDxe.
+
+--- a/usr.sbin/bhyve/aarch64/fdt.c
++++ b/usr.sbin/bhyve/aarch64/fdt.c
+@@ -154,7 +154,9 @@
+ 	add_cpus(fdt, ncpu);
+ 
+ 	fdt_begin_node(fdt, "psci");
+-	fdt_property_string(fdt, "compatible", "arm,psci-1.0");
++#define	PSCI_COMPAT	"arm,psci-1.0\0arm,psci-0.2"
++	fdt_property(fdt, "compatible", PSCI_COMPAT, sizeof(PSCI_COMPAT));
++#undef PSCI_COMPAT
+ 	fdt_property_string(fdt, "method", "hvc");
+ 	fdt_end_node(fdt);
+ 

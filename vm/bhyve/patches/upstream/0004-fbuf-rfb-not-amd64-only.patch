@@ -1,0 +1,137 @@
+bhyve: let the framebuffer and the VNC server build on other platforms
+
+pci_fbuf.c and rfb.c are only built for amd64.  Nothing in them needs a
+PC except the VGA registers behind the framebuffer and the SSE4.2 CRC32
+that the VNC server uses when CPUID says it can: make those two amd64
+only.  Elsewhere the framebuffer starts with vga=off (and takes nothing
+else) and the VNC server uses zlib's crc32().
+
+This is the source half; the files still have to be added to the other
+platforms' Makefile.inc.
+
+--- a/usr.sbin/bhyve/rfb.c
++++ b/usr.sbin/bhyve/rfb.c
+@@ -38,8 +38,10 @@
+ #include <sys/un.h>
+ #include <arpa/inet.h>
+ #include <stdatomic.h>
++#ifdef __amd64__
+ #include <machine/cpufunc.h>
+ #include <machine/specialreg.h>
++#endif
+ #include <netinet/in.h>
+ #include <netdb.h>
+ 
+@@ -455,6 +457,7 @@
+ 	return (0);
+ }
+ 
++#ifdef __amd64__
+ /*
+  * Calculate CRC32 using SSE4.2; Intel or AMD Bulldozer+ CPUs only
+  */
+@@ -475,6 +478,7 @@
+ 
+ 	return (crcval);
+ }
++#endif
+ 
+ static int
+ rfb_send_update_header(struct rfb_softc *rc __unused, int cfd, int numrects)
+@@ -791,11 +795,13 @@
+ 			else
+ 				cellwidth = PIX_PER_CELL;
+ 
++#ifdef __amd64__
+ 			if (rc->hw_crc)
+ 				crc_p[x] = fast_crc32(p,
+ 				             cellwidth * sizeof(uint32_t),
+ 				             crc_p[x]);
+ 			else
++#endif
+ 				crc_p[x] = (uint32_t)crc32(crc_p[x],
+ 				             (Bytef *)p,
+ 				             cellwidth * sizeof(uint32_t));
+@@ -1325,6 +1331,7 @@
+ 	return (NULL);
+ }
+ 
++#ifdef __amd64__
+ static int
+ sse42_supported(void)
+ {
+@@ -1336,6 +1343,7 @@
+ 
+ 	return ((ecx & CPUID2_SSE42) != 0);
+ }
++#endif
+ 
+ int
+ rfb_init(sa_family_t family, const char *hostname, int port, int wait,
+@@ -1438,7 +1446,9 @@
+ 		errx(EX_OSERR, "Unable to apply rights for sandbox");
+ #endif
+ 
++#ifdef __amd64__
+ 	rc->hw_crc = sse42_supported();
++#endif
+ 
+ 	rc->conn_wait = wait;
+ 	if (wait) {
+--- a/usr.sbin/bhyve/pci_fbuf.c
++++ b/usr.sbin/bhyve/pci_fbuf.c
+@@ -325,12 +325,14 @@
+ 	if (value != NULL) {
+ 		if (strcmp(value, "off") == 0) {
+ 			sc->vga_enabled = 0;
++#ifdef __amd64__
+ 		} else if (strcmp(value, "io") == 0) {
+ 			sc->vga_enabled = 1;
+ 			sc->vga_full = 0;
+ 		} else if (strcmp(value, "on") == 0) {
+ 			sc->vga_enabled = 1;
+ 			sc->vga_full = 1;
++#endif
+ 		} else {
+ 			EPRINTLN("fbuf: Invalid vga setting: \"%s\"", value);
+ 			return (-1);
+@@ -373,6 +375,7 @@
+ 
+ 	sc = arg;
+ 	pthread_mutex_lock(&sc->mtx);
++#ifdef __amd64__
+ 	if (sc->vga_full && sc->gc_image->vgamode) {
+ 		/* TODO: mode switching to vga and vesa should use the special
+ 		 *      EFI-bhyve protocol port.
+@@ -381,6 +384,7 @@
+ 		vga_render(gc, sc->vgasc);
+ 		return;
+ 	}
++#endif
+ 	width = sc->memregs.width;
+ 	height = sc->memregs.height;
+ 	if (sc->gc_width != width || sc->gc_height != height) {
+@@ -439,7 +443,12 @@
+ 	sc->memregs.height = ROWS_DEFAULT;
+ 	sc->memregs.depth  = 32;
+ 
++#ifdef __amd64__
+ 	sc->vga_enabled = 1;
++#else
++	/* VGA is a PC device: the registers are I/O ports. */
++	sc->vga_enabled = 0;
++#endif
+ 	sc->vga_full = 0;
+ 
+ 	sc->fsc_pi = pi;
+@@ -460,8 +469,10 @@
+ 	console_init(sc->memregs.width, sc->memregs.height, sc->fb_base);
+ 	console_fb_register(pci_fbuf_render, sc);
+ 
++#ifdef __amd64__
+ 	if (sc->vga_enabled)
+ 		sc->vgasc = vga_init(!sc->vga_full);
++#endif
+ 	sc->gc_image = console_get_image();
+ 
+ 	fbuf_sc = sc;

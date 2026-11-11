@@ -1,0 +1,17 @@
+bhyve: nvme: initialize the AEN condition variable
+
+aen_cond is used with pthread_cond_wait() and pthread_cond_signal() but
+never initialized.  That works where a zeroed pthread_cond_t is
+initialized on first use; elsewhere pthread_cond_wait() fails at once
+and aen_thr() spins with aen_mtx held.
+
+--- a/usr.sbin/bhyve/pci_nvme.c
++++ b/usr.sbin/bhyve/pci_nvme.c
+@@ -853,6 +853,7 @@
+ 	pci_nvme_aen_reset(sc);
+ 
+ 	pthread_mutex_init(&sc->aen_mtx, NULL);
++	pthread_cond_init(&sc->aen_cond, NULL);
+ 	pthread_create(&sc->aen_tid, NULL, aen_thr, sc);
+ 	snprintf(nstr, sizeof(nstr), "nvme-aen-%d:%d", sc->nsc_pi->pi_slot,
+ 	    sc->nsc_pi->pi_func);

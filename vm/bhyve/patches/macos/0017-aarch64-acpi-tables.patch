@@ -1,0 +1,70 @@
+arm64: build the ACPI tables (acpi_arm64.c) and offer them through fw_cfg
+
+On by default (acpi_tables=false to leave them out): EDK2 installs them
+and the guest then runs on ACPI, which Windows needs.  U-Boot does not
+read fw_cfg, so a guest booted by it still gets the device tree.
+
+In patches/macos only because it sits on top of the GICv2m and device
+address patches there; nothing in it is specific to macOS.
+
+--- a/usr.sbin/bhyve/aarch64/bhyverun_machdep.c
++++ b/usr.sbin/bhyve/aarch64/bhyverun_machdep.c
+@@ -44,6 +44,8 @@
+ #include <vmmapi.h>
+ #include <vmmapi_hvf.h>
+ 
++#include "acpi_arm64.h"
++
+ #include "bhyve_machdep.h"
+ #include "bhyverun.h"
+ #include "config.h"
+@@ -117,6 +119,8 @@
+ #define	PCIE_INTB	35
+ #define	PCIE_INTC	36
+ #define	PCIE_INTD	37
++/* The ACPI generic event device's interrupt (the power button), see the DSDT. */
++#define	GED_INTR	39
+ 
+ uint64_t *cpu_to_mpidr;
+ 
+@@ -128,7 +132,8 @@
+ 	init_config();
+ 
+ 	/* Set default values prior to option parsing. */
+-	set_config_bool("acpi_tables", false);
++	/* For firmware that takes them from fw_cfg (EDK2); U-Boot never looks. */
++	set_config_bool("acpi_tables", true);
+ 	set_config_bool("acpi_tables_in_memory", false);
+ 	set_config_value("memory.size", "256M");
+ 	set_config_value("rundir", BHYVE_RUN_DIR);
+@@ -520,7 +525,30 @@
+ 	int error;
+ 
+ 	fdt_finalize();
++
++	if (get_config_bool("acpi_tables")) {
++		struct acpi_arm64_info info = {
++			.ncpu = guest_ncpus,
++			.mpidr = cpu_to_mpidr,
++			.uart_base = UART_MMIO_BASE,
++			.uart_irq = UART_INTR,
++			.gicd_base = GIC_DIST_BASE,
++			.gicr_base = GIC_REDIST_BASE,
++			.gicr_size = GIC_REDIST_SIZE(guest_ncpus),
++			.gic_msi_base = GIC_MSI_BASE,
++			.gic_msi_spi_base = GIC_MSI_SPI_BASE,
++			.gic_msi_spi_count = GIC_MSI_SPI_COUNT,
++			.pci_ecam_base = 0xe0000000,
++			.power_button_irq = GED_INTR,
++		};
+ 
++		error = acpi_arm64_build(ctx, &info);
++		if (error != 0) {
++			warnc(error, "acpi_arm64_build()");
++			return (error);
++		}
++	}
++
+ 	error = vm_set_register(bsp, VM_REG_GUEST_X0, fdt_gpa(ctx));
+ 	assert(error == 0);
+ 

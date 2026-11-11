@@ -1,0 +1,44 @@
+bhyve: fbuf: tell the firmware which ramfb size to use
+
+ramfb has no channel for the size the host wants, and EDK2's QemuRamfbDxe
+offers 640x480, 800x600 and 1024x768 only.  An operating system that
+keeps the firmware's GOP mode (Windows without a display driver) is then
+stuck with one of those.  Publish the framebuffer device's configured
+size (w=, h=) in the fw_cfg file opt/bhyve/ramfb-mode, two little-endian
+32-bit numbers; firmware that knows the file adds that mode and makes it
+the default (the EDK2 side is firmware/edk2-bhyve.patch in this port).
+
+--- a/usr.sbin/bhyve/pci_fbuf.c
++++ b/usr.sbin/bhyve/pci_fbuf.c
+@@ -124,9 +124,11 @@
+ 		uint32_t be_height;
+ 		uint32_t be_stride;
+ 	} __packed ramfb_cfg;
++	uint32_t  ramfb_mode[2];	/* width, height: little endian */
+ };
+ 
+ #define	RAMFB_FWCFG_FILE	"etc/ramfb"
++#define	RAMFB_MODE_FWCFG_FILE	"opt/bhyve/ramfb-mode"
+ #define	RAMFB_FOURCC_XR24	0x34325258	/* DRM_FORMAT_XRGB8888 */
+ 
+ static struct pci_fbuf_softc *fbuf_sc;
+@@ -547,9 +549,19 @@
+ #else
+ 	if (get_config_bool_node_default(nvl, "ramfb", true))
+ #endif
++	{
+ 		(void)qemu_fwcfg_add_file_writable(RAMFB_FWCFG_FILE,
+ 		    sizeof(sc->ramfb_cfg), &sc->ramfb_cfg,
+ 		    pci_fbuf_ramfb_write, sc);
++		/*
++		 * ramfb has no way to say which size the host would like, and
++		 * the firmware's driver knows three small ones.  Name ours.
++		 */
++		sc->ramfb_mode[0] = htole32(sc->memregs.width);
++		sc->ramfb_mode[1] = htole32(sc->memregs.height);
++		(void)qemu_fwcfg_add_file(RAMFB_MODE_FWCFG_FILE,
++		    sizeof(sc->ramfb_mode), sc->ramfb_mode);
++	}
+ 
+ 	error = rfb_init(sc->rfb_family, sc->rfb_host, sc->rfb_port,
+ 	    sc->rfb_wait, sc->rfb_password);

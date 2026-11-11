@@ -1,0 +1,99 @@
+bhyve: register a BAR again once the range it wanted is free
+
+A guest that reassigns the BARs of several devices without turning
+decoding off, as Linux does on arm64, routinely puts a BAR where another
+device's BAR still is; that one moves away a moment later.
+
+register_mem() reports success without registering anything when the
+new range starts inside a registered one, and returns an error when it
+overlaps one otherwise.  Either way modify_bar_registration() never
+tries again, and in the first case it even believes the BAR is
+registered.  The BAR then stays without a handler for good: its accesses
+fall through to the PCI fallback handler, reads return all ones, and
+for instance a virtio 1.0 driver waits forever for device_status to
+read 0 after a reset.
+
+Make register_mem() fail with EEXIST in the first case too, and try the
+unregistered BARs of all devices again whenever a BAR has moved or a
+device's decoding has changed.
+
+--- a/usr.sbin/bhyve/pci_emul.c
++++ b/usr.sbin/bhyve/pci_emul.c
+@@ -741,6 +741,44 @@
+ 	modify_bar_registration(pi, idx, 1);
+ }
+ 
++static int memen(struct pci_devinst *pi);
++static int porten(struct pci_devinst *pi);
++
++/*
++ * Register the BARs whose registration failed earlier because their range
++ * was still taken: a guest that moves the BARs of several devices while
++ * they decode puts one where another has not left yet.
++ */
++static void
++retry_bar_registration(void)
++{
++	struct businfo *bi;
++	struct pci_devinst *pi;
++	struct pcibar *bar;
++	int bus, slot, func, idx;
++
++	for (bus = 0; bus < MAXBUSES; bus++) {
++		if ((bi = pci_businfo[bus]) == NULL)
++			continue;
++		for (slot = 0; slot < MAXSLOTS; slot++) {
++			for (func = 0; func < MAXFUNCS; func++) {
++				pi = bi->slotinfo[slot].si_funcs[func].fi_devi;
++				if (pi == NULL)
++					continue;
++				for (idx = 0; idx <= PCI_BARMAX; idx++) {
++					bar = &pi->pi_bar[idx];
++					if (bar->registered)
++						continue;
++					if (bar->type == PCIBAR_IO ? porten(pi) :
++					    (bar->type == PCIBAR_MEM32 ||
++					    bar->type == PCIBAR_MEM64) ? memen(pi) : 0)
++						modify_bar_registration(pi, idx, 1);
++				}
++			}
++		}
++	}
++}
++
+ /* Is the ROM enabled for the emulated pci device? */
+ static int
+ romen(struct pci_devinst *pi)
+@@ -807,8 +845,11 @@
+ 		assert(0);
+ 	}
+ 
+-	if (decode)
++	if (decode) {
+ 		register_bar(pi, idx);
++		/* this BAR has left a range another one may be waiting for */
++		retry_bar_registration();
++	}
+ }
+ 
+ void
+@@ -2251,6 +2292,8 @@
+ 				assert(0);
+ 		}
+ 	}
++	if (changed & (PCIM_CMD_PORTEN | PCIM_CMD_MEMEN))
++		retry_bar_registration();
+ 
+ 	/*
+ 	 * If INTx has been unmasked and is pending, assert the
+--- a/usr.sbin/bhyve/mem.c
++++ b/usr.sbin/bhyve/mem.c
+@@ -318,6 +318,8 @@
+ 		pthread_rwlock_wrlock(&mmio_rwlock);
+ 		if (mmio_rb_lookup(rbt, memp->base, &entry) != 0)
+ 			err = mmio_rb_add(rbt, mrp);
++		else
++			err = EEXIST;
+ 		perror = pthread_rwlock_unlock(&mmio_rwlock);
+ 		assert(perror == 0);
+ 		if (err)

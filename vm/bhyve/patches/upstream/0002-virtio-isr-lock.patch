@@ -1,0 +1,79 @@
+bhyve: virtio: do not lock the softc mutex again to raise an interrupt
+
+Without MSI-X, vi_interrupt() takes the device's vs_mtx to set the ISR
+bit and assert INTx.  Most callers already hold that mutex: vi_pci_write()
+calls the queue notification handler with it held, and backends such as
+pci_vtblk_done() take it before vq_endchains().
+
+With FreeBSD's default (error-checking) mutexes the second lock fails
+with EDEADLK, which is ignored, and the matching unlock then releases
+the caller's lock early.  With a normal mutex the thread deadlocks: a
+Linux guest that has no MSI domain hangs at its first block read.
+
+Give the ISR state and the INTx level a small mutex of their own, taken
+last, and use it in the three places that touch them.
+
+--- a/usr.sbin/bhyve/virtio.c
++++ b/usr.sbin/bhyve/virtio.c
+@@ -79,6 +79,8 @@
+ 	vs->vs_pi = pi;
+ 	pi->pi_arg = vs;
+ 
++	pthread_mutex_init(&vs->vs_isr_mtx, NULL);
++
+ 	vs->vs_queues = queues;
+ 	for (i = 0; i < vc->vc_nvq; i++) {
+ 		queues[i].vq_vs = vs;
+@@ -116,9 +118,11 @@
+ 	vs->vs_negotiated_caps = 0;
+ 	vs->vs_curq = 0;
+ 	/* vs->vs_status = 0; -- redundant */
++	pthread_mutex_lock(&vs->vs_isr_mtx);
+ 	if (vs->vs_isr)
+ 		pci_lintr_deassert(vs->vs_pi);
+ 	vs->vs_isr = 0;
++	pthread_mutex_unlock(&vs->vs_isr_mtx);
+ 	vs->vs_msix_cfg_idx = VIRTIO_MSI_NO_VECTOR;
+ }
+ 
+@@ -673,10 +677,12 @@
+ 		value = vs->vs_status;
+ 		break;
+ 	case VIRTIO_PCI_ISR:
++		pthread_mutex_lock(&vs->vs_isr_mtx);
+ 		value = vs->vs_isr;
+ 		vs->vs_isr = 0;		/* a read clears this flag */
+ 		if (value)
+ 			pci_lintr_deassert(pi);
++		pthread_mutex_unlock(&vs->vs_isr_mtx);
+ 		break;
+ 	case VIRTIO_MSI_CONFIG_VECTOR:
+ 		value = vs->vs_msix_cfg_idx;
+--- a/usr.sbin/bhyve/virtio.h
++++ b/usr.sbin/bhyve/virtio.h
+@@ -241,6 +241,7 @@
+ 	int	vs_curq;		/* current queue */
+ 	uint8_t	vs_status;		/* value from last status write */
+ 	uint8_t	vs_isr;			/* ISR flags, if not MSI-X */
++	pthread_mutex_t vs_isr_mtx;	/* vs_isr and the INTx line's level */
+ 	uint16_t vs_msix_cfg_idx;	/* MSI-X vector for config event */
+ };
+ 
+@@ -355,11 +356,15 @@
+ 	if (pci_msix_enabled(vs->vs_pi))
+ 		pci_generate_msix(vs->vs_pi, msix_idx);
+ 	else {
+-		VS_LOCK(vs);
++		/*
++		 * Not vs_mtx: callers that complete a request from a queue
++		 * notification or from a backend's callback already hold it.
++		 */
++		pthread_mutex_lock(&vs->vs_isr_mtx);
+ 		vs->vs_isr |= isr;
+ 		pci_generate_msi(vs->vs_pi, 0);
+ 		pci_lintr_assert(vs->vs_pi);
+-		VS_UNLOCK(vs);
++		pthread_mutex_unlock(&vs->vs_isr_mtx);
+ 	}
+ }
+ 

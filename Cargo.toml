@@ -1,0 +1,60 @@
+[package]
+name = "hypermac"
+version = "1.1.0"
+edition = "2024"
+description = "RDP server for the Mac's physical desktop (docs/design.md)"
+publish = false
+
+[dependencies]
+# IronRDP: keel-rdp's pin (8f9bf5b8 + ironrdp-keel.patch); build.sh puts it in vendor/IronRDP
+ironrdp-server = { path = "vendor/IronRDP/crates/ironrdp-server", default-features = false, features = ["helper", "rayon", "egfx"] }
+ironrdp-pdu = { path = "vendor/IronRDP/crates/ironrdp-pdu" }
+# RDPSND, the Mac's system sound (sound.rs)
+ironrdp-rdpsnd = { path = "vendor/IronRDP/crates/ironrdp-rdpsnd" }
+# Opus for RDPSND (sound.rs); libopus built from the crate's bundled source and linked statically
+# (BSD-3-Clause, THIRD_PARTY.md), the same crate kRDPclient decodes with
+opus2 = { version = "0.4", features = ["bundled"] }
+# CLIPRDR, text both ways (clip.rs)
+ironrdp-cliprdr = { path = "vendor/IronRDP/crates/ironrdp-cliprdr" }
+# keelOS::Video dynamic channel (video.rs)
+ironrdp-dvc = { path = "vendor/IronRDP/crates/ironrdp-dvc" }
+ironrdp-svc = { path = "vendor/IronRDP/crates/ironrdp-svc" }
+ironrdp-core = { path = "vendor/IronRDP/crates/ironrdp-core" }
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "time", "sync"] }
+async-trait = "0.1"
+anyhow = "1"
+bytes = "1"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+# NTLM's NT hash of the RDP password for NLA/CredSSP (keel-rdp auth.rs; RustCrypto, MIT/Apache-2.0)
+md4 = "0.10"
+# tokens.json holds SHA-256 of each token (web.rs)
+sha2 = "0.10"
+# getuid for the LaunchAgent domain (main.rs install)
+libc = "0.2"
+# the web face shares the RDP certificate (same TlsAcceptor type ironrdp-server uses)
+tokio-rustls = { version = "0.26", default-features = false }
+# self-signed certificate on first start (MIT/Apache-2.0)
+rcgen = "0.14"
+# ScreenCaptureKit and friends (objc2 bindings, MIT)
+objc2 = "0.6"
+block2 = "0.6"
+dispatch2 = "0.3"
+objc2-foundation = "0.3"
+objc2-core-foundation = "0.3"
+objc2-core-media = { version = "0.3", features = ["objc2-core-audio-types"] }
+objc2-core-audio-types = "0.3"
+# CoreAudio process tap: the system sound, muted on the Mac while the client listens (tap.rs)
+objc2-core-audio = "0.3"
+objc2-core-video = "0.3"
+objc2-core-graphics = "0.3"
+objc2-screen-capture-kit = "0.3"
+objc2-video-toolbox = "0.3"
+# NSPasteboard (clip.rs)
+objc2-app-kit = "0.3"
+
+[profile.release]
+opt-level = 3
+strip = true

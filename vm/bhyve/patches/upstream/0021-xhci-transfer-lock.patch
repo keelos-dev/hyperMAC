@@ -1,0 +1,70 @@
+bhyve: xhci: do not lock a transfer again that is already locked
+
+pci_xhci_handle_transfer() takes the endpoint's transfer lock
+(USB_DATA_XFER_LOCK) and, for every endpoint but the control endpoint,
+calls pci_xhci_try_usb_xfer(), which takes the same lock.
+
+With FreeBSD's default (error-checking) mutexes the second lock fails
+with EDEADLK, which is ignored; the unlock at the end of
+pci_xhci_try_usb_xfer() then releases the caller's lock, so the rest of
+pci_xhci_handle_transfer(), including a retry with the next TRBs, runs
+without it, and its own unlock fails with EPERM.  Nothing breaks only
+because every caller also holds the controller's mutex.  With a normal
+mutex the thread deadlocks at the first interrupt transfer.
+
+Split the body of pci_xhci_try_usb_xfer() into
+pci_xhci_try_usb_xfer_locked() for the caller that holds the lock.
+
+--- a/usr.sbin/bhyve/pci_xhci.c
++++ b/usr.sbin/bhyve/pci_xhci.c
+@@ -1707,7 +1707,7 @@
+  * the transfer again to see if it succeeds.
+  */
+ static int
+-pci_xhci_try_usb_xfer(struct pci_xhci_softc *sc,
++pci_xhci_try_usb_xfer_locked(struct pci_xhci_softc *sc,
+     struct pci_xhci_dev_emu *dev, struct pci_xhci_dev_ep *devep,
+     struct xhci_endp_ctx *ep_ctx, uint32_t slot, uint32_t epid)
+ {
+@@ -1722,7 +1722,6 @@
+ 	do_intr = 0;
+ 
+ 	xfer = devep->ep_xfer;
+-	USB_DATA_XFER_LOCK(xfer);
+ 
+ 	/* outstanding requests queued up */
+ 	if (dev->dev_ue->ue_data != NULL) {
+@@ -1745,8 +1744,22 @@
+ 		}
+ 	}
+ 
+-	USB_DATA_XFER_UNLOCK(xfer);
++	return (err);
++}
++
++/* The same for a caller that does not hold the transfer's lock. */
++static int
++pci_xhci_try_usb_xfer(struct pci_xhci_softc *sc,
++    struct pci_xhci_dev_emu *dev, struct pci_xhci_dev_ep *devep,
++    struct xhci_endp_ctx *ep_ctx, uint32_t slot, uint32_t epid)
++{
++	struct usb_data_xfer *xfer;
++	int		err;
+ 
++	xfer = devep->ep_xfer;
++	USB_DATA_XFER_LOCK(xfer);
++	err = pci_xhci_try_usb_xfer_locked(sc, dev, devep, ep_ctx, slot, epid);
++	USB_DATA_XFER_UNLOCK(xfer);
+ 
+ 	return (err);
+ }
+@@ -1916,7 +1929,8 @@
+ 
+ 	} else {
+ 		/* handle data transfer */
+-		pci_xhci_try_usb_xfer(sc, dev, devep, ep_ctx, slot, epid);
++		pci_xhci_try_usb_xfer_locked(sc, dev, devep, ep_ctx, slot,
++		    epid);
+ 		err = XHCI_TRB_ERROR_SUCCESS;
+ 	}
+ 

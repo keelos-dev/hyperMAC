@@ -1,0 +1,24 @@
+[package]
+name = "hypermac"
+version = "0.1.0"
+edition = "2024"
+description = "Run macOS and Linux guests on an Apple Silicon Mac, headless (Virtualization.framework)"
+publish = false
+
+[dependencies]
+anyhow = "1"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+objc2 = "0.6"
+block2 = "0.6"
+dispatch2 = "0.3"
+objc2-foundation = "0.3"
+objc2-virtualization = "0.3"
+objc2-app-kit = "0.3"
+libc = "0.2"
+des = "0.8"
+objc2-core-graphics = "0.3"
+objc2-core-foundation = "0.3"
+
+[profile.release]
+opt-level = 3

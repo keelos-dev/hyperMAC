@@ -1,0 +1,117 @@
+bhyve/arm64: fw_cfg in the device tree; keep the device tree out of the boot ROM
+
+The device tree is built 1 MB above the start of RAM, where the boot ROM
+was just loaded: a ROM larger than 1 MB (EDK2 is 2 MB and more) had its
+second megabyte overwritten.  Put the device tree behind the ROM in that
+case.
+
+Give the platform the memory-mapped fw_cfg and describe it in the device
+tree ("qemu,fw-cfg-mmio"), where firmware and Linux look for it.
+
+--- a/usr.sbin/bhyve/aarch64/bhyverun_machdep.c
++++ b/usr.sbin/bhyve/aarch64/bhyverun_machdep.c
+@@ -54,6 +54,7 @@
+ #include "ipc.h"
+ #include "pci_emul.h"
+ #include "pci_irq.h"
++#include "qemu_fwcfg.h"
+ #include "rtc_pl031.h"
+ #include "uart_emul.h"
+ 
+@@ -74,8 +75,12 @@
+ 	    nitems(config_options_machdep));
+ }
+ 
+-/* Start of mem + 1M */
++/*
++ * Start of mem + 1M, or behind the boot ROM if that is larger (rounded up to
++ * 2M: firmware maps itself with blocks of that size).
++ */
+ #define	FDT_BASE	0x100000
++#define	FDT_ALIGN	0x200000
+ #define	FDT_SIZE	(64 * 1024)
+ 
+ /* Start of lowmem + 64K */
+@@ -84,6 +89,7 @@
+ #define	UART_INTR	32
+ #define	RTC_MMIO_BASE	0x11000
+ #define	RTC_MMIO_SIZE	0x1000
++#define	FWCFG_MMIO_BASE	0x12000
+ #define	RTC_INTR	33
+ 
+ #define	GIC_DIST_BASE		0x2f000000
+@@ -103,6 +109,8 @@
+ 
+ uint64_t *cpu_to_mpidr;
+ 
++static vm_paddr_t fdt_offset = FDT_BASE;
++
+ void
+ bhyve_init_config(void)
+ {
+@@ -274,6 +282,10 @@
+ 	if (munmap(data, size) != 0)
+ 		err(1, "munmap(%s)", path);
+ 
++	/* The device tree must not land in the image. */
++	if ((vm_paddr_t)size > FDT_BASE)
++		fdt_offset = roundup2((vm_paddr_t)size, FDT_ALIGN);
++
+ 	*elrp = loadaddr;
+ }
+ 
+@@ -400,7 +412,7 @@
+ static vm_paddr_t
+ fdt_gpa(struct vmctx *ctx)
+ {
+-	return (vm_get_highmem_base(ctx) + FDT_BASE);
++	return (vm_get_highmem_base(ctx) + fdt_offset);
+ }
+ 
+ int
+@@ -467,6 +479,9 @@
+ 		return (error);
+ 	init_mmio_rtc(ctx);
+ 	fdt_add_rtc(RTC_MMIO_BASE, RTC_MMIO_SIZE, RTC_INTR);
++	/* qemu_fwcfg_init() registers it; firmware finds it in the device tree */
++	qemu_fwcfg_enable_mmio(FWCFG_MMIO_BASE);
++	fdt_add_fwcfg(FWCFG_MMIO_BASE, QEMU_FWCFG_MMIO_SIZE);
+ 	fdt_add_timer();
+ 	pci_irq_init(pcie_intrs);
+ 	fdt_add_pcie(pcie_intrs);
+--- a/usr.sbin/bhyve/aarch64/fdt.c
++++ b/usr.sbin/bhyve/aarch64/fdt.c
+@@ -296,6 +296,23 @@
+ }
+ 
+ void
++fdt_add_fwcfg(uint64_t fwcfg_base, uint64_t fwcfg_size)
++{
++	void *fdt;
++	char node_name[32];
++
++	fdt = fdtroot;
++
++	snprintf(node_name, sizeof(node_name), "fw-cfg@%lx",
++	    (unsigned long)fwcfg_base);
++	fdt_begin_node(fdt, node_name);
++	fdt_property_string(fdt, "compatible", "qemu,fw-cfg-mmio");
++	set_single_reg(fdt, fwcfg_base, fwcfg_size);
++	fdt_property(fdt, "dma-coherent", NULL, 0);
++	fdt_end_node(fdt);
++}
++
++void
+ fdt_add_timer(void)
+ {
+ 	void *fdt, *interrupts;
+--- a/usr.sbin/bhyve/aarch64/fdt.h
++++ b/usr.sbin/bhyve/aarch64/fdt.h
+@@ -45,6 +45,7 @@
+ void	fdt_add_pcie(int intrs[static 4]);
+ void	fdt_add_uart(uint64_t uart_base, uint64_t uart_size, int intr);
+ void	fdt_add_rtc(uint64_t rtc_base, uint64_t rtc_size, int intr);
++void	fdt_add_fwcfg(uint64_t fwcfg_base, uint64_t fwcfg_size);
+ void	fdt_finalize(void);
+ 
+ #endif	/* _FDT_H_ */

@@ -1,0 +1,72 @@
+bhyve/arm64: a 64K PCI I/O space behind a translation
+
+On arm64 and riscv an I/O BAR held the CPU address its registers were
+at (0xdf000000 and up), and the device tree declared an I/O space of
+16 MB whose port numbers were those addresses.  Linux and FreeBSD cope,
+but firmware does not: EDK2's host bridge driver has a 64K I/O space
+and stops at an assertion.
+
+Do what other virtual platforms do: I/O BARs hold port numbers below
+64K, and the bridge maps port 0 to the CPU address 0xdf000000, which is
+what the device tree's "ranges" now says.
+
+--- a/usr.sbin/bhyve/pci_emul.c
++++ b/usr.sbin/bhyve/pci_emul.c
+@@ -138,8 +138,16 @@
+  */
+ #define	PCI_EMUL_MEMBASE32	0xc0000000
+ #elif defined(__aarch64__) || defined(__riscv)
+-#define	PCI_EMUL_IOBASE		0xdf000000UL
+-#define	PCI_EMUL_IOLIMIT	0xe0000000UL
++/*
++ * There are no I/O ports: the bridge turns accesses to 64K of memory at
++ * PCI_EMUL_IO_CPUBASE into I/O space accesses (the device tree's "ranges").
++ * I/O BARs hold port numbers, as on a PC; firmware and operating systems
++ * expect an I/O space of 64K, not one whose port numbers are CPU addresses.
++ */
++#define	PCI_EMUL_IOBASE		0x1000
++#define	PCI_EMUL_IOLIMIT	0x10000
++#define	PCI_EMUL_IOMASK		0xffff
++#define	PCI_EMUL_IO_CPUBASE	0xdf000000UL
+ #define	PCI_EMUL_MEMBASE32	0xa0000000UL
+ #else
+ #error Unsupported platform
+@@ -556,6 +564,7 @@
+ 
+ 	assert(bidx <= PCI_BARMAX);
+ 	assert(pdi->pi_bar[bidx].type == PCIBAR_IO);
++	addr -= PCI_EMUL_IO_CPUBASE;
+ 	assert(addr >= pdi->pi_bar[bidx].addr &&
+ 	       addr + size <= pdi->pi_bar[bidx].addr + pdi->pi_bar[bidx].size);
+ 	assert(size == 1 || size == 2 || size == 4);
+@@ -672,7 +681,7 @@
+ 
+ 		bzero(&mr, sizeof(struct mem_range));
+ 		mr.name = pi->pi_name;
+-		mr.base = bar->addr;
++		mr.base = PCI_EMUL_IO_CPUBASE + bar->addr;
+ 		mr.size = bar->size;
+ 		if (registration) {
+ 			mr.flags = MEM_F_RW;
+--- a/usr.sbin/bhyve/aarch64/fdt.c
++++ b/usr.sbin/bhyve/aarch64/fdt.c
+@@ -356,16 +356,17 @@
+ 	set_single_reg(fdt, 0xe0000000, 0x10000000);
+ 	fdt_property_placeholder(fdt, "ranges",
+ 	    2 * 7 * sizeof(uint32_t), &prop);
++	/* I/O space: ports 0 to 0xffff are the 64K at 0xdf000000 */
+ 	SET_PROP_U32(prop, 0, 0x01000000);
+ 
+ 	SET_PROP_U32(prop, 1, 0);
+-	SET_PROP_U32(prop, 2, 0xdf000000);
++	SET_PROP_U32(prop, 2, 0);
+ 
+ 	SET_PROP_U32(prop, 3, 0);
+ 	SET_PROP_U32(prop, 4, 0xdf000000);
+ 
+ 	SET_PROP_U32(prop, 5, 0);
+-	SET_PROP_U32(prop, 6, 0x01000000);
++	SET_PROP_U32(prop, 6, 0x00010000);
+ 
+ 	SET_PROP_U32(prop, 7, 0x02000000);
+ 

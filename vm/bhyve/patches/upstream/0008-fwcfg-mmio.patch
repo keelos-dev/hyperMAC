@@ -1,0 +1,341 @@
+bhyve: qemu_fwcfg: memory-mapped interface, DMA and writable files
+
+fw_cfg was only reachable through the two I/O ports, so only on amd64.
+Add the memory-mapped interface that QEMU's "virt" machines have (data
+register, big-endian selector, DMA address), for platforms without I/O
+ports: a platform asks for it with qemu_fwcfg_enable_mmio(base) before
+qemu_fwcfg_init().
+
+The DMA interface comes with it (the ID item says so): firmware reads
+large files such as ACPI tables in one request instead of a byte per
+exit, and it is the only way a guest can write.  A file added with
+qemu_fwcfg_add_file_writable() gets the guest's writes and a callback.
+
+--- a/usr.sbin/bhyve/qemu_fwcfg.c
++++ b/usr.sbin/bhyve/qemu_fwcfg.c
+@@ -22,6 +22,7 @@
+ 
+ #include "acpi_device.h"
+ #include "bhyverun.h"
++#include "mem.h"
+ #ifdef __amd64__
+ #include "amd64/inout.h"
+ #include "amd64/pci_lpc.h"
+@@ -39,6 +40,23 @@
+ #define QEMU_FWCFG_DATA_PORT_FLAGS \
+ 	IOPORT_F_INOUT /* QEMU v2.4+ ignores writes */
+ 
++/*
++ * The memory-mapped interface of platforms without I/O ports: the data
++ * register at 0 (any access width, bytes in stream order), the selector at 8
++ * (16 bits, big endian) and the address of a DMA request at 16 (64 bits, big
++ * endian; writing its low half starts the request).
++ */
++#define QEMU_FWCFG_MMIO_DATA 0x00
++#define QEMU_FWCFG_MMIO_SELECTOR 0x08
++#define QEMU_FWCFG_MMIO_DMA 0x10
++
++#define QEMU_FWCFG_DMA_SIGNATURE 0x51454d5520434647UL /* "QEMU CFG" */
++#define QEMU_FWCFG_DMA_CTL_ERROR 0x01
++#define QEMU_FWCFG_DMA_CTL_READ 0x02
++#define QEMU_FWCFG_DMA_CTL_SKIP 0x04
++#define QEMU_FWCFG_DMA_CTL_SELECT 0x08
++#define QEMU_FWCFG_DMA_CTL_WRITE 0x10
++
+ #define QEMU_FWCFG_ARCHITECTURE_MASK 0x0001
+ #define QEMU_FWCFG_INDEX_MASK 0x3FFF
+ 
+@@ -91,6 +109,12 @@
+ 	struct qemu_fwcfg_file files[0];
+ };
+ 
++struct qemu_fwcfg_dma_access {
++	uint32_t be_control;
++	uint32_t be_length;
++	uint64_t be_address;
++};
++
+ #pragma pack()
+ 
+ struct qemu_fwcfg_softc {
+@@ -101,6 +125,9 @@
+ 	struct qemu_fwcfg_item items[QEMU_FWCFG_MAX_ARCHS]
+ 				    [QEMU_FWCFG_MAX_ENTRIES];
+ 	struct qemu_fwcfg_directory *directory;
++	struct vmctx *ctx;
++	uint64_t mmio_base; /* 0: no memory-mapped interface */
++	uint64_t dma_address;
+ };
+ 
+ static struct qemu_fwcfg_softc fwcfg_sc;
+@@ -183,6 +210,141 @@
+ 	return (0);
+ }
+ #endif
++
++/* The selected item, or NULL if there is none with that key. */
++static struct qemu_fwcfg_item *
++qemu_fwcfg_selected_item(void)
++{
++	struct qemu_fwcfg_item *const item =
++	    &fwcfg_sc.items[fwcfg_sc.selector.architecture]
++			   [fwcfg_sc.selector.index];
++
++	return (item->data != NULL ? item : NULL);
++}
++
++/*
++ * One DMA request: the guest gives the address of a qemu_fwcfg_dma_access,
++ * we do what it says and store the result in its control field (0, or
++ * the error bit).
++ */
++static void
++qemu_fwcfg_dma(struct vmctx *const ctx, const uint64_t gpa)
++{
++	struct qemu_fwcfg_dma_access *const access = paddr_guest2host(ctx, gpa,
++	    sizeof(struct qemu_fwcfg_dma_access));
++	struct qemu_fwcfg_item *item;
++	uint32_t control, length, avail;
++	uint8_t *buf;
++
++	if (access == NULL)
++		return;
++	control = be32toh(access->be_control);
++	length = be32toh(access->be_length);
++
++	if (control & QEMU_FWCFG_DMA_CTL_SELECT) {
++		fwcfg_sc.selector.bits = control >> 16;
++		fwcfg_sc.data_offset = 0;
++	}
++	item = qemu_fwcfg_selected_item();
++	avail = (item != NULL && fwcfg_sc.data_offset < item->size) ?
++	    item->size - fwcfg_sc.data_offset : 0;
++
++	if (control & (QEMU_FWCFG_DMA_CTL_READ | QEMU_FWCFG_DMA_CTL_WRITE)) {
++		buf = paddr_guest2host(ctx, be64toh(access->be_address),
++		    length);
++		if (buf == NULL && length != 0) {
++			access->be_control = htobe32(QEMU_FWCFG_DMA_CTL_ERROR);
++			return;
++		}
++		if (control & QEMU_FWCFG_DMA_CTL_READ) {
++			/* past the end of the item reads as zeros */
++			memset(buf, 0, length);
++			memcpy(buf, item != NULL ?
++			    item->data + fwcfg_sc.data_offset : NULL,
++			    MIN(length, avail));
++		} else {
++			if (item == NULL || item->write == NULL ||
++			    length > avail) {
++				access->be_control =
++				    htobe32(QEMU_FWCFG_DMA_CTL_ERROR);
++				return;
++			}
++			memcpy(item->data + fwcfg_sc.data_offset, buf, length);
++			item->write(item->write_arg);
++		}
++	}
++	/* a read, a write and a skip all move on in the item */
++	if (control & (QEMU_FWCFG_DMA_CTL_READ | QEMU_FWCFG_DMA_CTL_WRITE |
++	    QEMU_FWCFG_DMA_CTL_SKIP))
++		fwcfg_sc.data_offset += length;
++	access->be_control = 0;
++}
++
++static int
++qemu_fwcfg_mmio_handler(struct vcpu *const vcpu __unused, const int dir,
++    const uint64_t addr, const int size, uint64_t *const val,
++    void *const arg1 __unused, const long arg2 __unused)
++{
++	const uint64_t offset = addr - fwcfg_sc.mmio_base;
++	struct qemu_fwcfg_item *item;
++	uint64_t value;
++
++	if (dir == MEM_F_READ) {
++		value = 0;
++		if (offset < QEMU_FWCFG_MMIO_SELECTOR) {
++			/*
++			 * The next `size` bytes of the item, so that the
++			 * guest's (little endian) register holds them in
++			 * the order of the stream.
++			 */
++			item = qemu_fwcfg_selected_item();
++			for (int i = 0; i < size; i++) {
++				if (item != NULL &&
++				    fwcfg_sc.data_offset < item->size)
++					value |= (uint64_t)item->data[
++					    fwcfg_sc.data_offset] << (8 * i);
++				fwcfg_sc.data_offset++;
++			}
++		} else if (offset >= QEMU_FWCFG_MMIO_DMA &&
++		    offset + size <= QEMU_FWCFG_MMIO_DMA + 8) {
++			/* the signature that says the DMA interface exists */
++			const uint64_t be_sig =
++			    htobe64(QEMU_FWCFG_DMA_SIGNATURE);
++
++			memcpy(&value, (const uint8_t *)&be_sig +
++			    (offset - QEMU_FWCFG_MMIO_DMA), size);
++		}
++		*val = value;
++		return (0);
++	}
++
++	value = *val;
++	if (offset == QEMU_FWCFG_MMIO_SELECTOR && size == 2) {
++		fwcfg_sc.selector.bits = be16toh(value);
++		fwcfg_sc.data_offset = 0;
++	} else if (offset == QEMU_FWCFG_MMIO_DMA && size == 8) {
++		fwcfg_sc.dma_address = be64toh(value);
++		qemu_fwcfg_dma(fwcfg_sc.ctx, fwcfg_sc.dma_address);
++	} else if (offset == QEMU_FWCFG_MMIO_DMA && size == 4) {
++		fwcfg_sc.dma_address = (uint64_t)be32toh(value) << 32;
++	} else if (offset == QEMU_FWCFG_MMIO_DMA + 4 && size == 4) {
++		fwcfg_sc.dma_address |= be32toh(value);
++		qemu_fwcfg_dma(fwcfg_sc.ctx, fwcfg_sc.dma_address);
++		fwcfg_sc.dma_address = 0;
++	}
++	/* writes to the data register are ignored, as QEMU does since 2.4 */
++	return (0);
++}
++
++/*
++ * A platform without I/O ports calls this before qemu_fwcfg_init() to have the
++ * memory-mapped interface at `base` (QEMU_FWCFG_MMIO_SIZE bytes).
++ */
++void
++qemu_fwcfg_enable_mmio(const uint64_t base)
++{
++	fwcfg_sc.mmio_base = base;
++}
+ 
+ static int
+ qemu_fwcfg_add_item(const uint16_t architecture, const uint16_t index,
+@@ -236,7 +398,7 @@
+ 	}
+ 
+ 	fwcfg_id->interface = 1;
+-	fwcfg_id->DMA = 0;
++	fwcfg_id->DMA = fwcfg_sc.mmio_base != 0;
+ 
+ 	uint32_t *const le_fwcfg_id_ptr = (uint32_t *)fwcfg_id;
+ 	*le_fwcfg_id_ptr = htole32(*le_fwcfg_id_ptr);
+@@ -400,7 +562,23 @@
+ 	fwcfg_sc.items[0][QEMU_FWCFG_INDEX_FILE_DIR].size =
+ 	    sizeof(struct qemu_fwcfg_directory) +
+ 	    count * sizeof(struct qemu_fwcfg_file);
++
++	return (0);
++}
++
++/* A file the guest may also write (through the DMA interface). */
++int
++qemu_fwcfg_add_file_writable(const char *name, const uint32_t size,
++    void *const data, qemu_fwcfg_write_t *const write, void *const arg)
++{
++	const uint32_t index = QEMU_FWCFG_FIRST_FILE_INDEX +
++	    be32toh(fwcfg_sc.directory->be_count);
++	const int error = qemu_fwcfg_add_file(name, size, data);
+ 
++	if (error != 0)
++		return (error);
++	fwcfg_sc.items[QEMU_FWCFG_ARCHITECTURE_GENERIC][index].write = write;
++	fwcfg_sc.items[QEMU_FWCFG_ARCHITECTURE_GENERIC][index].write_arg = arg;
+ 	return (0);
+ }
+ 
+@@ -431,15 +609,17 @@
+ 	int error;
+ 	bool fwcfg_enabled;
+ 
++	fwcfg_sc.ctx = ctx;
++
+ 	/*
+-	 * The fwcfg implementation currently only provides an I/O port
+-	 * interface and thus is amd64-specific for now.  An MMIO interface is
+-	 * required for other platforms.
++	 * On amd64 the interface is the two I/O ports, if the LPC bridge is
++	 * configured for it.  Other platforms have the memory-mapped interface
++	 * where they asked for it with qemu_fwcfg_enable_mmio().
+ 	 */
+ #ifdef __amd64__
+ 	fwcfg_enabled = strcmp(lpc_fwcfg(), "qemu") == 0;
+ #else
+-	fwcfg_enabled = false;
++	fwcfg_enabled = fwcfg_sc.mmio_base != 0;
+ #endif
+ 
+ 	/*
+@@ -457,6 +637,7 @@
+ 			goto done;
+ 		}
+ 
++#ifdef __amd64__
+ 		error = acpi_device_add_res_fixed_ioport(fwcfg_sc.acpi_dev,
+ 		    QEMU_FWCFG_SELECTOR_PORT_NUMBER, 2);
+ 		if (error) {
+@@ -465,7 +646,6 @@
+ 			goto done;
+ 		}
+ 
+-#ifdef __amd64__
+ 		if ((error = qemu_fwcfg_register_port("qemu_fwcfg_selector",
+ 		    QEMU_FWCFG_SELECTOR_PORT_NUMBER,
+ 		    QEMU_FWCFG_SELECTOR_PORT_SIZE,
+@@ -485,6 +665,28 @@
+ 			    __func__, QEMU_FWCFG_DATA_PORT_NUMBER);
+ 			goto done;
+ 		}
++#else
++		struct mem_range mr;
++
++		error = acpi_device_add_res_fixed_memory32(fwcfg_sc.acpi_dev,
++		    false, fwcfg_sc.mmio_base, QEMU_FWCFG_MMIO_SIZE);
++		if (error) {
++			warnx("%s: failed to add the memory range of QEMU FwCfg",
++			    __func__);
++			goto done;
++		}
++
++		bzero(&mr, sizeof(mr));
++		mr.name = "qemu_fwcfg";
++		mr.base = fwcfg_sc.mmio_base;
++		mr.size = QEMU_FWCFG_MMIO_SIZE;
++		mr.flags = MEM_F_RW;
++		mr.handler = qemu_fwcfg_mmio_handler;
++		if ((error = register_mem(&mr)) != 0) {
++			warnx("%s: Unable to register qemu fwcfg at 0x%lx",
++			    __func__, (unsigned long)fwcfg_sc.mmio_base);
++			goto done;
++		}
+ #endif
+ 	}
+ 
+--- a/usr.sbin/bhyve/qemu_fwcfg.h
++++ b/usr.sbin/bhyve/qemu_fwcfg.h
+@@ -15,12 +15,26 @@
+ 
+ #define QEMU_FWCFG_FILE_TABLE_LOADER "etc/table-loader"
+ 
++/*
++ * Called after the guest has written to a file (only possible through the DMA
++ * interface): the file's data holds what it wrote.
++ */
++typedef void qemu_fwcfg_write_t(void *arg);
++
+ struct qemu_fwcfg_item {
+ 	uint32_t size;
+ 	uint8_t *data;
++	qemu_fwcfg_write_t *write;
++	void *write_arg;
+ };
+ 
++/* The size of the memory-mapped interface: data, selector, DMA address. */
++#define QEMU_FWCFG_MMIO_SIZE 0x18
++
+ int qemu_fwcfg_add_file(const char *name,
+     const uint32_t size, void *const data);
++int qemu_fwcfg_add_file_writable(const char *name, const uint32_t size,
++    void *const data, qemu_fwcfg_write_t *const write, void *const arg);
++void qemu_fwcfg_enable_mmio(const uint64_t base);
+ int qemu_fwcfg_init(struct vmctx *const ctx);
+ int qemu_fwcfg_parse_cmdline_arg(const char *opt);

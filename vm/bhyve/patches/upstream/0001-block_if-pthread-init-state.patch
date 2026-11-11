@@ -1,0 +1,62 @@
+bhyve: block_if: do not compare pthread objects with NULL
+
+blockif_open()'s error path decides what to destroy by comparing the
+mutex and the condition variables with NULL.  That only compiles where
+pthread_mutex_t and pthread_cond_t are pointers, and it is not what was
+meant either: on FreeBSD a statically zeroed mutex is also NULL before
+its first use.  Record which objects were initialized instead.
+
+--- a/usr.sbin/bhyve/block_if.c
++++ b/usr.sbin/bhyve/block_if.c
+@@ -502,6 +502,7 @@
+ 	off_t size, psectsz, psectoff;
+ 	int extra, fd, i, sectsz;
+ 	int ro, candelete, geom, ssopt, pssopt;
++	bool mtx_init, cond_init, work_done_cond_init;
+ 	int nodelete;
+ 	int bootindex;
+ 
+@@ -515,6 +516,7 @@
+ 	bc = NULL;
+ 	fd = -1;
+ 	extra = 0;
++	mtx_init = cond_init = work_done_cond_init = false;
+ 	ssopt = 0;
+ 	ro = 0;
+ 	nodelete = 0;
+@@ -670,11 +672,14 @@
+ 	bc->bc_psectoff = psectoff;
+ 	if (pthread_mutex_init(&bc->bc_mtx, NULL) != 0)
+ 		goto err;
++	mtx_init = true;
+ 	if (pthread_cond_init(&bc->bc_cond, NULL) != 0)
+ 		goto err;
++	cond_init = true;
+ 	bc->bc_paused = 0;
+ 	if (pthread_cond_init(&bc->bc_work_done_cond, NULL) != 0)
+ 		goto err;
++	work_done_cond_init = true;
+ 	TAILQ_INIT(&bc->bc_freeq);
+ 	TAILQ_INIT(&bc->bc_pendq);
+ 	TAILQ_INIT(&bc->bc_busyq);
+@@ -697,7 +702,7 @@
+ err:
+ 	if (bc != NULL) {
+ 		void *jval;
+-		if (bc->bc_cond != NULL) {
++		if (cond_init) {
+ 			pthread_mutex_lock(&bc->bc_mtx);
+ 			bc->bc_closing = 1;
+ 			pthread_mutex_unlock(&bc->bc_mtx);
+@@ -707,9 +712,9 @@
+ 					pthread_join(bc->bc_btid[i], &jval);
+ 			pthread_cond_destroy(&bc->bc_cond);
+ 		}
+-		if (bc->bc_mtx != NULL)
++		if (mtx_init)
+ 			pthread_mutex_destroy(&bc->bc_mtx);
+-		if (bc->bc_work_done_cond != NULL)
++		if (work_done_cond_init)
+ 			pthread_cond_destroy(&bc->bc_work_done_cond);
+ 		free(bc);
+ 	}

@@ -1,0 +1,141 @@
+diff --git a/ArmVirtPkg/ArmVirtQemuFvMain.fdf.inc b/ArmVirtPkg/ArmVirtQemuFvMain.fdf.inc
+index ad158f5..ab14519 100644
+--- a/ArmVirtPkg/ArmVirtQemuFvMain.fdf.inc
++++ b/ArmVirtPkg/ArmVirtQemuFvMain.fdf.inc
+@@ -138,6 +138,9 @@ READ_LOCK_STATUS   = TRUE
+   # NVME Driver
+   #
+   INF MdeModulePkg/Bus/Pci/NvmExpressDxe/NvmExpressDxe.inf
++  INF MdeModulePkg/Bus/Pci/SataControllerDxe/SataControllerDxe.inf
++  INF MdeModulePkg/Bus/Ata/AtaAtapiPassThru/AtaAtapiPassThru.inf
++  INF MdeModulePkg/Bus/Ata/AtaBusDxe/AtaBusDxe.inf
+ 
+   #
+   # SMBIOS Support
+diff --git a/ArmVirtPkg/ArmVirtQemuKernel.dsc b/ArmVirtPkg/ArmVirtQemuKernel.dsc
+index 7fdb3b5..83d7d1c 100644
+--- a/ArmVirtPkg/ArmVirtQemuKernel.dsc
++++ b/ArmVirtPkg/ArmVirtQemuKernel.dsc
+@@ -343,6 +343,14 @@
+   #
+   MdeModulePkg/Bus/Pci/NvmExpressDxe/NvmExpressDxe.inf
+ 
++  #
++  # SATA (AHCI) controllers: bhyve presents CD-ROMs, the Windows install medium among them,
++  # as ATAPI devices on one. QEMU virt has no SATA, so this platform does not include them.
++  #
++  MdeModulePkg/Bus/Pci/SataControllerDxe/SataControllerDxe.inf
++  MdeModulePkg/Bus/Ata/AtaAtapiPassThru/AtaAtapiPassThru.inf
++  MdeModulePkg/Bus/Ata/AtaBusDxe/AtaBusDxe.inf
++
+   #
+   # SMBIOS Support
+   #
+diff --git a/OvmfPkg/QemuRamfbDxe/QemuRamfb.c b/OvmfPkg/QemuRamfbDxe/QemuRamfb.c
+index 5a1044f..ff3c711 100644
+--- a/OvmfPkg/QemuRamfbDxe/QemuRamfb.c
++++ b/OvmfPkg/QemuRamfbDxe/QemuRamfb.c
+@@ -16,6 +16,7 @@
+ #include <Library/DevicePathLib.h>
+ #include <Library/FrameBufferBltLib.h>
+ #include <Library/MemoryAllocationLib.h>
++#include <Library/PcdLib.h>
+ #include <Library/UefiBootServicesTableLib.h>
+ #include <Library/QemuFwCfgLib.h>
+ 
+@@ -54,11 +55,21 @@ STATIC EFI_GRAPHICS_OUTPUT_MODE_INFORMATION  mQemuRamfbModeInfo[] = {
+     0,    // Version
+     1024, // HorizontalResolution
+     768,  // VerticalResolution
++  },{
++    //
++    // the hypervisor's own size (fw_cfg "opt/bhyve/ramfb-mode"), if it is
++    // none of the above: see InitializeQemuRamfb()
++    //
++    0,
++    0,
++    0,
+   }
+ };
+ 
++#define RAMFB_FIXED_MODES  (ARRAY_SIZE (mQemuRamfbModeInfo) - 1)
++
+ STATIC EFI_GRAPHICS_OUTPUT_PROTOCOL_MODE  mQemuRamfbMode = {
+-  ARRAY_SIZE (mQemuRamfbModeInfo),                // MaxMode
++  RAMFB_FIXED_MODES,                              // MaxMode
+   0,                                              // Mode
+   mQemuRamfbModeInfo,                             // Info
+   sizeof (EFI_GRAPHICS_OUTPUT_MODE_INFORMATION),  // SizeOfInfo
+@@ -251,6 +262,8 @@ InitializeQemuRamfb (
+   UINTN                     FbSize, MaxFbSize, Pages;
+   UINTN                     FwCfgSize;
+   UINTN                     Index;
++  FIRMWARE_CONFIG_ITEM      ModeItem;
++  UINT32                    Width, Height;
+ 
+   if (!QemuFwCfgIsAvailable ()) {
+     DEBUG ((DEBUG_INFO, "Ramfb: no FwCfg\n"));
+@@ -272,8 +285,42 @@ InitializeQemuRamfb (
+     return EFI_PROTOCOL_ERROR;
+   }
+ 
++  //
++  // A hypervisor that wants one particular size (bhyve: the size of its
++  // framebuffer device) names it in the fw_cfg file "opt/bhyve/ramfb-mode":
++  // two little-endian UINT32, the width and the height. It becomes a mode of
++  // its own unless it is one of the fixed ones, and the mode the consoles use.
++  //
++  Status = QemuFwCfgFindFile ("opt/bhyve/ramfb-mode", &ModeItem, &FwCfgSize);
++  if (!EFI_ERROR (Status) && (FwCfgSize == 2 * sizeof (UINT32))) {
++    QemuFwCfgSelectItem (ModeItem);
++    Width  = QemuFwCfgRead32 ();
++    Height = QemuFwCfgRead32 ();
++    if ((Width >= 640) && (Width <= 8192) && (Height >= 480) && (Height <= 8192)) {
++      for (Index = 0; Index < RAMFB_FIXED_MODES; Index++) {
++        if ((mQemuRamfbModeInfo[Index].HorizontalResolution == Width) &&
++            (mQemuRamfbModeInfo[Index].VerticalResolution == Height))
++        {
++          break;
++        }
++      }
++
++      if (Index == RAMFB_FIXED_MODES) {
++        mQemuRamfbModeInfo[Index].HorizontalResolution = Width;
++        mQemuRamfbModeInfo[Index].VerticalResolution   = Height;
++        mQemuRamfbMode.MaxMode                         = RAMFB_FIXED_MODES + 1;
++      }
++
++      Status = PcdSet32S (PcdVideoHorizontalResolution, Width);
++      ASSERT_EFI_ERROR (Status);
++      Status = PcdSet32S (PcdVideoVerticalResolution, Height);
++      ASSERT_EFI_ERROR (Status);
++      DEBUG ((DEBUG_INFO, "Ramfb: the hypervisor asks for %ux%u\n", Width, Height));
++    }
++  }
++
+   MaxFbSize = 0;
+-  for (Index = 0; Index < ARRAY_SIZE (mQemuRamfbModeInfo); Index++) {
++  for (Index = 0; Index < mQemuRamfbMode.MaxMode; Index++) {
+     mQemuRamfbModeInfo[Index].PixelsPerScanLine =
+       mQemuRamfbModeInfo[Index].HorizontalResolution;
+     mQemuRamfbModeInfo[Index].PixelFormat =
+diff --git a/OvmfPkg/QemuRamfbDxe/QemuRamfbDxe.inf b/OvmfPkg/QemuRamfbDxe/QemuRamfbDxe.inf
+index e3890b8..7caa9b1 100644
+--- a/OvmfPkg/QemuRamfbDxe/QemuRamfbDxe.inf
++++ b/OvmfPkg/QemuRamfbDxe/QemuRamfbDxe.inf
+@@ -32,10 +32,15 @@
+   DevicePathLib
+   FrameBufferBltLib
+   MemoryAllocationLib
++  PcdLib
+   UefiBootServicesTableLib
+   UefiDriverEntryPoint
+   QemuFwCfgLib
+ 
++[Pcd]
++  gEfiMdeModulePkgTokenSpaceGuid.PcdVideoHorizontalResolution  ## PRODUCES
++  gEfiMdeModulePkgTokenSpaceGuid.PcdVideoVerticalResolution    ## PRODUCES
++
+ [Protocols]
+   gEfiGraphicsOutputProtocolGuid                ## PRODUCES
+ 

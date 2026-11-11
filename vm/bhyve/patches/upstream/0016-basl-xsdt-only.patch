@@ -1,0 +1,37 @@
+bhyve: basl: no RSDT where the guest has no memory below 4 GB
+
+Every table registered with basl gets an entry in both the RSDT and the
+XSDT.  The RSDT's entries are 32 bits wide, and firmware that follows
+QEMU's table-loader script (EDK2) allocates a table below 4 GB as soon
+as one pointer to it is that narrow.  An arm64 or riscv guest has no
+memory there, so nothing could be installed.  Build the RSDT on amd64
+only; ACPI needs just the XSDT.
+
+--- a/usr.sbin/bhyve/basl.c
++++ b/usr.sbin/bhyve/basl.c
+@@ -412,7 +412,13 @@
+ int
+ basl_init(struct vmctx *const ctx)
+ {
++#ifdef __amd64__
++	/*
++	 * Only where the guest has memory below 4 GB: the RSDT's 32-bit
++	 * pointers would force the firmware to put every table there.
++	 */
+ 	BASL_EXEC(basl_init_rsdt(ctx));
++#endif
+ 	BASL_EXEC(basl_init_xsdt(ctx));
+ 	BASL_EXEC(
+ 	    qemu_loader_create(&basl_loader, QEMU_FWCFG_FILE_TABLE_LOADER));
+@@ -693,8 +699,9 @@
+ 
+ 	header = (const ACPI_TABLE_HEADER *)table->data;
+ 
+-	BASL_EXEC(basl_table_append_pointer(rsdt, header->Signature,
+-	    ACPI_RSDT_ENTRY_SIZE));
++	if (rsdt != NULL)
++		BASL_EXEC(basl_table_append_pointer(rsdt, header->Signature,
++		    ACPI_RSDT_ENTRY_SIZE));
+ 	BASL_EXEC(basl_table_append_pointer(xsdt, header->Signature,
+ 	    ACPI_XSDT_ENTRY_SIZE));
+ 

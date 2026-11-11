@@ -1,0 +1,35 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- hyperMAC: a manual Windows 11 arm64 install on the bhyve engine (vm/src/bhyve.rs, create
+     with the manual option). Setup asks everything itself (language, edition, disk, account);
+     this file only does what the user cannot: switches off setup's hardware checks when the
+     machine does not meet them (LABCONFIG_PASS, bhyve.rs `labconfig`), installs virtio-win's drivers (\drivers on this CD, \hypermac.cmd) at
+     the specialize pass so the first-run setup has a network, and lets that setup go on
+     without one.
+     Never two hyphens in a row in this comment: that is not XML, and setup then quits without
+     a word and WinPE reboots (2026-11-11). -->
+<unattend xmlns="urn:schemas-microsoft-com:unattend" xmlns:wcm="http://schemas.microsoft.com/WMIConfig/2002/State">
+{{LABCONFIG_PASS}}  <settings pass="specialize">
+    <component name="Microsoft-Windows-Deployment" processorArchitecture="arm64" publicKeyToken="31bf3856ad364e35" language="neutral" versionScope="nonSxS">
+      <RunSynchronous>
+        <RunSynchronousCommand wcm:action="add">
+          <Order>1</Order>
+          <Path>reg add HKLM\SOFTWARE\Microsoft\Windows\CurrentVersion\OOBE /v BypassNRO /t REG_DWORD /d 1 /f</Path>
+        </RunSynchronousCommand>
+        <RunSynchronousCommand wcm:action="add">
+          <Order>2</Order>
+          <Path>cmd /c "for %d in (D E F G H I J K L M N O P) do @if exist %d:\hypermac.cmd call %d:\hypermac.cmd %d os"</Path>
+        </RunSynchronousCommand>
+        <!-- the display never turns off and the machine never sleeps: with the display off the
+             power button (hyperMAC's Stop) only wakes it instead of shutting down -->
+        <RunSynchronousCommand wcm:action="add">
+          <Order>3</Order>
+          <Path>powercfg /change monitor-timeout-ac 0</Path>
+        </RunSynchronousCommand>
+        <RunSynchronousCommand wcm:action="add">
+          <Order>4</Order>
+          <Path>powercfg /change standby-timeout-ac 0</Path>
+        </RunSynchronousCommand>
+      </RunSynchronous>
+    </component>
+  </settings>
+</unattend>

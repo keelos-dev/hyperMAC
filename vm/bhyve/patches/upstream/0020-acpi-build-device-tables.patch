@@ -1,0 +1,43 @@
+bhyve: acpi: let a platform build the registered devices' tables
+
+acpi_tables_add_device() collects the ACPI devices (today: the TPM), and
+only amd64's acpi_build() walks the list.  Give the walk a name,
+acpi_tables_build_devices(), so that a platform with its own table
+builder (arm64) gets the TPM2 table too.
+
+--- a/usr.sbin/bhyve/acpi.c
++++ b/usr.sbin/bhyve/acpi.c
+@@ -127,7 +127,23 @@
+ };
+ static SLIST_HEAD(acpi_device_list,
+     acpi_device_list_entry) acpi_devices = SLIST_HEAD_INITIALIZER(acpi_devices);
++
++/*
++ * The tables of the registered devices (a TPM's TPM2 table), for a platform that builds its
++ * tables itself.
++ */
++int
++acpi_tables_build_devices(void)
++{
++	const struct acpi_device_list_entry *entry;
+ 
++	SLIST_FOREACH(entry, &acpi_devices, chain) {
++		BASL_EXEC(acpi_device_build_table(entry->dev));
++	}
++
++	return (0);
++}
++
+ int
+ acpi_tables_add_device(const struct acpi_device *const dev)
+ {
+--- a/usr.sbin/bhyve/acpi.h
++++ b/usr.sbin/bhyve/acpi.h
+@@ -56,6 +56,7 @@
+ int	acpi_build(struct vmctx *ctx, int ncpu);
+ void	acpi_raise_gpe(struct vmctx *ctx, unsigned bit);
+ int 	acpi_tables_add_device(const struct acpi_device *const dev);
++int	acpi_tables_build_devices(void);
+ int	acpi_add_vcpu_affinity(int vcpuid, int domain);
+ void	dsdt_line(const char *fmt, ...) __printflike(1, 2);
+ void	dsdt_fixed_ioport(uint16_t iobase, uint16_t length);

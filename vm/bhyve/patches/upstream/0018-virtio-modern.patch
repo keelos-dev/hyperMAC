@@ -1,0 +1,491 @@
+bhyve: virtio: the virtio 1.0 register interface next to the legacy one
+
+bhyve's virtio devices have only the legacy interface: registers in an
+I/O BAR.  A guest that cannot use I/O BARs has no way to drive them;
+Windows on arm64 loads the virtio driver and then fails to start the
+device.
+
+Add the virtio 1.0 ("modern") interface in a memory BAR, described by
+the four vendor capabilities, so that every device that uses
+vi_set_io_bar() becomes a transitional device: common configuration
+with 64-bit features and the three queue addresses, notification, ISR
+and the device's own configuration.  VIRTIO_F_VERSION_1 is offered there
+and passed to the device model's vc_apply_features(); virtio-net uses
+the 12-byte header when it is negotiated.  The legacy interface is
+unchanged; virtio.modern=false leaves the new one out.
+
+pci_emul_add_capability() is exported for the capabilities.
+
+--- a/usr.sbin/bhyve/virtio.c
++++ b/usr.sbin/bhyve/virtio.c
+@@ -33,6 +33,8 @@
+ #include <machine/atomic.h>
+ 
+ #include <dev/virtio/pci/virtio_pci_legacy_var.h>
++#include <dev/virtio/pci/virtio_pci_modern_var.h>
++#include <dev/virtio/virtio_config.h>
+ 
+ #include <stdio.h>
+ #include <stdint.h>
+@@ -41,6 +43,7 @@
+ #include <pthread_np.h>
+ 
+ #include "bhyverun.h"
++#include "config.h"
+ #include "debug.h"
+ #include "pci_emul.h"
+ #ifdef BHYVE_SNAPSHOT
+@@ -80,6 +83,7 @@
+ 	pi->pi_arg = vs;
+ 
+ 	pthread_mutex_init(&vs->vs_isr_mtx, NULL);
++	vs->vs_modern_bar = -1;
+ 
+ 	vs->vs_queues = queues;
+ 	for (i = 0; i < vc->vc_nvq; i++) {
+@@ -114,8 +118,13 @@
+ 		vq->vq_save_used = 0;
+ 		vq->vq_pfn = 0;
+ 		vq->vq_msix_idx = VIRTIO_MSI_NO_VECTOR;
++		if (vq->vq_qsize_max != 0)
++			vq->vq_qsize = vq->vq_qsize_max;
++		vq->vq_desc_gpa = vq->vq_avail_gpa = vq->vq_used_gpa = 0;
+ 	}
+ 	vs->vs_negotiated_caps = 0;
++	vs->vs_dfsel = vs->vs_gfsel = 0;
++	vs->vs_driver_features = 0;
+ 	vs->vs_curq = 0;
+ 	/* vs->vs_status = 0; -- redundant */
+ 	pthread_mutex_lock(&vs->vs_isr_mtx);
+@@ -126,6 +135,8 @@
+ 	vs->vs_msix_cfg_idx = VIRTIO_MSI_NO_VECTOR;
+ }
+ 
++static void vi_modern_init(struct virtio_softc *vs);
++
+ /*
+  * Set I/O BAR (usually 0) to map PCI config registers.
+  */
+@@ -140,9 +151,327 @@
+ 	 */
+ 	size = VIRTIO_PCI_CONFIG_OFF(1) + vs->vs_vc->vc_cfgsize;
+ 	pci_emul_alloc_bar(vs->vs_pi, barnum, PCIBAR_IO, size);
++
++	if (get_config_bool_default("virtio.modern", true))
++		vi_modern_init(vs);
+ }
+ 
+ /*
++ * The virtio 1.0 interface next to the legacy one (a "transitional" device):
++ * four register regions in a memory BAR, found through vendor-specific PCI
++ * capabilities.  A driver without I/O port access has only this: Windows on
++ * arm64 does not start a device on its I/O BAR.
++ *
++ *	common configuration	features, status, the queues' addresses
++ *	notification		a write of a queue's number is its "kick"
++ *	ISR			as the legacy register
++ *	device configuration	the device's own registers, as behind the
++ *				legacy ones
++ */
++#define	VI_MODERN_BAR		4
++#define	VI_MODERN_COMMON	0x0000
++#define	VI_MODERN_NOTIFY	0x1000
++#define	VI_MODERN_ISR		0x2000
++#define	VI_MODERN_DEVICE	0x3000
++#define	VI_MODERN_REGION	0x1000
++#define	VI_MODERN_SIZE		0x4000
++
++static void
++vi_modern_add_cap(struct virtio_softc *vs, uint8_t type, uint32_t offset,
++    uint32_t length)
++{
++	struct virtio_pci_notify_cap cap;
++	int error;
++
++	memset(&cap, 0, sizeof(cap));
++	cap.cap.cap_vndr = PCIY_VENDOR;
++	cap.cap.cap_len = type == VIRTIO_PCI_CAP_NOTIFY_CFG ?
++	    sizeof(cap) : sizeof(cap.cap);
++	cap.cap.cfg_type = type;
++	cap.cap.bar = VI_MODERN_BAR;
++	cap.cap.offset = htole32(offset);
++	cap.cap.length = htole32(length);
++	/* notify_off_multiplier 0: every queue is notified at the same address */
++	error = pci_emul_add_capability(vs->vs_pi, (u_char *)&cap,
++	    cap.cap.cap_len);
++	assert(error == 0);
++}
++
++static void
++vi_modern_init(struct virtio_softc *vs)
++{
++	vs->vs_modern_bar = VI_MODERN_BAR;
++	pci_emul_alloc_bar(vs->vs_pi, VI_MODERN_BAR, PCIBAR_MEM32,
++	    VI_MODERN_SIZE);
++	vi_modern_add_cap(vs, VIRTIO_PCI_CAP_COMMON_CFG, VI_MODERN_COMMON,
++	    sizeof(struct virtio_pci_common_cfg));
++	vi_modern_add_cap(vs, VIRTIO_PCI_CAP_ISR_CFG, VI_MODERN_ISR, 1);
++	vi_modern_add_cap(vs, VIRTIO_PCI_CAP_DEVICE_CFG, VI_MODERN_DEVICE,
++	    VI_MODERN_REGION);
++	vi_modern_add_cap(vs, VIRTIO_PCI_CAP_NOTIFY_CFG, VI_MODERN_NOTIFY, 4);
++}
++
++/*
++ * The size a queue is offered with: what the device model set, taken the
++ * first time the driver looks (device models set it after the BARs).
++ */
++static void
++vi_modern_qsizes(struct virtio_softc *vs)
++{
++	struct vqueue_info *vq;
++	int i;
++
++	for (vq = vs->vs_queues, i = 0; i < vs->vs_vc->vc_nvq; vq++, i++)
++		if (vq->vq_qsize_max == 0)
++			vq->vq_qsize_max = vq->vq_qsize;
++}
++
++/* The driver has given the selected queue's three addresses: map them. */
++static void
++vi_modern_vq_enable(struct virtio_softc *vs, struct vqueue_info *vq)
++{
++	struct vmctx *ctx = vs->vs_pi->pi_vmctx;
++	size_t qs = vq->vq_qsize;
++
++	vq->vq_desc = paddr_guest2host(ctx, vq->vq_desc_gpa,
++	    qs * sizeof(struct vring_desc));
++	vq->vq_avail = paddr_guest2host(ctx, vq->vq_avail_gpa,
++	    (3 + qs) * sizeof(uint16_t));
++	vq->vq_used = paddr_guest2host(ctx, vq->vq_used_gpa,
++	    3 * sizeof(uint16_t) + qs * sizeof(struct vring_used_elem));
++	if (vq->vq_desc == NULL || vq->vq_avail == NULL ||
++	    vq->vq_used == NULL) {
++		EPRINTLN("%s: queue %u is not in guest memory",
++		    vs->vs_vc->vc_name, vq->vq_num);
++		return;
++	}
++	vq->vq_flags = VQ_ALLOC;
++	vq->vq_last_avail = 0;
++	vq->vq_next_used = 0;
++	vq->vq_save_used = 0;
++}
++
++/* The features both sides have: tell the device model. */
++static void
++vi_modern_features_ok(struct virtio_softc *vs)
++{
++	struct virtio_consts *vc = vs->vs_vc;
++	uint64_t negotiated;
++
++	negotiated = vs->vs_driver_features &
++	    (vc->vc_hv_caps | VIRTIO_F_VERSION_1);
++	vs->vs_negotiated_caps = (uint32_t)negotiated;
++	if (vc->vc_apply_features)
++		(*vc->vc_apply_features)(DEV_SOFTC(vs), negotiated);
++}
++
++/* A kick of queue `idx`, from either interface; vs_mtx held. */
++static void
++vi_queue_notify(struct virtio_softc *vs, unsigned int idx)
++{
++	struct virtio_consts *vc = vs->vs_vc;
++	struct vqueue_info *vq;
++
++	if (idx >= (unsigned int)vc->vc_nvq) {
++		EPRINTLN("%s: queue %u notify out of range", vc->vc_name, idx);
++		return;
++	}
++	vq = &vs->vs_queues[idx];
++	if (!vq_ring_ready(vq))
++		return;
++	if (vq->vq_notify)
++		(*vq->vq_notify)(DEV_SOFTC(vs), vq);
++	else if (vc->vc_qnotify)
++		(*vc->vc_qnotify)(DEV_SOFTC(vs), vq);
++	else
++		EPRINTLN("%s: qnotify queue %u: missing vq/vc notify",
++		    vc->vc_name, idx);
++}
++
++static uint64_t
++vi_modern_read(struct virtio_softc *vs, uint64_t offset, int size)
++{
++	struct virtio_consts *vc = vs->vs_vc;
++	struct vqueue_info *vq;
++	uint64_t features, value;
++	uint32_t cfg;
++
++	vi_modern_qsizes(vs);
++	vq = vs->vs_curq < vc->vc_nvq ? &vs->vs_queues[vs->vs_curq] : NULL;
++	value = 0;
++	if (offset >= VI_MODERN_DEVICE) {
++		cfg = size == 1 ? 0xff : size == 2 ? 0xffff : 0xffffffff;
++		if (vc->vc_cfgread != NULL && size <= 4)
++			(void)(*vc->vc_cfgread)(DEV_SOFTC(vs),
++			    offset - VI_MODERN_DEVICE, size, &cfg);
++		return (cfg);
++	}
++	if (offset >= VI_MODERN_ISR) {
++		pthread_mutex_lock(&vs->vs_isr_mtx);
++		value = vs->vs_isr;
++		vs->vs_isr = 0;		/* a read clears this flag */
++		if (value)
++			pci_lintr_deassert(vs->vs_pi);
++		pthread_mutex_unlock(&vs->vs_isr_mtx);
++		return (value);
++	}
++	if (offset >= VI_MODERN_NOTIFY)
++		return (0);
++
++	/* the common configuration: the 32-bit word the access is in */
++	features = vc->vc_hv_caps | VIRTIO_F_VERSION_1;
++	switch (offset & ~3ul) {
++	case VIRTIO_PCI_COMMON_DFSELECT:
++		value = vs->vs_dfsel;
++		break;
++	case VIRTIO_PCI_COMMON_DF:
++		value = vs->vs_dfsel == 0 ? (uint32_t)features :
++		    vs->vs_dfsel == 1 ? features >> 32 : 0;
++		break;
++	case VIRTIO_PCI_COMMON_GFSELECT:
++		value = vs->vs_gfsel;
++		break;
++	case VIRTIO_PCI_COMMON_GF:
++		value = vs->vs_gfsel == 0 ? (uint32_t)vs->vs_driver_features :
++		    vs->vs_gfsel == 1 ? vs->vs_driver_features >> 32 : 0;
++		break;
++	case VIRTIO_PCI_COMMON_MSIX:	/* and the number of queues */
++		value = vs->vs_msix_cfg_idx | (uint32_t)vc->vc_nvq << 16;
++		break;
++	case VIRTIO_PCI_COMMON_STATUS:	/* config generation 0, queue select */
++		value = vs->vs_status | (uint32_t)vs->vs_curq << 16;
++		break;
++	case VIRTIO_PCI_COMMON_Q_SIZE:	/* and the queue's MSI-X vector */
++		value = vq == NULL ? 0 :
++		    vq->vq_qsize | (uint32_t)vq->vq_msix_idx << 16;
++		break;
++	case VIRTIO_PCI_COMMON_Q_ENABLE:	/* queue_notify_off is 0 */
++		value = vq != NULL && vq_ring_ready(vq);
++		break;
++	case VIRTIO_PCI_COMMON_Q_DESCLO:
++		value = vq == NULL ? 0 : (uint32_t)vq->vq_desc_gpa;
++		break;
++	case VIRTIO_PCI_COMMON_Q_DESCHI:
++		value = vq == NULL ? 0 : vq->vq_desc_gpa >> 32;
++		break;
++	case VIRTIO_PCI_COMMON_Q_AVAILLO:
++		value = vq == NULL ? 0 : (uint32_t)vq->vq_avail_gpa;
++		break;
++	case VIRTIO_PCI_COMMON_Q_AVAILHI:
++		value = vq == NULL ? 0 : vq->vq_avail_gpa >> 32;
++		break;
++	case VIRTIO_PCI_COMMON_Q_USEDLO:
++		value = vq == NULL ? 0 : (uint32_t)vq->vq_used_gpa;
++		break;
++	case VIRTIO_PCI_COMMON_Q_USEDHI:
++		value = vq == NULL ? 0 : vq->vq_used_gpa >> 32;
++		break;
++	}
++	value >>= 8 * (offset & 3);
++	return (size == 4 ? value : value & ((1ul << (8 * size)) - 1));
++}
++
++static void
++vi_modern_write(struct virtio_softc *vs, uint64_t offset, int size,
++    uint64_t value)
++{
++	struct virtio_consts *vc = vs->vs_vc;
++	struct vqueue_info *vq;
++	uint8_t status;
++
++	vi_modern_qsizes(vs);
++	vq = vs->vs_curq < vc->vc_nvq ? &vs->vs_queues[vs->vs_curq] : NULL;
++	if (offset >= VI_MODERN_DEVICE) {
++		if (vc->vc_cfgwrite != NULL && size <= 4)
++			(void)(*vc->vc_cfgwrite)(DEV_SOFTC(vs),
++			    offset - VI_MODERN_DEVICE, size, value);
++		return;
++	}
++	if (offset >= VI_MODERN_ISR)
++		return;
++	if (offset >= VI_MODERN_NOTIFY) {
++		vi_queue_notify(vs, value & 0xffff);
++		return;
++	}
++
++#define	SET_LO(field)	(field) = ((field) & ~0xfffffffful) | (uint32_t)value
++#define	SET_HI(field)	(field) = ((field) & 0xfffffffful) | value << 32
++	switch (offset) {
++	case VIRTIO_PCI_COMMON_DFSELECT:
++		vs->vs_dfsel = value;
++		break;
++	case VIRTIO_PCI_COMMON_GFSELECT:
++		vs->vs_gfsel = value;
++		break;
++	case VIRTIO_PCI_COMMON_GF:
++		if (vs->vs_gfsel == 0)
++			SET_LO(vs->vs_driver_features);
++		else if (vs->vs_gfsel == 1)
++			SET_HI(vs->vs_driver_features);
++		break;
++	case VIRTIO_PCI_COMMON_MSIX:
++		vs->vs_msix_cfg_idx = value;
++		break;
++	case VIRTIO_PCI_COMMON_STATUS:
++		status = value;
++		if (status == 0) {
++			/* the device model's reset ends in vi_reset_dev() */
++			vs->vs_status = 0;
++			(*vc->vc_reset)(DEV_SOFTC(vs));
++			break;
++		}
++		if ((status & VIRTIO_CONFIG_S_FEATURES_OK) != 0 &&
++		    (vs->vs_status & VIRTIO_CONFIG_S_FEATURES_OK) == 0)
++			vi_modern_features_ok(vs);
++		vs->vs_status = status;
++		break;
++	case VIRTIO_PCI_COMMON_Q_SELECT:
++		vs->vs_curq = value & 0xffff;
++		break;
++	case VIRTIO_PCI_COMMON_Q_SIZE:
++		/* the driver may take a smaller queue than the one offered */
++		if (vq != NULL && value != 0 && value <= vq->vq_qsize_max &&
++		    powerof2(value))
++			vq->vq_qsize = value;
++		break;
++	case VIRTIO_PCI_COMMON_Q_MSIX:
++		if (vq != NULL)
++			vq->vq_msix_idx = value;
++		break;
++	case VIRTIO_PCI_COMMON_Q_ENABLE:
++		if (vq != NULL && (value & 1) != 0)
++			vi_modern_vq_enable(vs, vq);
++		break;
++	case VIRTIO_PCI_COMMON_Q_DESCLO:
++		if (vq != NULL)
++			SET_LO(vq->vq_desc_gpa);
++		break;
++	case VIRTIO_PCI_COMMON_Q_DESCHI:
++		if (vq != NULL)
++			SET_HI(vq->vq_desc_gpa);
++		break;
++	case VIRTIO_PCI_COMMON_Q_AVAILLO:
++		if (vq != NULL)
++			SET_LO(vq->vq_avail_gpa);
++		break;
++	case VIRTIO_PCI_COMMON_Q_AVAILHI:
++		if (vq != NULL)
++			SET_HI(vq->vq_avail_gpa);
++		break;
++	case VIRTIO_PCI_COMMON_Q_USEDLO:
++		if (vq != NULL)
++			SET_LO(vq->vq_used_gpa);
++		break;
++	case VIRTIO_PCI_COMMON_Q_USEDHI:
++		if (vq != NULL)
++			SET_HI(vq->vq_used_gpa);
++		break;
++	}
++#undef SET_LO
++#undef SET_HI
++}
++
++/*
+  * Initialize MSI-X vector capabilities if we're to use MSI-X,
+  * or MSI capabilities if not.
+  *
+@@ -601,6 +930,17 @@
+ 		    baridx == pci_msix_pba_bar(pi)) {
+ 			return (pci_emul_msix_tread(pi, offset, size));
+ 		}
++	}
++
++	if (baridx == vs->vs_modern_bar) {
++		uint64_t v;
++
++		if (vs->vs_mtx)
++			pthread_mutex_lock(vs->vs_mtx);
++		v = vi_modern_read(vs, offset, size);
++		if (vs->vs_mtx)
++			pthread_mutex_unlock(vs->vs_mtx);
++		return (v);
+ 	}
+ 
+ 	/* XXX probably should do something better than just assert() */
+@@ -726,6 +1066,15 @@
+ 		}
+ 	}
+ 
++	if (baridx == vs->vs_modern_bar) {
++		if (vs->vs_mtx)
++			pthread_mutex_lock(vs->vs_mtx);
++		vi_modern_write(vs, offset, size, value);
++		if (vs->vs_mtx)
++			pthread_mutex_unlock(vs->vs_mtx);
++		return;
++	}
++
+ 	/* XXX probably should do something better than just assert() */
+ 	assert(baridx == 0);
+ 
+--- a/usr.sbin/bhyve/virtio.h
++++ b/usr.sbin/bhyve/virtio.h
+@@ -243,6 +243,11 @@
+ 	uint8_t	vs_isr;			/* ISR flags, if not MSI-X */
+ 	pthread_mutex_t vs_isr_mtx;	/* vs_isr and the INTx line's level */
+ 	uint16_t vs_msix_cfg_idx;	/* MSI-X vector for config event */
++	/* virtio 1.0 ("modern") interface, in a memory BAR */
++	int	vs_modern_bar;		/* its BAR, -1: none */
++	uint32_t vs_dfsel;		/* device_feature_select */
++	uint32_t vs_gfsel;		/* driver_feature_select */
++	uint64_t vs_driver_features;	/* as written by the driver */
+ };
+ 
+ #define	VS_LOCK(vs)							\
+@@ -311,6 +316,11 @@
+ 	uint16_t vq_msix_idx;	/* MSI-X index, or VIRTIO_MSI_NO_VECTOR */
+ 
+ 	uint32_t vq_pfn;	/* PFN of virt queue (not shifted!) */
++	/* virtio 1.0: the driver gives the three parts of the queue one by one */
++	uint16_t vq_qsize_max;	/* the size offered (vq_qsize: the one in use) */
++	uint64_t vq_desc_gpa;
++	uint64_t vq_avail_gpa;
++	uint64_t vq_used_gpa;
+ 
+ 	struct vring_desc *vq_desc;	/* descriptor array */
+ 	struct vring_avail *vq_avail;	/* the "avail" ring */
+--- a/usr.sbin/bhyve/pci_emul.c
++++ b/usr.sbin/bhyve/pci_emul.c
+@@ -1154,7 +1154,7 @@
+ }
+ 
+ #define	CAP_START_OFFSET	0x40
+-static int
++int
+ pci_emul_add_capability(struct pci_devinst *pi, u_char *capdata, int caplen)
+ {
+ 	int i, capoff, reallen;
+--- a/usr.sbin/bhyve/pci_emul.h
++++ b/usr.sbin/bhyve/pci_emul.h
+@@ -241,6 +241,8 @@
+     	    void **const addr);
+ int 	pci_emul_add_boot_device(struct pci_devinst *const pi,
+ 	    const int bootindex);
++int	pci_emul_add_capability(struct pci_devinst *pi, u_char *capdata,
++	    int caplen);
+ int	pci_emul_add_msicap(struct pci_devinst *pi, int msgnum);
+ int	pci_emul_add_pciecap(struct pci_devinst *pi, int pcie_device_type);
+ void	pci_emul_capwrite(struct pci_devinst *pi, int offset, int bytes,
+--- a/usr.sbin/bhyve/pci_virtio_net.c
++++ b/usr.sbin/bhyve/pci_virtio_net.c
+@@ -714,6 +714,10 @@
+ 	if (negotiated_features & VIRTIO_NET_F_MRG_RXBUF) {
+ 		sc->vhdrlen = sizeof(struct virtio_net_rxhdr);
+ 		sc->rx_merge = 1;
++	} else if (negotiated_features & VIRTIO_F_VERSION_1) {
++		/* virtio 1.0: the header always has the num_buffers field. */
++		sc->vhdrlen = sizeof(struct virtio_net_rxhdr);
++		sc->rx_merge = 0;
+ 	} else {
+ 		/*
+ 		 * Without mergeable rx buffers, virtio-net header is 2
