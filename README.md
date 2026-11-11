@@ -18,6 +18,10 @@ hyperMAC does two things, and they fit together:
 
 Don't want the second part? One switch closes every port, and it is just a local hypervisor.
 
+| New Virtual Machine: pick a system | The Mac itself: remote access, one switch each |
+|---|---|
+| ![The Virtual Machines tab and the New Virtual Machine window](docs/img/vm-wizard.png) | ![The Host tab: remote access settings](docs/img/host-settings.png) |
+
 ## Why you might want it
 
 - **Windows 11 ARM installs from Microsoft's own ISO, unmodified.** The machine has a TPM 2.0 and
