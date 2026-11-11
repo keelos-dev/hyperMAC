@@ -187,12 +187,14 @@ mstsc（远程桌面连接）等标准 RDP 客户端也能连（`Mac地址:3389`
 
 ## 从源码编译
 
-需要 Xcode 命令行工具、Rust（rustup，stable）和 Python 3；Windows 虚拟机的 TPM 还要
-`brew install libtpms openssl`（没有的话 bhyve 照常能编，只是不带 TPM）。
+需要 Xcode 命令行工具、Rust（rustup，stable，另加 `rustup target add aarch64-unknown-uefi`）、Python 3 和 `brew install cmake`；
+Windows 虚拟机的 TPM 还要 `brew install libtpms openssl`（没有的话 bhyve 照常能编，只是不带 TPM）。
 
 ```sh
 sh build.sh        # target/release/hypermac、vm/target/release/hypermac（虚拟机程序）、vm/bhyve/build/bhyve
 ```
+
+想让 AI 助手帮你装依赖和编译？让它读 [AGENTS.md](AGENTS.md)：要装什么、怎么编、怎么直接从源码目录试一台虚拟机、哪些东西不能碰。
 
 钥匙串里有 "Apple Development" 证书时 `build.sh` 用它签名（重新编译后两项授权不丢），否则是 ad hoc 签名。
 `target/release/hypermac install` 装成登录自启。各部分怎么配合、发布怎么打包见

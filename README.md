@@ -222,12 +222,16 @@ General → Sharing if you no longer need it.
 
 ## Building from source
 
-Needs Xcode's command line tools, Rust (rustup, stable) and Python 3; for the TPM of Windows
-machines also `brew install libtpms openssl` (without them bhyve builds without a TPM).
+Needs Xcode's command line tools, Rust (rustup, stable, plus `rustup target add aarch64-unknown-uefi`),
+Python 3 and `brew install cmake`; for the TPM of Windows machines also `brew install libtpms openssl`
+(without them bhyve builds without a TPM).
 
 ```sh
 sh build.sh        # target/release/hypermac, vm/target/release/hypermac (the VM program), vm/bhyve/build/bhyve
 ```
+
+Building with an AI assistant? Point it at [AGENTS.md](AGENTS.md): what to install, how to build,
+how to try a virtual machine from the tree, and what not to touch.
 
 `build.sh` signs with the first "Apple Development" identity in the keychain when there is one
 (the two permissions then survive a rebuild), else ad hoc. `target/release/hypermac install` sets
