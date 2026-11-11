@@ -17,6 +17,7 @@ mod clip;
 mod clipimg;
 mod display;
 mod encoder;
+mod guest;
 mod gui;
 mod input;
 mod shutdown;
@@ -691,6 +692,8 @@ async fn serve() -> anyhow::Result<()> {
             sessions: Default::default(),
             fails: Default::default(),
         });
+        // in a virtual machine of another hyperMAC: tell that host how to reach this desktop
+        guest::start(a.state.clone(), a.listen.port());
         let acceptor = tls.make_acceptor()?;
         let web_addr = a.web;
         tokio::spawn(async move {

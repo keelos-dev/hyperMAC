@@ -284,7 +284,8 @@ async fn handle(stream: tokio_rustls::server::TlsStream<tokio::net::TcpStream>, 
     let (code, body, cookie) = if method != "GET" && path.starts_with("/v1/vms/") {
         plain(403, serde_json::json!({"error": "hyperMAC: the Mac's power is not keel's to switch"}))
     } else if path == "/v1/version" {
-        plain(200, serde_json::json!({"version": env!("CARGO_PKG_VERSION"), "product": "hyperMAC"}))
+        // build: the commit in the release's name (a development build has none)
+        plain(200, serde_json::json!({"version": env!("CARGO_PKG_VERSION"), "product": "hyperMAC", "build": option_env!("MACRDP_COMMIT").unwrap_or("dev")}))
     } else if method == "POST" && path == "/login" {
         login(st, body_in)
     } else if method == "POST" && path == "/login/setup" {

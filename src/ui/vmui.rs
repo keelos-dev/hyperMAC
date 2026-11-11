@@ -267,7 +267,7 @@ fn vm_row(vm: &Vm) -> Retained<NSView> {
         }
         // a macOS guest serves its own desktop (hyperMAC installed in it): pair with it once, and
         // kRDPclient opens it from this Mac's list (vms.rs "a guest that serves its own desktop")
-        if os_key == "macos" && ip.is_some() {
+        if os_key == "macos" && ip.is_some() && !crate::vms::auto_paired(&name) {
             let n = name.clone();
             if crate::vms::paired(&name) {
                 ctl.push(as_view(&button(t("取消远程配对", "Unpair Remote"), move || {

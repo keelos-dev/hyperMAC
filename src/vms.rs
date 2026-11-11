@@ -134,9 +134,11 @@ pub fn guests(rdp_port: u16) -> Vec<serde_json::Value> {
             if vm.running && vm.own_devices {
                 g["rdp"] = serde_json::json!({ "port": rdp_port });
             } else if vm.running {
-                // a macOS guest with hyperMAC inside, paired in the window: the client goes there
-                if let Some(d) = direct(&vm.name) {
-                    g["rdp_direct"] = d;
+                // a macOS guest serves its own desktop (hyperMAC inside it): the client goes
+                // there, or is told why it cannot
+                match direct(&vm.name) {
+                    Ok(d) => g["rdp_direct"] = d,
+                    Err(why) => g["rdp_direct_why"] = why.into(),
                 }
             }
             g
@@ -147,9 +149,10 @@ pub fn guests(rdp_port: u16) -> Vec<serde_json::Value> {
 // ---- a guest that serves its own desktop --------------------------------------------------------
 // A macOS guest's picture cannot be taken on the host (Apple's graphics device shows only in a
 // visible window), so hyperMAC is installed in the guest too and serves the guest's desktop
-// itself. For the client to open it from this host's list, the host is paired with the guest
-// once (the window: the guest's account and password, traded for a token of the guest's
-// hyperMAC, kept in the VM's folder) and then publishes, in the guest's /v1/vms entry:
+// itself. For the client to open it from this host's list, the guest's hyperMAC tells the host a
+// token of its own through a directory shared with that VM alone (src/guest.rs; a VM from
+// before that can be paired by hand in the window: the guest's account and password, traded
+// for a token, kept in the VM's folder). The host then publishes, in the guest's /v1/vms entry:
 //
 //   "rdp_direct": { "host": "192.168.100.42", "port": 3389, "token": "keel_…", "cert_sha256": "…" }
 //
@@ -157,6 +160,7 @@ pub fn guests(rdp_port: u16) -> Vec<serde_json::Value> {
 // token = the RDP password (any user name; the client's usual one, the VM's name, is fine);
 // cert_sha256 = SHA-256 of the guest's TLS certificate (DER), the one its RDP port presents too.
 // "rdp" stays absent, so a client that does not know rdp_direct says "no RDP" as before.
+// When there is no rdp_direct, "rdp_direct_why" is a sentence saying why.
 
 const PAIRING: &str = "guest-rdp.json";
 
@@ -182,13 +186,43 @@ pub fn unpair(name: &str) {
     let _ = std::fs::remove_file(dir(name).join(PAIRING));
 }
 
-fn direct(name: &str) -> Option<serde_json::Value> {
-    let p: serde_json::Value = serde_json::from_slice(&std::fs::read(dir(name).join(PAIRING)).ok()?).ok()?;
-    let ip = guest_ip(name)?;
-    Some(serde_json::json!({
+/// The pairing the guest's hyperMAC wrote by itself into the directory shared with it
+/// (src/guest.rs; vm/src/vm.rs makes the share), else the one made by hand in the window.
+fn pairing(name: &str) -> Option<serde_json::Value> {
+    [dir(name).join("share").join(crate::guest::GUEST_FILE), dir(name).join(PAIRING)]
+        .iter()
+        .find_map(|p| serde_json::from_slice::<serde_json::Value>(&std::fs::read(p).ok()?).ok())
+        .filter(|p| p.get("token").and_then(|t| t.as_str()).is_some_and(|t| !t.is_empty()))
+}
+
+/// Paired by itself (the window then has no pairing to offer).
+pub fn auto_paired(name: &str) -> bool {
+    dir(name).join("share").join(crate::guest::GUEST_FILE).exists()
+}
+
+/// `rdp_direct` for the running guest `name`, or why there is none (`rdp_direct_why`, shown by
+/// the client as it is).
+fn direct(name: &str) -> Result<serde_json::Value, &'static str> {
+    let Some(ip) = guest_ip(name) else {
+        return Err("the virtual machine has no address yet");
+    };
+    let Some(p) = pairing(name) else {
+        return Err(if dir(name).join("share").join(crate::guest::HOST_MARK).exists() {
+            "hyperMAC is not installed in the virtual machine, or nobody is logged in there"
+        } else {
+            "restart the virtual machine once: it was started by a hyperMAC from before automatic pairing"
+        });
+    };
+    let port = p.get("rdp_port").and_then(|v| v.as_u64()).and_then(|n| u16::try_from(n).ok()).unwrap_or(3389);
+    // only while its server answers: a token for a server that is not there helps nobody
+    let up = format!("{ip}:{port}").parse::<std::net::SocketAddr>().ok().is_some_and(|a| std::net::TcpStream::connect_timeout(&a, Duration::from_millis(300)).is_ok());
+    if !up {
+        return Err("the hyperMAC in the virtual machine does not answer (is somebody logged in there?)");
+    }
+    Ok(serde_json::json!({
         "host": ip,
-        "port": p.get("rdp_port").and_then(|v| v.as_u64()).unwrap_or(3389),
-        "token": p.get("token")?.as_str()?,
+        "port": port,
+        "token": p.get("token").and_then(|t| t.as_str()).unwrap_or(""),
         "cert_sha256": p.get("cert_sha256").and_then(|v| v.as_str()).unwrap_or(""),
     }))
 }

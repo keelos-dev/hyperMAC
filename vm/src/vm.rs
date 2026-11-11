@@ -156,6 +156,26 @@ fn config_macos(dir: &Path, c: &VmConf, new_hw: Option<&VZMacHardwareModel>) -> 
         snd.setStreams(&NSArray::from_retained_slice(&[Retained::into_super(out)]));
         cfg.setAudioDevices(&NSArray::from_retained_slice(&[Retained::into_super(snd)]));
 
+        // The pairing channel (src/guest.rs in the main program): a directory of this VM alone,
+        // which macOS mounts by itself (/Volumes/My Shared Files). The hyperMAC installed in the
+        // guest writes there how the host reaches the guest's desktop; nothing of the host's is
+        // in it but the mark that says whose directory this is.
+        let share = dir.join("share");
+        std::fs::create_dir_all(&share)?;
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let _ = std::fs::set_permissions(&share, std::fs::Permissions::from_mode(0o700));
+        }
+        std::fs::write(share.join("hypermac-host"), "hyperMAC: the virtual machine's host looks for hypermac-guest.json here\n")?;
+        let shared = VZSharedDirectory::initWithURL_readOnly(VZSharedDirectory::alloc(), &url(&share), false);
+        let single = VZSingleDirectoryShare::initWithDirectory(VZSingleDirectoryShare::alloc(), &shared);
+        let fs = VZVirtioFileSystemDeviceConfiguration::initWithTag(
+            VZVirtioFileSystemDeviceConfiguration::alloc(),
+            &VZVirtioFileSystemDeviceConfiguration::macOSGuestAutomountTag(),
+        );
+        fs.setShare(Some(&single));
+        cfg.setDirectorySharingDevices(&NSArray::from_retained_slice(&[Retained::into_super(fs)]));
+
         cfg.validateWithError().map_err(err)?;
         Ok(cfg)
     }
