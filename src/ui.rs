@@ -1416,6 +1416,9 @@ fn check_for_updates() {
     });
 }
 
+/// How many commits the update dialog lists.
+const MAX_LISTED: usize = 30;
+
 fn on_checked(result: Result<Option<crate::update::Release>, String>) {
     let release = match result {
         Ok(Some(r)) => r,
@@ -1425,28 +1428,28 @@ fn on_checked(result: Result<Option<crate::update::Release>, String>) {
             return gui::error(mtm(), t("没能检查更新", "Cannot check for updates"), &e);
         }
     };
-    let mut text = String::new();
+    // the release's notes and the commits since this build, in a box that scrolls (a long list
+    // made the dialog taller than the screen, user 2026-11-11); Markdown's marks taken out
+    let mut long = String::new();
     if !release.notes.is_empty() {
-        let notes: String = release.notes.chars().take(700).collect();
-        text.push_str(&notes);
-        text.push_str("\n\n");
+        long.push_str(release.notes.replace("**", "").replace('`', "").trim());
+        long.push_str("\n\n");
     }
     if !release.changes.is_empty() {
-        text.push_str(if release.partial { t("最近的改动：\n", "Latest changes:\n") } else { t("这次的改动：\n", "What changed:\n") });
-        for c in release.changes.iter().take(15) {
-            text.push_str(&format!("• {c}\n"));
+        long.push_str(if release.partial { t("最近的改动：\n", "Latest changes:\n") } else { t("这次的改动：\n", "What changed:\n") });
+        for c in release.changes.iter().take(MAX_LISTED) {
+            long.push_str(&format!("• {c}\n"));
         }
-        if release.changes.len() > 15 {
-            text.push_str("…\n");
+        if release.changes.len() > MAX_LISTED {
+            long.push_str("…\n");
         }
-        text.push('\n');
     }
-    text.push_str(t(
+    let text = t(
         "更新会下载新版本、核对签名，替换「应用程序」里的 hyperMAC；装好后再问你要不要立即重启（重启时正在连着的会话会断开几秒）。授权不用重新给。",
         "Updating downloads the new version, checks its signature and replaces hyperMAC in Applications; then it asks whether to restart now (a session in progress drops for a few seconds then). The permissions stay.",
-    ));
+    );
     let title = format!("{} {}", t("有新版本：", "New version:"), short_tag(&release.tag));
-    if gui::ask(mtm(), &title, &text, &[t("以后再说", "Later"), t("更新", "Update")]) != 1 {
+    if gui::ask_long(mtm(), &title, text, long.trim_end(), &[t("以后再说", "Later"), t("更新", "Update")]) != 1 {
         return set_upd(Upd::Idle);
     }
     start_install(release);

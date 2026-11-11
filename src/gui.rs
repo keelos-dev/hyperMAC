@@ -420,6 +420,23 @@ pub fn version() -> String {
     }
 }
 
+/// A question with a long text under it (what an update changes): the text in a box of a fixed
+/// height that scrolls, so the dialog stays small however much there is to say.
+pub fn ask_long(mtm: MainThreadMarker, title: &str, text: &str, long: &str, buttons: &[&str]) -> usize {
+    use objc2_app_kit::{NSFont, NSScrollView, NSTextView};
+    let frame = NSRect::new(NSPoint::new(0.0, 0.0), NSSize::new(440.0, 220.0));
+    let scroll = NSScrollView::initWithFrame(NSScrollView::alloc(mtm), frame);
+    scroll.setHasVerticalScroller(true);
+    scroll.setBorderType(objc2_app_kit::NSBorderType::BezelBorder);
+    let view = NSTextView::initWithFrame(NSTextView::alloc(mtm), NSRect::new(NSPoint::new(0.0, 0.0), NSSize::new(424.0, 220.0)));
+    view.setString(&ns(long));
+    view.setEditable(false);
+    view.setFont(Some(&NSFont::systemFontOfSize(12.0)));
+    view.setTextContainerInset(NSSize::new(6.0, 6.0));
+    scroll.setDocumentView(Some(&view));
+    alert(mtm, title, text, buttons, Some(&scroll), false)
+}
+
 /// "Connect to the hyperMAC inside…": the guest's account, to trade for a token there.
 pub fn pair_dialog(mtm: MainThreadMarker, vm: &str) -> Option<(String, String)> {
     let view = NSView::initWithFrame(NSView::alloc(mtm), NSRect::new(NSPoint::new(0.0, 0.0), NSSize::new(300.0, 60.0)));
