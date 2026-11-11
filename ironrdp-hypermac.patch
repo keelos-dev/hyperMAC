@@ -1,0 +1,55 @@
+hyperMAC's own changes to IronRDP, applied after ironrdp-keel.patch (tools/vendor-ironrdp.sh).
+
+- ironrdp-server: a redraw the client asks for (RefreshRectangle; the display_refresh counter)
+  makes the encoder forget its copy of the client's picture, so the next bitmap is sent whole.
+  Without it a part the client lost stayed lost while the picture did not change there
+  (kRDPclient on a VM whose screen was still: black but for the tiles that moved).
+
+--- a/crates/ironrdp-server/src/encoder/mod.rs
++++ b/crates/ironrdp-server/src/encoder/mod.rs
+@@ -241,6 +241,13 @@
+         }
+     }
+ 
++    /// hyperMAC (ironrdp-keel.patch): the client asked for a redraw, so what it has is not
++    /// what was sent. Forget the copy the differences are taken against: the next bitmap goes
++    /// out whole.
++    pub(crate) fn forget_framebuffer(&mut self) {
++        self.framebuffer = None;
++    }
++
+     pub(crate) fn set_desktop_size(&mut self, size: DesktopSize) {
+         self.desktop_size = size;
+         self.bitmap_updater
+--- a/crates/ironrdp-server/src/server.rs
++++ b/crates/ironrdp-server/src/server.rs
+@@ -3992,6 +3992,7 @@
+         let udp_transport_for_pdus = Rc::clone(&udp_transport);
+         let write_counter = writer.write_counter();
+         let ev_receiver = Arc::clone(&self.ev_receiver);
++        let display_refresh = self.display_refresh.clone(); // hyperMAC: for dispatch_display below
+         let s = Rc::new(Mutex::new((self, conn)));
+ 
+         let this = Rc::clone(&s);
+@@ -4074,12 +4075,21 @@
+             }
+         };
+ 
++        // hyperMAC (ironrdp-keel.patch): a redraw the client asked for (the display_refresh
++        // counter) makes the encoder forget its copy of the client's picture, see
++        // `UpdateEncoder::forget_framebuffer`.
++        let mut refresh_seen = display_refresh.as_ref().map(|r| r.load(Ordering::Relaxed));
+         let dispatch_display = async move {
+             let mut buffer = vec![0u8; 4096];
+ 
+             loop {
+                 match display_updates.next_update().await {
+                     Ok(Some(update)) => {
++                        let refresh_now = display_refresh.as_ref().map(|r| r.load(Ordering::Relaxed));
++                        if refresh_now != refresh_seen {
++                            refresh_seen = refresh_now;
++                            encoder.forget_framebuffer();
++                        }
+                         match Self::dispatch_display_update(
+                             update,
+                             &mut display_writer,

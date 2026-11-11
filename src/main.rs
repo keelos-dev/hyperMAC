@@ -765,6 +765,7 @@ async fn serve() -> anyhow::Result<()> {
                 // and stays on EGFX. The app's switch (settings.rs) or MACRDP_VIDEO=0 turns it off.
                 // It also carries kRDPclient's sound switch (SOUND) to this connection's sound.
                 let video = settings::on(&state, "video", "MACRDP_VIDEO").then(|| video::Video::new(offers.clone(), sound.clone()));
+                let refresh = std::sync::Arc::new(std::sync::atomic::AtomicU32::new(0));
                 let builder = RdpServer::builder()
                     .with_addr(listen)
                     // Hybrid = NLA (CredSSP, what mstsc wants) and TLS-only clients both (keel-rdp);
@@ -781,7 +782,7 @@ async fn serve() -> anyhow::Result<()> {
                             // "mute the Mac while remote" (tap.rs), its own switch, read live
                             tap::MuteSwitch(state.to_path_buf()),
                         ),
-                        vm: vms::VmDisplay::new(vm_slot.clone()),
+                        vm: vms::VmDisplay::new(vm_slot.clone(), refresh.clone()),
                         on_vm: None,
                     })
                     .with_credential_validator(Some(Arc::new(login)))
@@ -808,7 +809,10 @@ async fn serve() -> anyhow::Result<()> {
                 }
                 // Consume the client's Frame Acknowledge PDUs; without this each one is logged
                 // as an "unexpected share data pdu" (keel-rdp main.rs does the same).
-                server.set_display_refresh_handle(Some(std::sync::Arc::new(std::sync::atomic::AtomicU32::new(0))));
+                // The counter of the client's redraw requests: the server's encoder then sends
+                // the next picture whole (ironrdp-keel.patch), and a VM's display, whose picture
+                // may be still, sends one (vms.rs).
+                server.set_display_refresh_handle(Some(refresh));
                 // The NLA path: NTLM needs the password's NT hash by user name. A wrong password
                 // fails inside NTLM; a wrong user name returns None here.
                 // The Mac account's hash is the one kept from its password (account.rs).

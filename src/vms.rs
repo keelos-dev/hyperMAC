@@ -338,11 +338,15 @@ impl Drop for Shm {
 
 pub struct VmDisplay {
     slot: Slot,
+    /// counted up when the client asks for a redraw (RefreshRectangle): the picture is sent
+    /// again even when it has not changed (kRDPclient asks once its window is up; a still
+    /// screen, e.g. Windows setup's, otherwise stayed black but for the parts that moved)
+    refresh: Arc<std::sync::atomic::AtomicU32>,
 }
 
 impl VmDisplay {
-    pub fn new(slot: Slot) -> Self {
-        Self { slot }
+    pub fn new(slot: Slot, refresh: Arc<std::sync::atomic::AtomicU32>) -> Self {
+        Self { slot, refresh }
     }
 }
 
@@ -366,14 +370,21 @@ impl RdpServerDisplay for VmDisplay {
     async fn updates(&mut self) -> ServerResult<Box<dyn RdpServerDisplayUpdates>> {
         let (tx, rx) = tokio::sync::mpsc::channel(2);
         let name = self.slot.lock().unwrap().clone();
+        let refresh = self.refresh.clone();
         // a thread copies frames out of the shared file (~60 Hz poll) for this connection
         std::thread::spawn(move || {
+            let mut asked = refresh.load(Ordering::Relaxed);
             let Some(s) = name.as_deref().and_then(Shm::open) else {
                 return warn!(vm = name, "no screen.shm");
             };
             let (mut last, mut size) = (0u64, (0u32, 0u32));
             loop {
                 s.want(2000);
+                let now = refresh.load(Ordering::Relaxed);
+                if now != asked {
+                    asked = now;
+                    last = 0; // the same frame once more, and the encoder sends it whole
+                }
                 if let Some((seq, w, h, pix)) = s.read(last) {
                     last = seq;
                     if size != (w, h) && size != (0, 0) {

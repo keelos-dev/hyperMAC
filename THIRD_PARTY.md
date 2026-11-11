@@ -13,6 +13,8 @@
     transport (MS-RDPEUDP2) beside TCP, automatic-reconnect cookies taken as a new login,
     pointer updates that were not sent.
   - `ironrdp-egfx`, `ironrdp-dvc`, `ironrdp-rdpeudp-tokio`: fixes that keel-rdp needed.
+  and then `ironrdp-hypermac.patch` (hyperMAC's own): a redraw the client asks for makes
+  `ironrdp-server` send the next picture whole.
 
 ## libopus
 
