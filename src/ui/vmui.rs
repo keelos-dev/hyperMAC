@@ -11,7 +11,7 @@ use std::path::PathBuf;
 use objc2::MainThreadOnly;
 use objc2::rc::Retained;
 use objc2::runtime::ProtocolObject;
-use objc2_app_kit::{NSAccessibility, NSBackingStoreType, NSBezelStyle, NSCellImagePosition, NSStackViewDistribution, NSWindow, NSWindowStyleMask, NSAlert, NSAlertStyle, NSColor, NSFontWeightMedium, NSFontWeightRegular, NSOpenPanel, NSSecureTextField, NSStackView, NSTextField, NSView};
+use objc2_app_kit::{NSAccessibility, NSBackingStoreType, NSBezelStyle, NSBox, NSBoxType, NSTitlePosition, NSWindowOrderingMode, NSCellImagePosition, NSStackViewDistribution, NSWindow, NSWindowStyleMask, NSAlert, NSAlertStyle, NSColor, NSFontWeightMedium, NSFontWeightRegular, NSOpenPanel, NSSecureTextField, NSStackView, NSTextField, NSView};
 use objc2_foundation::{NSEdgeInsets, NSPoint, NSRect, NSSize};
 
 use super::{as_view, button, copy, fixed_size, hstack, insets, label, mtm, render, row, same_width, section, spacer, switch, with, wrapping};
@@ -327,7 +327,6 @@ fn icon_button(symbol: &str, tip: &str, action: Act) -> Retained<NSView> {
 
 fn vm_row(vm: &Vm) -> Retained<NSView> {
     let c = &vm.conf;
-    let bridged = str_of(c, "net").is_some();
     let os_key = str_of(c, "os").unwrap_or("linux");
     let (icon, color) = match os_key {
         "macos" => ("apple.logo", NSColor::systemGrayColor()),
@@ -345,7 +344,6 @@ fn vm_row(vm: &Vm) -> Retained<NSView> {
     let spec = if zh() { format!("{os} · {cpus} 核 · {mem} GB") } else { format!("{os} · {cpus} CPU · {mem} GB") };
     let name = vm.name.clone();
     let op = with(|u| u.pending.iter().find(|(n, _, _)| n == &vm.name).map(|(_, op, _)| *op));
-    let net = if bridged { t("桥接", "bridged") } else { "NAT" };
 
     // the icons, left to right; each branch below fills in what can be done now
     let (mut copy_a, mut console_a, mut run_a, mut suspend_a, mut stop_a, mut eject_a, mut edit_a, mut delete_a): (Act, Act, Act, Act, Act, Act, Act, Act) =
@@ -355,6 +353,9 @@ fn vm_row(vm: &Vm) -> Retained<NSView> {
     let mut delete_tip = t("删除…", "Delete…");
     // rare, and only for a macOS guest: a text button before the icons
     let mut lead: Vec<Retained<NSView>> = Vec::new();
+    // the row's ground says how the machine is (user 2026-11-11: running light green, paused
+    // light yellow, an error light red, stopped plain)
+    let mut tint: Option<Retained<NSColor>> = None;
     let console = |n: String| {
         act(move || {
             // the VM's own process opens the window
@@ -369,7 +370,9 @@ fn vm_row(vm: &Vm) -> Retained<NSView> {
         }
         if what.starts_with("win:") {
             let n = name.clone();
-            if !what.starts_with("win:failed:") {
+            if what.starts_with("win:failed:") {
+                tint = Some(NSColor::systemRedColor());
+            } else {
                 delete_tip = t("取消安装…", "Cancel Install…");
             }
             delete_a = act(move || delete(&n));
@@ -424,9 +427,10 @@ fn vm_row(vm: &Vm) -> Retained<NSView> {
         let n = name.clone();
         stop_a = act(move || stop(&n));
         let running = if paused { t("已暂停", "Paused") } else { t("运行中", "Running") };
+        tint = Some(if paused { NSColor::systemYellowColor() } else { NSColor::systemGreenColor() });
         match ip {
-            Some(ip) => format!("{running} · {ip}（{net}）"),
-            None => format!("{running} · {}（{net}）", t("还没有地址", "no address yet")),
+            Some(ip) => format!("{running} · {ip}"),
+            None => format!("{running} · {}", t("还没有地址", "no address yet")),
         }
     } else if op == Some(Op::Start) {
         Op::Start.text().to_string()
@@ -459,7 +463,7 @@ fn vm_row(vm: &Vm) -> Retained<NSView> {
         } else {
             t("已停止", "Stopped")
         };
-        format!("{state}（{net}）")
+        state.to_string()
     };
     let mut controls = lead;
     controls.extend([
@@ -474,7 +478,23 @@ fn vm_row(vm: &Vm) -> Retained<NSView> {
     ]);
     let refs: Vec<&NSView> = controls.iter().map(|v| &**v).collect();
     let acc = hstack(&refs, 6.0);
-    row(Some((icon, color)), &vm.name, Some(&format!("{spec} · {state}")), Some(&acc))
+    let r = row(Some((icon, color)), &vm.name, Some(&format!("{spec} · {state}")), Some(&acc));
+    if let Some(tint) = tint {
+        // behind the row's content, a little inside the card's rounded edge
+        let ground = NSBox::new(mtm());
+        ground.setBoxType(NSBoxType::Custom);
+        ground.setTitlePosition(NSTitlePosition::NoTitle);
+        ground.setBorderWidth(0.0);
+        ground.setCornerRadius(8.0);
+        ground.setFillColor(&tint.colorWithAlphaComponent(0.13));
+        ground.setTranslatesAutoresizingMaskIntoConstraints(false);
+        r.addSubview_positioned_relativeTo(&ground, NSWindowOrderingMode::Below, None);
+        ground.leadingAnchor().constraintEqualToAnchor_constant(&r.leadingAnchor(), 2.0).setActive(true);
+        ground.trailingAnchor().constraintEqualToAnchor_constant(&r.trailingAnchor(), -2.0).setActive(true);
+        ground.topAnchor().constraintEqualToAnchor_constant(&r.topAnchor(), 2.0).setActive(true);
+        ground.bottomAnchor().constraintEqualToAnchor_constant(&r.bottomAnchor(), -2.0).setActive(true);
+    }
+    r
 }
 
 // ---- actions --------------------------------------------------------------------------------
