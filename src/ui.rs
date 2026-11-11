@@ -706,14 +706,32 @@ pub fn render() {
         Page::Tokens => page_tokens(&root),
         Page::Main => {
             main_header(&root);
-            // a Mac that is itself a virtual machine has no hypervisor to offer: no Virtual
-            // Machines tab there, only the host's page
-            if can_virtualize() {
-                tabs(&root);
-            }
+            tabs(&root);
             match with(|u| u.tab) {
+                Tab::Host => page_main(&root),
                 Tab::Vms if can_virtualize() => vmui::page(&root, MAIN_WIDTH),
-                _ => page_main(&root),
+                // a Mac that is itself a virtual machine has no hypervisor to offer: the tab
+                // says so (user 2026-11-11: keep the tab, say why it is empty)
+                Tab::Vms => {
+                    let card = vstack(&[], 8.0);
+                    card.setEdgeInsets(NSEdgeInsets { top: 28.0, left: 0.0, bottom: 28.0, right: 0.0 });
+                    card.addArrangedSubview(&label(
+                        t("这台 Mac 本身是一台虚拟机", "This Mac is itself a virtual machine"),
+                        15.0,
+                        unsafe { NSFontWeightSemibold },
+                        &NSColor::labelColor(),
+                    ));
+                    card.addArrangedSubview(&wrapping(
+                        t(
+                            "虚拟机里不能再运行虚拟机，所以这里的功能不可用。hyperMAC 在这台机器上只做远程桌面：别的电脑可以连它的桌面，设置在「主机」页。",
+                            "A virtual machine cannot run virtual machines, so this part is not available here. On this machine hyperMAC is the remote desktop only: other computers can connect to its desktop; the settings are on the Host tab.",
+                        ),
+                        13.0,
+                        &NSColor::secondaryLabelColor(),
+                        MAIN_WIDTH - 40.0,
+                    ));
+                    root.addArrangedSubview(&card);
+                }
             }
         }
     }
