@@ -92,6 +92,8 @@ hyperMAC began as an RDP server for the Mac itself, and that part is the mature 
   hardware H.264: 1080p at 30 fps (60 on a LAN), about 6–10 Mbps, with sound and the clipboard. It
   lists the Mac and each virtual machine; one click opens any of them.
 - The login is your Mac account. No cloud service sits in between.
+- Free, also where NoMachine no longer is: its version 10 dropped the free server edition, and a
+  server now needs a yearly subscription, for personal use too.
 
 ### Compared with other remote desktops for the Mac
 
@@ -108,7 +110,7 @@ From each product's public description (2026-11); not all of them tested side by
 | Sound | ✅ | high-performance mode only (Mac clients) | ✅ | ✅ | ✅ | ✅ |
 | File transfer | ❌ (planned) | ✅ (Mac clients) | ✅ | ❌ | ✅ | ❌ |
 | Works at the login window | ❌ | ✅ | ✅ | ✅ | ✅ | — |
-| Price | free | built in | free for personal use | free | open source | free for personal use |
+| Price | free | built in | paid from version 10 on (also for personal use) | free | open source | free for personal use |
 
 Pick hyperMAC when the other side is Windows and you want plain RDP (mstsc with nothing to install,
 or kRDPclient for hardware H.264), with no cloud account in between.
