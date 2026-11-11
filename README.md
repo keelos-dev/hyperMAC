@@ -1,35 +1,97 @@
-# hyperMAC
+<p align="center"><img src="docs/img/logo.png" width="140" alt="hyperMAC"></p>
+<h1 align="center">hyperMAC</h1>
+<p align="center"><b>Windows 11 on your Mac in three clicks. Free, open source, no QEMU.</b><br>
+bhyve on Apple Silicon + Apple's Virtualization.framework + a built-in RDP server, in one app.</p>
+<p align="center"><a href="https://github.com/keelos-dev/hyperMAC/releases">Download</a> · <a href="#windows-11-in-three-steps">Windows 11 in three steps</a> · <a href="#how-it-compares">How it compares</a> · <a href="README.zh-CN.md">中文</a></p>
 
-[English](#english) · [中文](#中文)
+![Windows 11 ARM running in hyperMAC on an M4 Mac](docs/img/windows11.jpg)
 
-## English
+hyperMAC does two things, and they fit together:
 
-hyperMAC is a free RDP server for your Mac's own desktop: connect from another computer and you
-see and control the desktop that is logged in on the Mac, with its sound and clipboard. It also
-runs virtual machines on the same Mac (macOS, Windows 11 ARM, Linux, FreeBSD). Free and open
-source: MIT, the bhyve port in `vm/bhyve` BSD-2-Clause.
+1. **A hypervisor.** macOS, Windows 11 ARM, Linux and FreeBSD guests on Apple Silicon. Windows and
+   FreeBSD run on **bhyve**, FreeBSD's hypervisor, ported to Apple's Hypervisor.framework: as far
+   as we know the first bhyve on Apple Silicon. macOS and Linux guests run on Apple's own
+   Virtualization.framework.
+2. **An RDP server.** Your Mac's own desktop and every virtual machine are reachable with plain RDP:
+   Windows' built-in `mstsc` connects with nothing to install. A Mac mini in a closet becomes a
+   Windows-and-Mac server you use from any PC.
 
-New in 1.1, as a preview: **virtual machines** on the same Mac (see [Virtual machines](#virtual-machines-preview)).
+Don't want the second part? One switch closes every port, and it is just a local hypervisor.
 
-**Requirements**: a Mac with Apple Silicon. Tested on macOS 26 and 27.2 (it asks for macOS 13 or
-later; 13–15 not tested). Intel Macs are not supported.
+## Why you might want it
 
-### Features by macOS version
+- **Windows 11 ARM installs from Microsoft's own ISO, unmodified.** The machine has a TPM 2.0 and
+  Secure Boot, so the installer's hardware checks pass as they are: no registry tricks, no patched
+  image. Choose "unattended" and you are at the desktop in about 8 minutes on an M4, account made,
+  network up.
+- **Free and open source.** MIT; the bhyve port BSD-2-Clause. No subscription, no account, no
+  telemetry.
+- **Small and native.** One app of about 30 MB: Rust and C, no QEMU, no kernel extension, no
+  background daemon running as root. A virtual machine is one ordinary process.
+- **Headless by design.** Virtual machines open no window on the Mac and keep running when the
+  app's window closes. Look at them in a console window, or from another computer over RDP.
+- **Two engines, each where it is best.** Apple's Virtualization.framework for macOS and Linux
+  (it is what Apple supports). bhyve for Windows and FreeBSD, where Virtualization.framework
+  does not go.
 
-✅ tested on a real Mac · ☑️ should work, not yet tested on this version · — not tested
+## Windows 11 in three steps
 
-| Feature | 13–15 | 26 | 27.2 |
-|---|:-:|:-:|:-:|
-| kRDPclient: login, H.264 hardware video | — | ✅ | ✅ |
-| mstsc / standard RDP clients (RemoteFX) | — | ✅ | ☑️ |
-| Keyboard and mouse (input methods work) | — | ✅ | ✅ |
-| Sound (Opus to kRDPclient, PCM to mstsc) | — | ✅ | ☑️ |
-| Clipboard: text | — | ✅ | ☑️ |
-| Clipboard: pictures | — | ✅ | ✅ |
-| Found by kRDPclient's "Discover keelOS" | — | ✅ | ☑️ |
-| Runs in the background, starts at login | — | ✅ | ✅ |
-| Permissions kept across a macOS upgrade | — | — | ✅ (26 → 27.2) |
-| App, first-run setup, Check for Updates | — | ✅ | ☑️ |
+1. Get two files: the **Windows 11 ARM64 ISO** from
+   [Microsoft](https://www.microsoft.com/software-download/windows11arm64) and the
+   [virtio-win driver ISO](https://fedorapeople.org/groups/virt/virtio-win/direct-downloads/)
+   (the network driver). Put them in Downloads.
+2. Open hyperMAC → **Virtual Machines** → **New Virtual Machine…** → **Windows 11**. It finds both
+   files by itself.
+3. Click **Create**, then **Start**. Install as on a real PC in the console window; or switch on
+   "unattended", type a user name and password, and come back in 8 minutes.
+
+That is all. No TPM bypass, no "this PC can't run Windows 11".
+
+| The firmware shows where you are | Windows agrees it is a real, secure PC |
+|---|---|
+| ![UEFI boot screen with the hyperMAC logo](docs/img/firmware-logo.png) | ![Windows System Information: Secure Boot on](docs/img/secure-boot.jpg) |
+
+macOS guests are as short: **New Virtual Machine… → macOS → Download the newest macOS from
+Apple**, and it installs by itself. Linux and FreeBSD: point it at the distribution's arm64 ISO.
+
+## What runs
+
+| Guest | Engine | How it installs | State |
+|---|---|---|---|
+| **Windows 11 ARM** | bhyve on Hypervisor.framework | Microsoft's ISO: by hand, or unattended | TPM 2.0, Secure Boot, network, 1920x1080, Windows Update |
+| **macOS** | Virtualization.framework | by itself, from Apple's restore image (downloaded for you) | as Apple's framework gives it |
+| **Linux** (arm64) | Virtualization.framework | the distribution's ISO | Fedora tested |
+| **FreeBSD** (arm64) | bhyve on Hypervisor.framework | the release's ISO | 15.1 tested |
+
+## How it compares
+
+From each project's public documentation, 2026-11; not all tested side by side. Corrections are
+welcome as an issue.
+
+| | **hyperMAC** | UTM | Parallels Desktop | VMware Fusion | VirtualBox |
+|---|---|---|---|---|---|
+| Price | free | free | paid subscription | free | free |
+| Open source | ✅ MIT / BSD | ✅ | ❌ | ❌ | ✅ (GPL) |
+| What runs the guest | bhyve on Hypervisor.framework; Apple VZ | QEMU; Apple VZ | its own | its own | its own |
+| Windows 11 ARM | ✅ | ✅ | ✅ | ✅ | ✅ (7.2 and later) |
+| macOS guests | ✅ | ✅ | ✅ | ❌ | ❌ |
+| 3D acceleration in Windows | ❌ not yet | ❌ | ✅ | ✅ | ❌ |
+| RDP to the Mac's own desktop and to every VM | ✅ built in | ❌ | ❌ | ❌ | VMs only (VRDE) |
+
+Honestly: if you need games or 3D in Windows, Parallels is ahead and will be for a while. If you
+want Windows 11 for Office, a browser, development tools or that one Windows-only program, on a
+Mac that may not even have a screen attached, and you would rather not pay every year for it:
+this is for you.
+
+## The RDP server
+
+hyperMAC began as an RDP server for the Mac itself, and that part is the mature one.
+
+- **`mstsc` just connects** (`mac-address:3389`, your Mac's user name and password).
+- With **[kRDPclient](https://github.com/keelos-dev/kRDPclient-releases)** (Windows, free) you get
+  hardware H.264: 1080p at 30 fps (60 on a LAN), about 6–10 Mbps, with sound and the clipboard. It
+  lists the Mac and each virtual machine; one click opens any of them.
+- The login is your Mac account. No cloud service sits in between.
 
 ### Compared with other remote desktops for the Mac
 
@@ -51,43 +113,35 @@ From each product's public description (2026-11); not all of them tested side by
 Pick hyperMAC when the other side is Windows and you want plain RDP (mstsc with nothing to install,
 or kRDPclient for hardware H.264), with no cloud account in between.
 
-### Install
+### Features by macOS version
 
-1. Download the newest `.dmg` from [Releases](https://github.com/keelos-dev/hyperMAC/releases)
-   and open it.
-2. Drag **hyperMAC** into **Applications**.
-3. Open hyperMAC from Applications and follow the dialogs:
-   - type your Mac's login password once: clients log in with your Mac account (user name and
-     login password), there is no separate password to remember;
-   - allow **Screen Recording** and **Accessibility** in System Settings → Privacy & Security.
-     Accessibility is not switched on for you: turn on hyperMAC's switch in that list yourself.
-     macOS 26 asks once more, on the first connection, whether hyperMAC may capture the screen and
-     audio: allow it;
-   - optionally turn on Remote Login (SSH), so kRDPclient can open a terminal on this Mac.
-4. hyperMAC now runs in the background and starts at every login. Open the app again at any time
-   for its status, a kRDPclient token, password change or uninstall.
+✅ tested on a real Mac · ☑️ should work, not yet tested on this version · — not tested
 
-### Virtual machines (preview)
+| Feature | 13–15 | 26 | 27.2 |
+|---|:-:|:-:|:-:|
+| kRDPclient: login, H.264 hardware video | — | ✅ | ✅ |
+| mstsc / standard RDP clients (RemoteFX) | — | ✅ | ☑️ |
+| Keyboard and mouse (input methods work) | — | ✅ | ✅ |
+| Sound (Opus to kRDPclient, PCM to mstsc) | — | ✅ | ☑️ |
+| Clipboard: text | — | ✅ | ☑️ |
+| Clipboard: pictures | — | ✅ | ✅ |
+| Found by kRDPclient's "Discover keelOS" | — | ✅ | ☑️ |
+| Runs in the background, starts at login | — | ✅ | ✅ |
+| Permissions kept across a macOS upgrade | — | — | ✅ (26 → 27.2) |
+| App, first-run setup, Check for Updates | — | ✅ | ☑️ |
 
-The window's **Virtual Machines** tab makes and runs machines on this Mac; kRDPclient lists them
-after the Mac itself and connects to their screens the same way.
+## Install
 
-| Guest | Runs on | State |
-|---|---|---|
-| macOS | Apple's Virtualization.framework | installs by itself from a restore image (.ipsw) |
-| Windows 11 (ARM) | bhyve (from FreeBSD) on Hypervisor.framework | installs from Microsoft's own ISO, by hand in the console window or unattended; network, 1920x1080; Windows Update worked |
-| Linux, FreeBSD (arm64) | Virtualization.framework / bhyve | installs from the distribution's ISO |
+1. Download the newest `.dmg` from [Releases](https://github.com/keelos-dev/hyperMAC/releases) and
+   open it. It is signed and notarized.
+2. Drag **hyperMAC** into **Applications** and open it.
+3. First run: type your Mac's login password once (that is what remote clients log in with) and
+   allow **Screen Recording** and **Accessibility**. Only want virtual machines? Click
+   **Virtual Machines Only** on that page and skip both.
 
-What you need to bring: the system's installer (ISO / IPSW); for Windows also the
-[virtio-win driver ISO](https://fedorapeople.org/groups/virt/virtio-win/direct-downloads/) (network driver).
-A Windows machine has a TPM 2.0 and Secure Boot, so Microsoft's installer runs as it is, with its
-hardware checks on.
+Requirements: a Mac with Apple Silicon. Tested on macOS 26 and 27. Intel Macs are not supported.
 
-Known gaps: no graphics acceleration in Windows (basic display driver); no sound from
-virtual machines; bridged networking, sleep/wake and long runs are not tested yet. This part is
-new: expect rough edges and keep copies of anything important.
-
-### Which client
+## Which RDP client
 
 **kRDPclient is the recommended client**: https://github.com/keelos-dev/kRDPclient-releases
 (Windows). In kRDPclient choose "Add keelOS host", enter the Mac's address and your Mac's
@@ -99,7 +153,7 @@ mstsc (Remote Desktop Connection) and other standard RDP clients can connect too
 the picture goes as RemoteFX / bitmaps and is noticeably less smooth. If mstsc feels slow, try
 kRDPclient before judging hyperMAC.
 
-### Known limitations
+### Limits of the RDP server
 
 - A user must be logged in on the Mac: at the login window (after a restart without automatic
   login) nobody can connect. Turn on automatic login in System Settings → Users & Groups.
@@ -114,7 +168,33 @@ kRDPclient before judging hyperMAC.
   kRDPclient (or open hyperMAC and type it), kRDPclient works right away.
 - Updates are not checked by themselves: use "Check for Updates…" in the app.
 
-### Update
+## What is rough
+
+- **This is young.** The virtual machine part is brand new. Keep copies of anything important.
+- No graphics acceleration in Windows (the basic display driver, up to 1920x1200) and no sound
+  from virtual machines yet.
+- Bridged networking, sleep/wake and long uptimes are not tested enough.
+- The firmware's Secure Boot keeps its keys where the guest's kernel could reach them (the EDK2
+  platform has no protected variable store): enough for Windows' requirements, not the strength
+  of a real PC's.
+
+## For the curious: bhyve on Apple Silicon
+
+[xhyve](https://github.com/machyve/xhyve) brought bhyve to Intel Macs in 2015. `vm/bhyve` here is
+the arm64 story:
+
+- FreeBSD's `usr.sbin/bhyve` sources **unchanged**, with a numbered patch series on top and a small
+  compatibility layer, so following FreeBSD head stays cheap.
+- `libvmmapi` reimplemented over **Hypervisor.framework** (`vm/bhyve/hvf`, about 2,000 lines):
+  vCPUs, the framework's in-kernel GICv3, MSIs through a GICv2m frame, instruction decoding for
+  the MMIO accesses the CPU does not describe.
+- What arm64 bhyve did not have and Windows needs: **UEFI** (EDK2), **ACPI** tables, a CFI flash
+  for UEFI variables, QEMU's fw_cfg and ramfb, the **virtio 1.0** transport, a **TPM** (libtpms
+  inside the process), Secure Boot.
+- Eighteen of the patches are written for FreeBSD review, bugs found on the way included
+  (`vm/bhyve/patches/REVIEW.md`). Nothing has been submitted yet.
+
+## Update
 
 Open hyperMAC and click "Check for Updates…" (under About). If there is a newer version it shows
 what changed; "Update" downloads it, checks that it is signed by hyperMAC's developer and notarized
@@ -134,7 +214,7 @@ may keep running.
 Remote Login (SSH) is a macOS setting and is left as it is; turn it off in System Settings →
 General → Sharing if you no longer need it.
 
-### Building from source
+## Building from source
 
 Needs Xcode's command line tools, Rust (rustup, stable) and Python 3; for the TPM of Windows
 machines also `brew install libtpms openssl` (without them bhyve builds without a TPM).
@@ -159,7 +239,7 @@ hyperMAC's own code: MIT ([LICENSE](LICENSE)). `vm/bhyve`, the port of FreeBSD's
 Hypervisor.framework: BSD-2-Clause ([vm/bhyve/LICENSE](vm/bhyve/LICENSE)); FreeBSD's files in
 `vm/bhyve/freebsd` keep their own headers.
 
-### Third-party software
+## Third-party software
 
 hyperMAC is built on [IronRDP](https://github.com/Devolutions/IronRDP) (MIT / Apache-2.0) and
 other open-source Rust crates; its virtual machines use [bhyve](https://bhyve.org) from FreeBSD
@@ -167,147 +247,3 @@ other open-source Rust crates; its virtual machines use [bhyve](https://bhyve.or
 Their notices ship with every copy: `THIRD_PARTY.md`, `LICENSE-IronRDP-MIT`,
 `THIRD_PARTY-crates.txt` and `THIRD_PARTY-vm.txt` are at the top of the dmg and in
 `hyperMAC.app/Contents/Resources/`.
-
-## 中文
-
-hyperMAC 是一个免费的 Mac 用 RDP 服务端：从别的电脑连上来，看到、操作的就是这台 Mac 上当前登录
-的那个桌面，带声音和剪贴板；还能在同一台 Mac 上跑虚拟机（macOS、Windows 11 ARM、Linux、FreeBSD）。
-免费、开源：MIT，`vm/bhyve` 里的 bhyve 移植是 BSD-2-Clause。
-
-1.1 新增（预览）：在同一台 Mac 上跑**虚拟机**，见[虚拟机](#虚拟机预览)。
-
-**系统要求**：Apple Silicon 的 Mac。在 macOS 26 和 27.2 上测过（最低要求 macOS 13，13–15 没测）。不支持 Intel Mac。
-
-### 功能 × macOS 版本
-
-✅ 真机实测 · ☑️ 应该能用，这个版本还没测 · — 没测
-
-| 功能 | 13–15 | 26 | 27.2 |
-|---|:-:|:-:|:-:|
-| kRDPclient：登录、H.264 硬件画面 | — | ✅ | ✅ |
-| mstsc 等标准 RDP 客户端（RemoteFX） | — | ✅ | ☑️ |
-| 键鼠（输入法可用） | — | ✅ | ✅ |
-| 声音（kRDPclient 用 Opus，mstsc 用 PCM） | — | ✅ | ☑️ |
-| 剪贴板：文字 | — | ✅ | ☑️ |
-| 剪贴板：图片 | — | ✅ | ✅ |
-| kRDPclient「Discover keelOS」自动发现 | — | ✅ | ☑️ |
-| 后台运行、登录自启 | — | ✅ | ✅ |
-| macOS 升级后授权不丢 | — | — | ✅（26 → 27.2） |
-| app、首次设置、检查更新 | — | ✅ | ☑️ |
-
-### 和其他 Mac 远程桌面比较
-
-按各家公开说明整理（2026-11），没有全部并排实测。
-
-| | hyperMAC | Apple 屏幕共享 | NoMachine | Chrome 远程桌面 | RustDesk | Parsec |
-|---|---|---|---|---|---|---|
-| 协议 | RDP | VNC + Apple 扩展 | NX | WebRTC | 自有 | 自有 |
-| 视频编码 | H.264 硬编（kRDPclient）；RemoteFX / 位图（mstsc）；声音 Opus / PCM | VNC 编码（Raw/ZRLE/Tight…）；高性能模式 HEVC（两端都是 Apple Silicon Mac） | H.264、VP8 | VP8 / VP9（WebRTC） | VP8 / VP9 / AV1，可选硬件 H.264 / H.265 | H.264、H.265 |
-| Windows 自带 mstsc 能直连 | ✅ | ❌ | ❌ | ❌ | ❌ | ❌ |
-| 要账号/云服务 | 不要 | 不要 | 不要（局域网） | 要 Google 账号 | 不要（可自建中继） | 要 |
-| 给 Windows 客户端的硬件视频 | ✅ H.264（kRDPclient） | ❌ | ✅ | — | ✅ | ✅ |
-| 流畅度（Windows 客户端） | 流畅：1080p 30 fps（局域网可 60），实测解码 7.6 ms、6–10 Mbps、Mac CPU 约 6% | 卡（TigerVNC 实测） | 流畅 | 一般 | 较流畅 | 很流畅（游戏级延迟） |
-| 声音 | ✅ | 只有高性能模式（Mac 客户端） | ✅ | ✅ | ✅ | ✅ |
-| 文件传输 | ❌（计划中） | ✅（Mac 客户端） | ✅ | ❌ | ✅ | ❌ |
-| 停在登录窗口时能连 | ❌ | ✅ | ✅ | ✅ | ✅ | — |
-| 价格 | 免费 | 系统自带 | 个人免费 | 免费 | 开源 | 个人免费 |
-
-适合的场景：对面是 Windows，想用标准 RDP（mstsc 什么都不用装，或者 kRDPclient 走 H.264 硬件编解码），
-中间不经过任何云账号。
-
-### 安装
-
-1. 从 [Releases](https://github.com/keelos-dev/hyperMAC/releases) 下载最新的 `.dmg` 并打开。
-2. 把 **hyperMAC** 拖进「**应用程序**」。
-3. 从「应用程序」打开 hyperMAC，按对话框走：
-   - 输一次这台 Mac 的登录密码：客户端用的就是你的 Mac 账号（用户名 + 登录密码），不用另记密码；
-   - 在「系统设置 → 隐私与安全性」里允许「**屏幕录制**」和「**辅助功能**」。
-     「辅助功能」系统不会替你打开：要在列表里自己把 hyperMAC 的开关打开。
-     macOS 26 第一次有人连上时还会再问一次「要采集屏幕和音频」，选允许；
-   - 可选：打开远程登录（SSH），这样 kRDPclient 能直接开这台 Mac 的终端。
-4. 之后 hyperMAC 在后台运行，每次登录自动启动。随时再打开 app 可以看状态、生成 kRDPclient
-   token、改密码、卸载。
-
-### 虚拟机（预览）
-
-窗口的「**虚拟机**」页可以在这台 Mac 上新建、运行虚拟机；kRDPclient 里它们列在这台 Mac 后面，连法一样。
-
-| 系统 | 跑在 | 状态 |
-|---|---|---|
-| macOS | 苹果的 Virtualization.framework | 用恢复映像（.ipsw）全自动安装 |
-| Windows 11（ARM） | bhyve（来自 FreeBSD）+ Hypervisor.framework | 用微软原版 ISO 安装，可以在控制台窗口里手动装，也可以无人值守；有网络、1920x1080；Windows Update 跑通过 |
-| Linux、FreeBSD（arm64） | Virtualization.framework / bhyve | 用发行版的 ISO 安装 |
-
-需要自备：系统的安装盘（ISO / IPSW）；Windows 还要
-[virtio-win 驱动 ISO](https://fedorapeople.org/groups/virt/virtio-win/direct-downloads/)（网卡驱动）。
-Windows 虚拟机带 TPM 2.0 和 Secure Boot，微软的安装程序原样运行，硬件检查不用关。
-
-已知的缺口：Windows 里没有显卡加速
-（基本显示驱动）；虚拟机没有声音；桥接网络、睡眠唤醒、长时间运行还没测。这部分是新的：会有毛糙的地方，重要的东西请留备份。
-
-### 用什么客户端
-
-**推荐 kRDPclient**：https://github.com/keelos-dev/kRDPclient-releases （Windows）。
-在 kRDPclient 里「添加 keelOS 主机」，填 Mac 的地址和 Mac 的登录密码（kRDPclient 拿它换
-一个 token，不保存密码），也可以填 hyperMAC app 里生成的 token。画面走硬件
-编码的 H.264，声音、剪贴板也都有。
-
-mstsc（远程桌面连接）等标准 RDP 客户端也能连（`Mac地址:3389`，用 Mac 的用户名和登录密码），
-**但它们没有 H.264 通道**，画面走 RemoteFX / 位图，流畅度差一截。用 mstsc 觉得卡的话，
-请先换 kRDPclient 试试。
-
-### 已知限制
-
-- Mac 上要有用户登录着：停在登录窗口（比如重启后没开自动登录）时连不上。建议在「系统设置 →
-  用户与群组」里打开自动登录。
-- Mac 要接着显示器，或者插一个假负载（HDMI 欺骗器）；什么都不接时 macOS 没有屏幕可抓。
-- 剪贴板支持文字和图片（截图、复制的图片），文件还不支持。
-- 鼠标指针是画在画面里的，还没有客户端本地光标。
-- 登录用的就是你的 Mac 账号，知道 Mac 密码的人就能连：密码要设好，3389/443 端口别暴露到公网。
-  hyperMAC 不保存密码本身，只为 mstsc 存一个密码的 NT 哈希（只有你的账号能读）。改了 Mac 密码后旧密码
-  立刻失效；kRDPclient 马上能用新密码，mstsc 要先用新密码从 kRDPclient 登录一次（或者打开 hyperMAC 输一次）。
-- 不会自己检查更新：在 app 里点「检查更新…」。
-
-### 更新
-
-打开 hyperMAC，点「关于」里的「检查更新…」。有新版本时会列出改了什么；点「更新」会下载新版本、
-核对它是 hyperMAC 开发者签名并经苹果公证的，替换 app 并重启服务（正在连着的会话会断开几秒），授权
-不用重新给。
-
-手动覆盖：先退出 hyperMAC 的窗口（⌘Q；窗口开着时 Finder 不让覆盖，会说「hyperMAC 正在使用」），
-再把新的 hyperMAC 拖进去覆盖，然后打开它。后台服务不用停。
-
-### 卸载
-
-1. 打开 hyperMAC，选「卸载自启」。
-2. 删掉「应用程序」里的 hyperMAC 和文件夹 `~/Library/Application Support/hyperMAC`。
-3. 可选：在「系统设置」的「屏幕录制」「辅助功能」里把 hyperMAC 删掉。
-
-远程登录（SSH）是 macOS 自己的设置，卸载时不动它；不需要了就在「系统设置 → 通用 → 共享」里关掉。
-
-### 从源码编译
-
-需要 Xcode 命令行工具、Rust（rustup，stable）和 Python 3；Windows 虚拟机的 TPM 还要
-`brew install libtpms openssl`（没有的话 bhyve 照常能编，只是不带 TPM）。
-
-```sh
-sh build.sh        # target/release/hypermac、vm/target/release/hypermac（虚拟机程序）、vm/bhyve/build/bhyve
-```
-
-钥匙串里有 "Apple Development" 证书时 `build.sh` 用它签名（重新编译后两项授权不丢），否则是 ad hoc 签名。
-`target/release/hypermac install` 装成登录自启。各部分怎么配合、发布怎么打包见
-[docs/DEVELOPING.md](docs/DEVELOPING.md)；虚拟机部分见 [vm/README.md](vm/README.md) 和 [vm/bhyve/README.md](vm/bhyve/README.md)。
-
-这个仓库每次发版从开发仓库收到一份快照，一版一个提交。欢迎提 pull request：合并后会带进开发仓库，下一份快照里就有。
-
-### 许可证
-
-hyperMAC 自己的代码：MIT（[LICENSE](LICENSE)）。`vm/bhyve`（把 FreeBSD 的 bhyve 移植到 Hypervisor.framework）：
-BSD-2-Clause（[vm/bhyve/LICENSE](vm/bhyve/LICENSE)）；`vm/bhyve/freebsd` 里 FreeBSD 的文件保留各自的文件头。
-
-### 第三方软件
-
-hyperMAC 基于 [IronRDP](https://github.com/Devolutions/IronRDP)（MIT / Apache-2.0）和其他开源
-Rust crate；虚拟机部分用了 FreeBSD 的 [bhyve](https://bhyve.org)（BSD 许可）和 [EDK2](https://www.tianocore.org)
-UEFI 固件（BSD-2-Clause-Patent）。它们的声明随每份副本一起发：dmg 根目录和 `hyperMAC.app/Contents/Resources/` 里的
-`THIRD_PARTY.md`、`LICENSE-IronRDP-MIT`、`THIRD_PARTY-crates.txt`、`THIRD_PARTY-vm.txt`。
