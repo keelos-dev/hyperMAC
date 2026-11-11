@@ -11,7 +11,7 @@ use std::path::PathBuf;
 use objc2::MainThreadOnly;
 use objc2::rc::Retained;
 use objc2::runtime::ProtocolObject;
-use objc2_app_kit::{NSBackingStoreType, NSStackViewDistribution, NSWindow, NSWindowStyleMask, NSAlert, NSAlertStyle, NSColor, NSFontWeightMedium, NSFontWeightRegular, NSOpenPanel, NSSecureTextField, NSStackView, NSTextField, NSView};
+use objc2_app_kit::{NSAccessibility, NSBackingStoreType, NSBezelStyle, NSCellImagePosition, NSStackViewDistribution, NSWindow, NSWindowStyleMask, NSAlert, NSAlertStyle, NSColor, NSFontWeightMedium, NSFontWeightRegular, NSOpenPanel, NSSecureTextField, NSStackView, NSTextField, NSView};
 use objc2_foundation::{NSEdgeInsets, NSPoint, NSRect, NSSize};
 
 use super::{as_view, button, copy, fixed_size, hstack, insets, label, mtm, render, row, same_width, section, spacer, switch, with, wrapping};
@@ -49,22 +49,100 @@ fn vms() -> Vec<Vm> {
     v
 }
 
+/// What a button just asked of a VM. Its row shows this (user 2026-11-11: "点完之后先切换执行中，
+/// 完成后改状态") until the VM is there, or until the time is up and the row shows what is true.
+#[derive(Clone, Copy, PartialEq, Debug)]
+pub enum Op {
+    Start,
+    /// the guest was asked to shut down: it may take its time, or ask its user first
+    Stop,
+    Kill,
+    Pause,
+    Resume,
+    Suspend,
+}
+
+impl Op {
+    fn done(self, vm: &Vm) -> bool {
+        let paused = vm.info.as_ref().map(is_paused);
+        match self {
+            Op::Start => vm.info.is_some(),
+            Op::Stop | Op::Kill | Op::Suspend => vm.info.is_none(),
+            Op::Pause => paused != Some(false),
+            Op::Resume => paused != Some(true),
+        }
+    }
+
+    /// seconds after which the row stops saying so (a start that failed: run.log says why)
+    fn patience(self) -> u64 {
+        match self {
+            Op::Start => 20,
+            Op::Stop => 90,
+            Op::Suspend => 60,
+            Op::Kill | Op::Pause | Op::Resume => 10,
+        }
+    }
+
+    fn text(self) -> &'static str {
+        match self {
+            Op::Start => t("正在启动…", "Starting…"),
+            Op::Stop => t("正在关机…", "Shutting down…"),
+            Op::Kill => t("正在关闭…", "Stopping…"),
+            Op::Pause => t("正在暂停…", "Pausing…"),
+            Op::Resume => t("正在继续…", "Resuming…"),
+            Op::Suspend => t("正在挂起…", "Suspending…"),
+        }
+    }
+}
+
+fn is_paused(info: &serde_json::Value) -> bool {
+    info.get("paused").and_then(|v| v.as_bool()).unwrap_or(false)
+}
+
+/// `name`'s row says `op` from now on (instead of what was asked of it before).
+fn mark(name: &str, op: Op) {
+    with(|u| {
+        u.pending.retain(|(n, _, _)| n != name);
+        u.pending.push((name.to_string(), op, std::time::Instant::now()));
+    });
+}
+
+/// Ask a running VM for `cmd`; when it took the request, its row says `op`.
+fn ask(name: &str, cmd: &str, op: Op) {
+    match ctl_request(name, cmd) {
+        Ok(a) => match str_of(&a, "error") {
+            Some(e) => {
+                alert(t("没能执行", "That did not work"), e, &[t("好", "OK")], None, true);
+            }
+            None => mark(name, op),
+        },
+        // no answer: it is gone already, the list shows that
+        Err(_) => {}
+    }
+    render();
+}
+
+/// Forget what is done, what took too long, and what belongs to a VM that is no longer listed.
+fn settle(list: &[Vm]) {
+    with(|u| {
+        u.pending.retain(|(n, op, at)| at.elapsed().as_secs() < op.patience() && list.iter().any(|v| &v.name == n && !op.done(v)))
+    });
+}
+
 /// What the tab shows that changes behind its back (for the window's refresh timer).
 pub fn snapshot() -> String {
-    let starting = with(|u| {
-        // give up on a start after 20 s (the row goes back to "stopped"; run.log says why)
-        u.starting.retain(|(_, at)| at.elapsed().as_secs() < 20);
-        u.starting.iter().map(|(n, _)| n.clone()).collect::<Vec<_>>()
-    });
+    let vms = vms();
+    settle(&vms);
+    let pending = with(|u| u.pending.iter().map(|(n, op, _)| (n.clone(), *op)).collect::<Vec<_>>());
     // ip and state only: the rest of info (frame counters) changes all the time
-    let list: Vec<String> = vms()
+    let list: Vec<String> = vms
         .iter()
         .map(|v| {
             let ip = v.info.as_ref().and_then(|i| i.get("ip")).cloned();
-            format!("{}{}{:?}{:?}{}", v.name, v.conf, v.installing, ip, v.info.is_some())
+            format!("{}{}{:?}{:?}{:?}", v.name, v.conf, v.installing, ip, v.info.as_ref().map(is_paused))
         })
         .collect();
-    format!("{list:?}{starting:?}")
+    format!("{list:?}{pending:?}")
 }
 
 /// One request to a running VM's ctl.sock, its JSON answer (1 s at most).
@@ -103,7 +181,7 @@ fn edit(name: &str, f: impl FnOnce(&mut serde_json::Map<String, serde_json::Valu
 
 pub fn page(root_stack: &NSStackView, width: f64) {
     let list = vms();
-    with(|u| u.starting.retain(|(n, _)| list.iter().any(|v| &v.name == n && v.info.is_none())));
+    settle(&list);
     let running = list.iter().filter(|v| v.info.is_some()).count();
 
     let status = if zh() {
@@ -223,15 +301,39 @@ fn change_storage(running: usize) {
     render();
 }
 
+/// What a row's icon does when clicked; None: not now (the icon is grey).
+type Act = Option<Box<dyn Fn()>>;
+
+fn act(f: impl Fn() + 'static) -> Act {
+    Some(Box::new(f))
+}
+
+/// One square icon button of a row. Every row has the same ones in the same places (user
+/// 2026-11-11: "弄成图标，方形的，对齐，不能按的就显示灰色"); what it does is its tooltip.
+fn icon_button(symbol: &str, tip: &str, action: Act) -> Retained<NSView> {
+    let b = button("", || {});
+    b.setBezelStyle(NSBezelStyle::FlexiblePush);
+    b.setImage(super::symbol(symbol, 12.0).as_deref());
+    b.setImagePosition(NSCellImagePosition::ImageOnly);
+    b.setToolTip(Some(&ns(tip)));
+    b.setAccessibilityLabel(Some(&ns(tip)));
+    fixed_size(&b, 30.0, 26.0);
+    match action {
+        Some(f) => super::bind(&b, f),
+        None => b.setEnabled(false),
+    }
+    as_view(&b)
+}
+
 fn vm_row(vm: &Vm) -> Retained<NSView> {
     let c = &vm.conf;
     let bridged = str_of(c, "net").is_some();
     let os_key = str_of(c, "os").unwrap_or("linux");
     let (icon, color) = match os_key {
         "macos" => ("apple.logo", NSColor::systemGrayColor()),
-        "windows" => ("pc", NSColor::systemBlueColor()),
-        "freebsd" => ("server.rack", NSColor::systemRedColor()),
-        _ => ("terminal.fill", NSColor::systemOrangeColor()),
+        "windows" => ("os.windows", NSColor::systemBlueColor()),
+        "freebsd" => ("os.freebsd", NSColor::systemRedColor()),
+        _ => ("os.linux", NSColor::systemOrangeColor()),
     };
     let os = match os_key {
         "macos" => "macOS",
@@ -242,40 +344,63 @@ fn vm_row(vm: &Vm) -> Retained<NSView> {
     let (cpus, mem) = (num_of(c, "cpus"), num_of(c, "mem_gb"));
     let spec = if zh() { format!("{os} · {cpus} 核 · {mem} GB") } else { format!("{os} · {cpus} CPU · {mem} GB") };
     let name = vm.name.clone();
-    let starting = with(|u| u.starting.iter().any(|(n, _)| n == &vm.name));
+    let op = with(|u| u.pending.iter().find(|(n, _, _)| n == &vm.name).map(|(_, op, _)| *op));
+    let net = if bridged { t("桥接", "bridged") } else { "NAT" };
 
-    let (state, controls): (String, Vec<Retained<NSView>>) = if let Some(what) = &vm.installing {
-        let mut ctl: Vec<Retained<NSView>> = Vec::new();
+    // the icons, left to right; each branch below fills in what can be done now
+    let (mut copy_a, mut console_a, mut run_a, mut suspend_a, mut stop_a, mut eject_a, mut edit_a, mut delete_a): (Act, Act, Act, Act, Act, Act, Act, Act) =
+        (None, None, None, None, None, None, None, None);
+    // the third one starts, pauses or resumes
+    let (mut run_icon, mut run_tip) = ("play.fill", t("启动", "Start"));
+    let mut delete_tip = t("删除…", "Delete…");
+    // rare, and only for a macOS guest: a text button before the icons
+    let mut lead: Vec<Retained<NSView>> = Vec::new();
+    let console = |n: String| {
+        act(move || {
+            // the VM's own process opens the window
+            let _ = ctl_request(&n, "console");
+        })
+    };
+
+    let state: String = if let Some(what) = &vm.installing {
+        // a Windows install runs the VM meanwhile (its Console works)
         if vm.info.is_some() {
-            let n = name.clone();
-            ctl.push(as_view(&button(t("控制台", "Console"), move || {
-                let _ = ctl_request(&n, "console");
-            })));
+            console_a = console(name.clone());
         }
-        let failed = what.starts_with("win:failed:");
         if what.starts_with("win:") {
             let n = name.clone();
-            let title = if failed { t("删除…", "Delete…") } else { t("取消安装…", "Cancel Install…") };
-            ctl.push(as_view(&button(title, move || delete(&n))));
+            if !what.starts_with("win:failed:") {
+                delete_tip = t("取消安装…", "Cancel Install…");
+            }
+            delete_a = act(move || delete(&n));
         }
-        (install_state(what), ctl)
+        install_state(what)
+    } else if let (Some(op), true) = (op.filter(|op| *op != Op::Start), vm.info.is_some()) {
+        // on its way to what was asked. A shutdown is the guest's to do (macOS asks its user
+        // first): the screen and Force Off stay at hand
+        (run_icon, run_tip) = ("pause.fill", t("暂停", "Pause"));
+        if op == Op::Stop {
+            let n = name.clone();
+            console_a = console(name.clone());
+            stop_a = act(move || stop(&n));
+        }
+        op.text().to_string()
     } else if let Some(info) = &vm.info {
         let ip = info.get("ip").and_then(|v| v.as_str()).map(str::to_string);
-        let mut ctl: Vec<Retained<NSView>> = Vec::new();
         if let Some(ip) = ip.clone() {
-            ctl.push(as_view(&button(t("拷贝地址", "Copy Address"), move || copy(ip.clone()))));
+            copy_a = act(move || copy(ip.clone()));
         }
         // a macOS guest serves its own desktop (hyperMAC installed in it): pair with it once, and
         // kRDPclient opens it from this Mac's list (vms.rs "a guest that serves its own desktop")
         if os_key == "macos" && ip.is_some() && !crate::vms::auto_paired(&name) {
             let n = name.clone();
             if crate::vms::paired(&name) {
-                ctl.push(as_view(&button(t("取消远程配对", "Unpair Remote"), move || {
+                lead.push(as_view(&button(t("取消远程配对", "Unpair Remote"), move || {
                     crate::vms::unpair(&n);
                     render();
                 })));
             } else {
-                ctl.push(as_view(&button(t("远程配对…", "Pair for Remote…"), move || {
+                lead.push(as_view(&button(t("远程配对…", "Pair for Remote…"), move || {
                     if let Some((user, password)) = crate::gui::pair_dialog(mtm(), &n) {
                         if let Err(e) = crate::vms::pair(&n, &user, &password) {
                             alert(t("没能配对", "Pairing failed"), &format!("{e:#}"), &[t("好", "OK")], None, true);
@@ -285,68 +410,48 @@ fn vm_row(vm: &Vm) -> Retained<NSView> {
                 })));
             }
         }
-        let n = name.clone();
-        ctl.push(as_view(&button(t("控制台", "Console"), move || {
-            // the VM's own process opens the window
-            let _ = ctl_request(&n, "console");
-        })));
+        console_a = console(name.clone());
         // pause: the machine stands still in memory. suspend (where the engine can): its memory
         // goes to a file, the process ends, the next start goes on from there
-        let paused = info.get("paused").and_then(|v| v.as_bool()).unwrap_or(false);
+        let paused = is_paused(info);
         let n = name.clone();
-        ctl.push(as_view(&button(if paused { t("继续", "Resume") } else { t("暂停", "Pause") }, move || {
-            let _ = ctl_request(&n, if paused { "resume" } else { "pause" });
-            render();
-        })));
+        (run_icon, run_tip) = if paused { ("play.fill", t("继续", "Resume")) } else { ("pause.fill", t("暂停", "Pause")) };
+        run_a = act(move || if paused { ask(&n, "resume", Op::Resume) } else { ask(&n, "pause", Op::Pause) });
         if info.get("can_suspend").and_then(|v| v.as_bool()).unwrap_or(false) {
             let n = name.clone();
-            ctl.push(as_view(&button(t("挂起", "Suspend"), move || {
-                let _ = ctl_request(&n, "suspend");
-                render();
-            })));
+            suspend_a = act(move || ask(&n, "suspend", Op::Suspend));
         }
         let n = name.clone();
-        ctl.push(as_view(&button(t("停止…", "Stop…"), move || stop(&n))));
-        let net = if bridged { t("桥接", "bridged") } else { "NAT" };
+        stop_a = act(move || stop(&n));
         let running = if paused { t("已暂停", "Paused") } else { t("运行中", "Running") };
-        let state = match ip {
+        match ip {
             Some(ip) => format!("{running} · {ip}（{net}）"),
             None => format!("{running} · {}（{net}）", t("还没有地址", "no address yet")),
-        };
-        (state, ctl)
-    } else if starting {
-        (t("正在启动…", "Starting…").to_string(), vec![])
+        }
+    } else if op == Some(Op::Start) {
+        Op::Start.text().to_string()
     } else {
-        let n1 = name.clone();
-        let sw = switch(bridged, move |on| {
-            edit(&n1, |m| {
-                if on {
-                    m.insert("net".into(), "bridged".into());
-                } else {
-                    m.remove("net");
-                }
-            });
-            render();
-        });
-        let sw_l = label(t("桥接", "Bridged"), 11.0, unsafe { NSFontWeightRegular }, &NSColor::secondaryLabelColor());
-        let (n2, n3, n4) = (name.clone(), name.clone(), name.clone());
-        let mut ctl = vec![as_view(&hstack(&[&sw_l, &sw], 4.0))];
+        // stopped. Bridged or NAT is the machine's setting: it is in Edit… (user 2026-11-11:
+        // "bridge的开关是虚拟机属性，不应该在这里出现")
+        let (n2, n3, n4, n5) = (name.clone(), name.clone(), name.clone(), name.clone());
         let has_iso = str_of(c, "iso").is_some();
         if has_iso {
             // the installer is plugged in at every start until it is ejected
-            ctl.push(as_view(&button(t("弹出安装盘", "Eject Installer"), move || {
+            eject_a = act(move || {
                 edit(&n4, |m| {
                     m.remove("iso");
                 });
                 render();
-            })));
+            });
         }
-        let n5 = name.clone();
-        ctl.push(as_view(&button(t("编辑…", "Edit…"), move || edit_vm(&n5))));
-        ctl.push(as_view(&button(t("删除…", "Delete…"), move || delete(&n2))));
+        edit_a = act(move || edit_vm(&n5));
+        delete_a = act(move || delete(&n2));
         // suspended: its memory is in a file; Start goes on from there (vm/src/vm.rs SAVED)
         let suspended = vm_dir(&name).join("suspend.vzvmsave").exists();
-        ctl.push(as_view(&button(if suspended { t("继续", "Resume") } else { t("启动", "Start") }, move || start(&n3))));
+        if suspended {
+            run_tip = t("继续", "Resume");
+        }
+        run_a = act(move || start(&n3));
         let state = if suspended {
             t("已挂起", "Suspended")
         } else if has_iso {
@@ -354,10 +459,21 @@ fn vm_row(vm: &Vm) -> Retained<NSView> {
         } else {
             t("已停止", "Stopped")
         };
-        (state.to_string(), ctl)
+        format!("{state}（{net}）")
     };
+    let mut controls = lead;
+    controls.extend([
+        icon_button("doc.on.doc", t("拷贝地址", "Copy Address"), copy_a),
+        icon_button("display", t("控制台", "Console"), console_a),
+        icon_button(run_icon, run_tip, run_a),
+        icon_button("moon.fill", t("挂起", "Suspend"), suspend_a),
+        icon_button("power", t("停止…", "Stop…"), stop_a),
+        icon_button("eject.fill", t("弹出安装盘", "Eject Installer"), eject_a),
+        icon_button("slider.horizontal.3", t("编辑…", "Edit…"), edit_a),
+        icon_button("trash", delete_tip, delete_a),
+    ]);
     let refs: Vec<&NSView> = controls.iter().map(|v| &**v).collect();
-    let acc = hstack(&refs, 8.0);
+    let acc = hstack(&refs, 6.0);
     row(Some((icon, color)), &vm.name, Some(&format!("{spec} · {state}")), Some(&acc))
 }
 
@@ -411,7 +527,7 @@ fn alert(title: &str, text: &str, buttons: &[&str], accessory: Option<&NSView>, 
 
 fn start(name: &str) {
     match spawn_detached(&["run", name], &vm_dir(name).join("run.log"), &[]) {
-        Ok(()) => with(|u| u.starting.push((name.to_string(), std::time::Instant::now()))),
+        Ok(()) => mark(name, Op::Start),
         Err(e) => {
             alert(t("启动失败", "Could not start"), &e.to_string(), &["OK"], None, true);
         }
@@ -426,15 +542,10 @@ fn stop(name: &str) {
     );
     let title = if zh() { format!("停止「{name}」？") } else { format!("Stop “{name}”?") };
     match alert(&title, text, &[t("关机", "Shut Down"), t("强制关闭", "Force Off"), t("取消", "Cancel")], None, false) {
-        0 => {
-            let _ = ctl_request(name, "stop");
-        }
-        1 => {
-            let _ = ctl_request(name, "kill");
-        }
-        _ => {}
+        0 => ask(name, "stop", Op::Stop),
+        1 => ask(name, "kill", Op::Kill),
+        _ => render(),
     }
-    render();
 }
 
 fn delete(name: &str) {
@@ -826,7 +937,7 @@ fn step_os(root_stack: &NSStackView) {
             Some(&button(t("选择", "Choose"), choose(Os::Mac))),
         ),
         row(
-            Some(("pc", NSColor::systemBlueColor())),
+            Some(("os.windows", NSColor::systemBlueColor())),
             "Windows 11",
             Some(t(
                 "用微软的 ARM64 .iso，在「控制台」里安装，或者无人值守装到桌面",
@@ -835,7 +946,7 @@ fn step_os(root_stack: &NSStackView) {
             Some(&button(t("选择", "Choose"), choose(Os::Windows))),
         ),
         row(
-            Some(("terminal.fill", NSColor::systemOrangeColor())),
+            Some(("os.linux", NSColor::systemOrangeColor())),
             "Linux",
             Some(t("从 arm64 安装盘 .iso 启动，在「控制台」里安装", "Boots an arm64 installer .iso: install it in the Console")),
             Some(&button(t("选择", "Choose"), choose(Os::Linux))),
@@ -845,7 +956,7 @@ fn step_os(root_stack: &NSStackView) {
     // FreeBSD runs on the bhyve engine only
     if bhyve_ok() {
         rows.push(row(
-            Some(("server.rack", NSColor::systemRedColor())),
+            Some(("os.freebsd", NSColor::systemRedColor())),
             "FreeBSD",
             Some(t("从 arm64 安装盘 .iso 启动，在「控制台」里安装（跑在 bhyve 上）", "Boots an arm64 installer .iso: install it in the Console (runs on bhyve)")),
             Some(&button(t("选择", "Choose"), choose(Os::FreeBsd))),

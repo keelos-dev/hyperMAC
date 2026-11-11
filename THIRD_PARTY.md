@@ -93,3 +93,7 @@ installers.
 
 ScreenCaptureKit, VideoToolbox, CoreGraphics, AppKit, Virtualization, Hypervisor and the other system frameworks are part
 of macOS and are not distributed with hyperMAC.
+
+The Linux and FreeBSD marks in the list of virtual machines (`assets/os/linux.svg`,
+`assets/os/freebsd.svg`) are from Simple Icons (https://simpleicons.org, CC0 1.0). The marks
+themselves are trademarks of their owners and stand here only for the system a machine runs.

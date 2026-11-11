@@ -78,8 +78,9 @@ struct Ui {
     /// the About row's status line, updated in place while downloading
     upd_label: Option<Retained<NSTextField>>,
     tab: Tab,
-    /// VMs just started (vmui.rs): "Starting…" until their ctl.sock answers
-    starting: Vec<(String, std::time::Instant)>,
+    /// what was just asked of a VM (vmui.rs): its row says "Starting…", "Shutting down…" and so
+    /// on until the VM is there
+    pending: Vec<(String, vmui::Op, std::time::Instant)>,
     /// New Virtual Machine's steps (vmui.rs), while open
     wizard: Option<vmui::Wizard>,
     /// the wizard is a window of its own, with its own action list: the main window re-renders
@@ -324,7 +325,7 @@ pub fn show(mtm: MainThreadMarker, state: PathBuf, page: Page) {
             upd: Upd::Idle,
             upd_label: None,
             tab: Tab::Host,
-            starting: Vec::new(),
+            pending: Vec::new(),
             wizard: None,
             wizard_actions: Vec::new(),
             binding_wizard: false,
@@ -455,7 +456,22 @@ fn same_width(v: &NSView, of: &NSView, minus: f64) {
     v.widthAnchor().constraintEqualToAnchor_constant(&of.widthAnchor(), -minus).setActive(true);
 }
 
+/// An SF Symbol, or one of the systems' own marks ("os.windows", "os.linux", "os.freebsd":
+/// SF Symbols has Apple's only). Those are assets/os/*.svg, drawn in the tint like a symbol.
 fn symbol(name: &str, size: f64) -> Option<Retained<NSImage>> {
+    let svg: Option<&'static [u8]> = match name {
+        "os.windows" => Some(include_bytes!("../assets/os/windows.svg")),
+        "os.linux" => Some(include_bytes!("../assets/os/linux.svg")),
+        "os.freebsd" => Some(include_bytes!("../assets/os/freebsd.svg")),
+        _ => None,
+    };
+    if let Some(svg) = svg {
+        let img = NSImage::initWithData(<NSImage as objc2::AnyThread>::alloc(), &objc2_foundation::NSData::with_bytes(svg))?;
+        img.setTemplate(true);
+        // a symbol's glyph is about this much larger than its point size
+        img.setSize(NSSize::new(size + 3.0, size + 3.0));
+        return Some(img);
+    }
     let img = NSImage::imageWithSystemSymbolName_accessibilityDescription(&ns(name), None)?;
     let cfg = NSImageSymbolConfiguration::configurationWithPointSize_weight(size, unsafe { NSFontWeightSemibold });
     img.imageWithSymbolConfiguration(&cfg)
