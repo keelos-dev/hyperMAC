@@ -248,6 +248,19 @@ fn download(url: &str, to: &Path, progress: &Progress) -> anyhow::Result<()> {
     }
 }
 
+/// Put `new` (a hyperMAC.app outside /Applications: the one in the dmg, run from there) in place
+/// of the installed /Applications/hyperMAC.app, after the same checks as a downloaded update.
+/// Finder refuses that replacement while anything of the installed app runs (the menu bar icon,
+/// a virtual machine): this does not, the running ones keep the files they have open.
+pub fn install_from(new: &Path) -> anyhow::Result<PathBuf> {
+    let app = PathBuf::from("/Applications/hyperMAC.app");
+    run("codesign", &["--verify", "--deep", "--strict", "-R", REQUIREMENT], &[new])
+        .context("this copy is not signed by hyperMAC's developer")?;
+    run("spctl", &["-a", "-t", "exec"], &[new]).context("Gatekeeper does not accept this copy")?;
+    swap(new, &app)?;
+    Ok(app)
+}
+
 /// The new app goes in beside the old one, then two renames swap them; the old one is deleted.
 fn swap(new: &Path, app: &Path) -> anyhow::Result<()> {
     let dir = app.parent().context("the app's folder")?;

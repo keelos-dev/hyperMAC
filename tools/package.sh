@@ -156,8 +156,8 @@ Install:
 Virtual machines (new, a preview): the window's "Virtual Machines" tab makes macOS, Windows 11
   (ARM) and Linux / FreeBSD machines; kRDPclient lists them after this Mac. A Windows machine has
   a TPM 2.0 and Secure Boot: Microsoft's installer runs as it is.
-Update: open hyperMAC > About > "Check for Updates…". To replace it by hand, quit hyperMAC's
-  window first (⌘Q), then drag the new one over it.
+Update: hyperMAC menu > "Check for Updates…". From a dmg: open the hyperMAC IN the dmg (double-click
+  it there) and click Update; dragging it over the installed one fails while hyperMAC runs.
 Uninstall: open hyperMAC > "Uninstall…", then delete hyperMAC.app and
   ~/Library/Application Support/hyperMAC.
 
@@ -169,8 +169,8 @@ Uninstall: open hyperMAC > "Uninstall…", then delete hyperMAC.app and
      mstsc 等标准 RDP 客户端也能连，但没有 H.264，画面流畅度差一截。
 虚拟机（新功能，预览）：窗口的「虚拟机」页可以建 macOS、Windows 11（ARM）、Linux / FreeBSD 虚拟机，
   kRDPclient 里它们列在这台 Mac 后面。Windows 虚拟机带 TPM 2.0 和 Secure Boot，微软的安装程序原样运行。
-更新：打开 hyperMAC →「关于」→「检查更新…」。要手动覆盖的话，先 ⌘Q 退出 hyperMAC 的窗口，
-  再拖进去覆盖。
+更新：hyperMAC 菜单 →「检查更新…」。用 dmg 更新：直接双击 dmg 里的 hyperMAC，点「更新」；
+  hyperMAC 在运行时拖过去覆盖会被系统拒绝。
 卸载：打开 hyperMAC →「卸载…」，再删掉 hyperMAC.app 和 ~/Library/Application Support/hyperMAC。
 
 Third-party notices / 第三方声明: the Licenses folder / Licenses 文件夹

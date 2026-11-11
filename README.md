@@ -210,9 +210,11 @@ what changed; "Update" downloads it, checks that it is signed by hyperMAC's deve
 by Apple, replaces the app and restarts the service (a session in progress drops for a few
 seconds). The permissions carry over.
 
-By hand: quit hyperMAC's window first (⌘Q; Finder does not replace an app whose window is open:
-"hyperMAC is in use"), drag the new hyperMAC over the old one, then open it. The background service
-may keep running.
+From a downloaded dmg: open it and double-click the hyperMAC **inside the dmg**. It sees the
+installed copy and offers **Update**: the same checks and the same replacement as above. Dragging
+the new one over the old one in Finder does not work while hyperMAC runs ("hyperMAC is in use":
+its menu bar icon and any running virtual machine count). Virtual machines keep running through
+an update either way.
 
 ### Uninstall
 

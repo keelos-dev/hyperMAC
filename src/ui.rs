@@ -782,6 +782,43 @@ fn tabs(root: &NSStackView) {
 }
 
 fn page_not_in_applications(root: &NSStackView) {
+    // an installed copy is there already: this one (opened in the dmg) can replace it itself,
+    // which Finder will not do while the menu bar icon or a virtual machine runs from it
+    let installed = std::path::Path::new("/Applications/hyperMAC.app").exists();
+    let this = std::env::current_exe().ok().and_then(|e| e.canonicalize().ok()).and_then(|e| crate::app_bundle(&e));
+    if let (true, Some(this)) = (installed, this) {
+        header(root, t("更新已安装的 hyperMAC", "Update the installed hyperMAC"), None);
+        paragraph(
+            root,
+            &if zh() {
+                format!("「应用程序」里已经有一份 hyperMAC。点「更新」用这一份（{}）替换它，然后重启服务和菜单栏图标；正在运行的虚拟机不受影响，正在连着的远程会话会断开几秒。", gui::version())
+            } else {
+                format!("There is a hyperMAC in Applications already. Update replaces it with this copy ({}) and restarts the service and the menu bar icon; virtual machines that are running go on, a remote session in progress drops for a few seconds.", gui::version())
+            },
+        );
+        buttons_right(
+            root,
+            None,
+            &[
+                button(t("退出", "Quit"), quit),
+                primary(t("更新", "Update"), move || match crate::update::install_from(&this) {
+                    Ok(app) => {
+                        // the service and the menu bar icon start again on the new files; the
+                        // icon's process opens the window. Never set up: just open the new app.
+                        if crate::agent_plist().map(|p| p.exists()).unwrap_or(false) {
+                            gui::restart_service();
+                            crate::menubar::restart(&state(), true);
+                        } else {
+                            let _ = std::process::Command::new("/bin/sh").arg("-c").arg(format!("sleep 1; /usr/bin/open -n '{}'", app.display())).spawn();
+                        }
+                        NSApplication::sharedApplication(mtm()).terminate(None);
+                    }
+                    Err(e) => gui::error(mtm(), t("没能更新", "The update failed"), &format!("{e:#}")),
+                }),
+            ],
+        );
+        return;
+    }
     header(root, t("先把 hyperMAC 拖进「应用程序」", "Move hyperMAC to Applications first"), None);
     paragraph(
         root,
