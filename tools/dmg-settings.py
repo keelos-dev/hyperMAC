@@ -8,18 +8,14 @@ stage = defines["stage"]  # noqa: F821 (dmgbuild provides `defines`)
 
 format = "UDZO"
 filesystem = "HFS+"
-files = [os.path.join(stage, n) for n in (
-    "hyperMAC.app", "README.txt", "THIRD_PARTY.md", "LICENSE-IronRDP-MIT", "THIRD_PARTY-crates.txt",
-    "THIRD_PARTY-vm.txt")]
+# (the third-party notices in one folder: five long file names in a row ran into each other)
+files = [os.path.join(stage, n) for n in ("hyperMAC.app", "README.txt", "Licenses")]
 symlinks = {"Applications": "/Applications"}
 icon_locations = {
     "hyperMAC.app": (170, 190),
     "Applications": (490, 190),
-    "README.txt": (90, 420),
-    "THIRD_PARTY.md": (210, 420),
-    "LICENSE-IronRDP-MIT": (330, 420),
-    "THIRD_PARTY-crates.txt": (450, 420),
-    "THIRD_PARTY-vm.txt": (570, 420),
+    "README.txt": (250, 420),
+    "Licenses": (410, 420),
 }
 background = defines["background"]  # noqa: F821
 window_rect = ((200, 120), (660, 548))

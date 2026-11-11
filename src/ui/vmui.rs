@@ -265,6 +265,26 @@ fn vm_row(vm: &Vm) -> Retained<NSView> {
         if let Some(ip) = ip.clone() {
             ctl.push(as_view(&button(t("拷贝地址", "Copy Address"), move || copy(ip.clone()))));
         }
+        // a macOS guest serves its own desktop (hyperMAC installed in it): pair with it once, and
+        // kRDPclient opens it from this Mac's list (vms.rs "a guest that serves its own desktop")
+        if os_key == "macos" && ip.is_some() {
+            let n = name.clone();
+            if crate::vms::paired(&name) {
+                ctl.push(as_view(&button(t("取消远程配对", "Unpair Remote"), move || {
+                    crate::vms::unpair(&n);
+                    render();
+                })));
+            } else {
+                ctl.push(as_view(&button(t("远程配对…", "Pair for Remote…"), move || {
+                    if let Some((user, password)) = crate::gui::pair_dialog(mtm(), &n) {
+                        if let Err(e) = crate::vms::pair(&n, &user, &password) {
+                            alert(t("没能配对", "Pairing failed"), &format!("{e:#}"), &[t("好", "OK")], None, true);
+                        }
+                    }
+                    render();
+                })));
+            }
+        }
         let n = name.clone();
         ctl.push(as_view(&button(t("控制台", "Console"), move || {
             // the VM's own process opens the window

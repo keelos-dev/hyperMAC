@@ -138,7 +138,9 @@ rm -f "$ZIP"
 xcrun stapler staple "$APP"
 
 # 5. dmg: the app, a link to /Applications (drag arrow between them), the notices, a short README --------------------
-for n in THIRD_PARTY.md LICENSE-IronRDP-MIT THIRD_PARTY-crates.txt; do cp "$n" "$STAGE/"; done  # THIRD_PARTY-vm.txt is there
+mkdir -p "$STAGE/Licenses"
+for n in THIRD_PARTY.md LICENSE-IronRDP-MIT THIRD_PARTY-crates.txt; do cp "$n" "$STAGE/Licenses/"; done
+mv "$STAGE/THIRD_PARTY-vm.txt" "$STAGE/Licenses/"
 cat > "$STAGE/README.txt" <<TXT
 hyperMAC $VER ($COMMIT) — RDP server for this Mac's desktop, and virtual machines on it
                         把这台 Mac 的桌面开成 RDP 服务，并在它上面跑虚拟机
@@ -171,7 +173,7 @@ Uninstall: open hyperMAC > "Uninstall…", then delete hyperMAC.app and
   再拖进去覆盖。
 卸载：打开 hyperMAC →「卸载…」，再删掉 hyperMAC.app 和 ~/Library/Application Support/hyperMAC。
 
-Third-party notices / 第三方声明: THIRD_PARTY.md, LICENSE-IronRDP-MIT, THIRD_PARTY-crates.txt, THIRD_PARTY-vm.txt
+Third-party notices / 第三方声明: the Licenses folder / Licenses 文件夹
 More / 详情: https://github.com/keelos-dev/hyperMAC
 TXT
 DMG=$OUT/$NAME.dmg

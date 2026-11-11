@@ -133,10 +133,125 @@ pub fn guests(rdp_port: u16) -> Vec<serde_json::Value> {
             });
             if vm.running && vm.own_devices {
                 g["rdp"] = serde_json::json!({ "port": rdp_port });
+            } else if vm.running {
+                // a macOS guest with hyperMAC inside, paired in the window: the client goes there
+                if let Some(d) = direct(&vm.name) {
+                    g["rdp_direct"] = d;
+                }
             }
             g
         })
         .collect()
+}
+
+// ---- a guest that serves its own desktop --------------------------------------------------------
+// A macOS guest's picture cannot be taken on the host (Apple's graphics device shows only in a
+// visible window), so hyperMAC is installed in the guest too and serves the guest's desktop
+// itself. For the client to open it from this host's list, the host is paired with the guest
+// once (the window: the guest's account and password, traded for a token of the guest's
+// hyperMAC, kept in the VM's folder) and then publishes, in the guest's /v1/vms entry:
+//
+//   "rdp_direct": { "host": "192.168.100.42", "port": 3389, "token": "keel_…", "cert_sha256": "…" }
+//
+// host = the guest's address now (it must be one the client reaches: bridged networking);
+// token = the RDP password (any user name; the client's usual one, the VM's name, is fine);
+// cert_sha256 = SHA-256 of the guest's TLS certificate (DER), the one its RDP port presents too.
+// "rdp" stays absent, so a client that does not know rdp_direct says "no RDP" as before.
+
+const PAIRING: &str = "guest-rdp.json";
+
+fn ctl_info(name: &str) -> Option<serde_json::Value> {
+    use std::io::{BufRead, BufReader, Write};
+    let mut s = std::os::unix::net::UnixStream::connect(dir(name).join("ctl.sock")).ok()?;
+    s.set_read_timeout(Some(std::time::Duration::from_secs(1))).ok()?;
+    writeln!(s, "info").ok()?;
+    let mut line = String::new();
+    BufReader::new(s).read_line(&mut line).ok()?;
+    serde_json::from_str(&line).ok()
+}
+
+fn guest_ip(name: &str) -> Option<String> {
+    ctl_info(name)?.get("ip")?.as_str().map(str::to_owned)
+}
+
+pub fn paired(name: &str) -> bool {
+    dir(name).join(PAIRING).exists()
+}
+
+pub fn unpair(name: &str) {
+    let _ = std::fs::remove_file(dir(name).join(PAIRING));
+}
+
+fn direct(name: &str) -> Option<serde_json::Value> {
+    let p: serde_json::Value = serde_json::from_slice(&std::fs::read(dir(name).join(PAIRING)).ok()?).ok()?;
+    let ip = guest_ip(name)?;
+    Some(serde_json::json!({
+        "host": ip,
+        "port": p.get("rdp_port").and_then(|v| v.as_u64()).unwrap_or(3389),
+        "token": p.get("token")?.as_str()?,
+        "cert_sha256": p.get("cert_sha256").and_then(|v| v.as_str()).unwrap_or(""),
+    }))
+}
+
+/// Pair with the hyperMAC inside the running guest `name`: log in to its API with the guest's
+/// account (the password goes to curl on stdin, never into an argument), ask it for a token,
+/// note its certificate's fingerprint, and keep both in the VM's folder (0600).
+pub fn pair(name: &str, user: &str, password: &str) -> anyhow::Result<()> {
+    use anyhow::{Context, bail, ensure};
+    use std::io::Write;
+    use std::process::{Command, Stdio};
+    let ip = guest_ip(name).context("the virtual machine has no address yet")?;
+    let base = format!("https://{ip}:443");
+    // the certificate is the guest's own (self-signed): -k here, its fingerprint kept for the client
+    let pem = Command::new("/usr/bin/openssl").args(["s_client", "-connect", &format!("{ip}:443")]).stdin(Stdio::null()).stderr(Stdio::null()).output()?;
+    ensure!(!pem.stdout.is_empty(), "no answer from {ip}:443 — is hyperMAC installed and running in the virtual machine?");
+    let mut fp = Command::new("/usr/bin/openssl").args(["x509", "-noout", "-fingerprint", "-sha256"]).stdin(Stdio::piped()).stdout(Stdio::piped()).stderr(Stdio::null()).spawn()?;
+    fp.stdin.take().context("openssl")?.write_all(&pem.stdout)?;
+    let fp = String::from_utf8_lossy(&fp.wait_with_output()?.stdout).to_string();
+    let cert: String = fp.rsplit('=').next().unwrap_or("").chars().filter(|c| c.is_ascii_hexdigit()).collect::<String>().to_lowercase();
+    ensure!(cert.len() == 64, "could not read the certificate of {ip}:443");
+
+    let mut login = Command::new("/usr/bin/curl")
+        .args(["-sk", "--max-time", "15", "-i", "-H", "Content-Type: application/json", "--data-binary", "@-", &format!("{base}/login")])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .spawn()?;
+    login.stdin.take().context("curl")?.write_all(serde_json::json!({"user": user, "password": password}).to_string().as_bytes())?;
+    let out = String::from_utf8_lossy(&login.wait_with_output()?.stdout).to_string();
+    let (head, body) = out.split_once("\r\n\r\n").unwrap_or((&out, ""));
+    let cookie = head
+        .lines()
+        .filter_map(|l| l.split_once(':'))
+        .filter(|(k, _)| k.eq_ignore_ascii_case("set-cookie"))
+        .find_map(|(_, v)| v.trim().split(';').next().filter(|c| c.starts_with("keel_access=")).map(str::to_owned));
+    let csrf = serde_json::from_str::<serde_json::Value>(body.trim()).ok().and_then(|v| v.get("csrf").and_then(|c| c.as_str()).map(str::to_owned));
+    let (Some(cookie), Some(csrf)) = (cookie, csrf) else {
+        if head.starts_with("HTTP/1.1 401") {
+            bail!("the virtual machine's hyperMAC refused that user name and password");
+        }
+        bail!("the hyperMAC in the virtual machine did not log us in ({})", head.lines().next().unwrap_or("no answer"));
+    };
+    let host = std::process::Command::new("/bin/hostname").arg("-s").output().map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string()).unwrap_or_default();
+    let made = Command::new("/usr/bin/curl")
+        .args(["-sk", "--max-time", "15", "-H", "Content-Type: application/json", "-H"])
+        .arg(format!("Cookie: {cookie}"))
+        .arg("-H")
+        .arg(format!("X-Keel-CSRF: {csrf}"))
+        .arg("--data-binary")
+        .arg(serde_json::json!({"name": format!("host {host}")}).to_string())
+        .arg(format!("{base}/v1/tokens"))
+        .output()?;
+    let token = serde_json::from_slice::<serde_json::Value>(&made.stdout)
+        .ok()
+        .and_then(|v| v.get("secret").and_then(|s| s.as_str()).map(str::to_owned))
+        .context("the hyperMAC in the virtual machine gave no token")?;
+    let path = dir(name).join(PAIRING);
+    let tmp = path.with_extension("new");
+    std::fs::write(&tmp, serde_json::to_vec_pretty(&serde_json::json!({"token": token, "cert_sha256": cert, "rdp_port": 3389}))?)?;
+    use std::os::unix::fs::PermissionsExt;
+    std::fs::set_permissions(&tmp, std::fs::Permissions::from_mode(0o600))?;
+    std::fs::rename(&tmp, &path)?;
+    Ok(())
 }
 
 /// The VM a login's user name names, if it is one this RDP can show.

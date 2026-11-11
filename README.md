@@ -258,5 +258,5 @@ hyperMAC is built on [IronRDP](https://github.com/Devolutions/IronRDP) (MIT / Ap
 other open-source Rust crates; its virtual machines use [bhyve](https://bhyve.org) from FreeBSD
 (BSD licenses) and the [EDK2](https://www.tianocore.org) UEFI firmware (BSD-2-Clause-Patent).
 Their notices ship with every copy: `THIRD_PARTY.md`, `LICENSE-IronRDP-MIT`,
-`THIRD_PARTY-crates.txt` and `THIRD_PARTY-vm.txt` are at the top of the dmg and in
+`THIRD_PARTY-crates.txt` and `THIRD_PARTY-vm.txt` are in the dmg's `Licenses` folder and in
 `hyperMAC.app/Contents/Resources/`.

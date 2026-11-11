@@ -213,5 +213,5 @@ BSD-2-Clause（[vm/bhyve/LICENSE](vm/bhyve/LICENSE)）；`vm/bhyve/freebsd` 里 
 
 hyperMAC 基于 [IronRDP](https://github.com/Devolutions/IronRDP)（MIT / Apache-2.0）和其他开源
 Rust crate；虚拟机部分用了 FreeBSD 的 [bhyve](https://bhyve.org)（BSD 许可）和 [EDK2](https://www.tianocore.org)
-UEFI 固件（BSD-2-Clause-Patent）。它们的声明随每份副本一起发：dmg 根目录和 `hyperMAC.app/Contents/Resources/` 里的
+UEFI 固件（BSD-2-Clause-Patent）。它们的声明随每份副本一起发：dmg 的 `Licenses` 文件夹和 `hyperMAC.app/Contents/Resources/` 里的
 `THIRD_PARTY.md`、`LICENSE-IronRDP-MIT`、`THIRD_PARTY-crates.txt`、`THIRD_PARTY-vm.txt`。

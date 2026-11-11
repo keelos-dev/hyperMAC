@@ -420,6 +420,30 @@ pub fn version() -> String {
     }
 }
 
+/// "Connect to the hyperMAC inside…": the guest's account, to trade for a token there.
+pub fn pair_dialog(mtm: MainThreadMarker, vm: &str) -> Option<(String, String)> {
+    let view = NSView::initWithFrame(NSView::alloc(mtm), NSRect::new(NSPoint::new(0.0, 0.0), NSSize::new(300.0, 60.0)));
+    let label = |y: f64, name: &str| {
+        let l = NSTextField::labelWithString(&ns(name), mtm);
+        l.setFrame(NSRect::new(NSPoint::new(0.0, y + 2.0), NSSize::new(100.0, 20.0)));
+        view.addSubview(&l);
+    };
+    label(34.0, t("用户名", "User name"));
+    label(2.0, t("密码", "Password"));
+    let user = NSTextField::initWithFrame(NSTextField::alloc(mtm), NSRect::new(NSPoint::new(110.0, 34.0), NSSize::new(180.0, 24.0)));
+    let pass = NSSecureTextField::initWithFrame(NSSecureTextField::alloc(mtm), NSRect::new(NSPoint::new(110.0, 2.0), NSSize::new(180.0, 24.0)));
+    view.addSubview(&user);
+    view.addSubview(&pass);
+    let text = if zh() {
+        format!("先在虚拟机 {vm} 里装好 hyperMAC 并完成它的首次设置。这里输一次虚拟机里那个 Mac 账号的用户名和密码：只用来向它换一个 token，密码不保存。之后 kRDPclient 在这台 Mac 的列表里双击 {vm} 就直接进它的桌面。")
+    } else {
+        format!("Install hyperMAC inside the virtual machine {vm} first and finish its first-run setup. Type the user name and password of the Mac account in the virtual machine once: they are traded for a token there, the password is not kept. After that kRDPclient opens {vm}'s desktop from this Mac's list.")
+    };
+    let r = alert(mtm, t("连接虚拟机里的 hyperMAC", "Connect to the hyperMAC inside"), &text, &[t("配对", "Pair"), t("取消", "Cancel")], Some(&view), false);
+    let (u, p) = (user.stringValue().to_string().trim().to_string(), pass.stringValue().to_string());
+    (r == 0 && !u.is_empty() && !p.is_empty()).then_some((u, p))
+}
+
 /// "Ports…": the two ports the service listens on. None = cancelled or not two different ports.
 pub fn ports_dialog(mtm: MainThreadMarker, rdp: u16, web: u16) -> Option<(u16, u16)> {
     let view = NSView::initWithFrame(NSView::alloc(mtm), NSRect::new(NSPoint::new(0.0, 0.0), NSSize::new(300.0, 60.0)));
