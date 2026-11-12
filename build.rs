@@ -19,6 +19,7 @@ fn main() {
 <plist version="1.0"><dict>
   <key>CFBundleIdentifier</key><string>dev.keelos.hypermac</string>{pad}
   <key>CFBundleName</key><string>hyperMAC</string>
+  <key>NSLocalNetworkUsageDescription</key><string>hyperMAC talks to its virtual machines over their network: coherence mode asks Windows where its windows are.</string>
   <key>NSAudioCaptureUsageDescription</key><string>hyperMAC plays this Mac's sound on the remote client and mutes it here meanwhile.</string>
 </dict></plist>
 "#

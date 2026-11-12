@@ -30,6 +30,14 @@ mod ui;
 mod update;
 mod video;
 mod vms;
+// A bhyve machine's windows in a process of their own (vmwin.rs): the VM program's console and
+// coherence code, compiled in here and fed from outside the machine.
+#[path = "../vm/src/coherence.rs"]
+mod coherence;
+#[path = "../vm/src/console.rs"]
+mod console;
+mod vmwin;
+use vmwin::{bhyve, vgpu, vinput};
 mod vmsound;
 mod web;
 
@@ -619,12 +627,18 @@ async fn serve() -> anyhow::Result<()> {
             println!("{}", if ok { "accepted" } else { "refused" });
             return Ok(());
         }
+        Some("vmwin") => return vmwin::run(argv.get(1).context("hypermac vmwin NAME")?),
         Some("install") => return install(&sub_state()),
         Some("menu-binary") => return refresh_menu_binary(&sub_state()),
         Some("uninstall") => return uninstall(),
         _ => {}
     }
     let a = args(argv.into_iter())?;
+    // The virtual machines that start with the login (vm.json "autostart"). First of all: they
+    // do not depend on the remote desktop being set up or switched on.
+    if std::env::var_os("HYPERMAC_NO_AUTOSTART").is_none() {
+        vms::autostart(&a.state);
+    }
     account::read(&a.state)?; // set up at all? (the logins read it afresh each time)
     // for the app's status page: which executable this service runs (gui.rs `upgrade`)
     if let Ok(exe) = std::env::current_exe() {

@@ -21,10 +21,15 @@ use objc2_app_kit::{
 };
 use objc2_core_foundation::CFData;
 use objc2_core_graphics::{CGBitmapInfo, CGColorRenderingIntent, CGColorSpace, CGDataProvider, CGImage, CGImageAlphaInfo, CGImageByteOrderInfo};
-use objc2_foundation::{NSPoint, NSRect, NSSize, NSString};
+use objc2_app_kit::NSWindowDelegate;
+use objc2_foundation::{NSObjectProtocol, NSPoint, NSRect, NSSize, NSString};
 
 /// the window wants frames (it is open)
 static SHOWN: AtomicBool = AtomicBool::new(false);
+/// This process only shows a machine (the main program's `vmwin`): its menu has a Quit. In the
+/// VM program quitting would be pulling the machine's plug, and there is none.
+#[allow(dead_code)]
+pub static QUIT: AtomicBool = AtomicBool::new(false);
 /// The window is open (someone is at this VM on this Mac).
 pub fn shown() -> bool {
     SHOWN.load(Ordering::Relaxed)
@@ -39,6 +44,48 @@ static KEYS: Mutex<Option<HashSet<u16>>> = Mutex::new(None);
 
 thread_local! {
     static CONSOLE: RefCell<Option<(Retained<NSWindow>, Retained<ConsoleView>)>> = const { RefCell::new(None) };
+    static DELEGATE: RefCell<Option<Retained<WindowDelegate>>> = const { RefCell::new(None) };
+}
+
+define_class!(
+    #[unsafe(super = objc2_foundation::NSObject)]
+    #[thread_kind = MainThreadOnly]
+    #[name = "HyperMACOwnConsoleDelegate"]
+    struct WindowDelegate;
+
+    unsafe impl NSObjectProtocol for WindowDelegate {}
+
+    unsafe impl NSWindowDelegate for WindowDelegate {
+        // The window got another size: where the guest's screen can follow (a bhyve machine
+        // with the 3D adapter), ask it for a screen of the window's size, one guest pixel a
+        // point. When the drag has ended, not during it: every request is a mode change in
+        // the guest. A guest that does not follow keeps its picture, fitted into the window.
+        #[unsafe(method(windowDidEndLiveResize:))]
+        fn did_end_live_resize(&self, _n: &objc2_foundation::NSNotification) {
+            follow_window();
+        }
+
+        // the green button, a double click on the title bar: no live resize around those
+        #[unsafe(method(windowDidResize:))]
+        fn did_resize(&self, _n: &objc2_foundation::NSNotification) {
+            let live = CONSOLE.with(|c| c.borrow().as_ref().is_some_and(|(w, _)| w.inLiveResize()));
+            if !live {
+                follow_window();
+            }
+        }
+    }
+);
+
+fn follow_window() {
+    if !crate::bhyve::active() || !crate::bhyve::resizable() {
+        return;
+    }
+    let Some(size) = CONSOLE.with(|c| c.borrow().as_ref().map(|(_, v)| v.bounds().size)) else { return };
+    let (w, h) = (size.width.round() as u32, size.height.round() as u32);
+    // (the device looks twice a second and ignores the size it has)
+    if let Err(e) = crate::bhyve::request_size(w, h) {
+        eprintln!("console: {e:#}");
+    }
 }
 
 define_class!(
@@ -162,7 +209,7 @@ impl ConsoleView {
     }
 }
 
-fn key(e: &NSEvent, down: bool) {
+pub(crate) fn key(e: &NSEvent, down: bool) {
     let Some(code) = mac_to_linux(e.keyCode()) else { return };
     let mut keys = KEYS.lock().unwrap();
     let keys = keys.get_or_insert_with(HashSet::new);
@@ -179,7 +226,7 @@ fn key(e: &NSEvent, down: bool) {
 }
 
 /// flagsChanged: which modifier, and is it down now (device-dependent bits tell left from right).
-fn modifier(e: &NSEvent) {
+pub(crate) fn modifier(e: &NSEvent) {
     let kc = e.keyCode();
     let flags = e.modifierFlags().0;
     let bit = match kc {
@@ -205,7 +252,7 @@ fn modifier(e: &NSEvent) {
 }
 
 /// macOS virtual key code (kVK_*) -> Linux input key code.
-fn mac_to_linux(kc: u16) -> Option<u16> {
+pub(crate) fn mac_to_linux(kc: u16) -> Option<u16> {
     Some(match kc {
         0x00 => 30, 0x01 => 31, 0x02 => 32, 0x03 => 33, 0x04 => 35, 0x05 => 34, 0x06 => 44, 0x07 => 45,
         0x08 => 46, 0x09 => 47, 0x0a => 86, 0x0b => 48, 0x0c => 16, 0x0d => 17, 0x0e => 18, 0x0f => 19,
@@ -236,9 +283,8 @@ fn mac_to_linux(kc: u16) -> Option<u16> {
 /// Open (or bring forward) the console window. On the main thread.
 pub fn open(title: &str) {
     let Some(mtm) = MainThreadMarker::new() else { return };
+    regular(mtm);
     let app = NSApplication::sharedApplication(mtm);
-    app.setActivationPolicy(NSApplicationActivationPolicy::Regular);
-    set_app_icon(&app);
     let existing = CONSOLE.with(|c| c.borrow().as_ref().map(|(w, _)| w.clone()));
     let window = match existing {
         Some(w) => w,
@@ -280,6 +326,10 @@ pub fn open(title: &str) {
             }
             window.setContentView(Some(&view));
             window.makeFirstResponder(Some(&view));
+            window.setContentMinSize(NSSize::new(640.0, 480.0));
+            let delegate: Retained<WindowDelegate> = unsafe { msg_send![super(WindowDelegate::alloc(mtm).set_ivars(())), init] };
+            window.setDelegate(Some(objc2::runtime::ProtocolObject::from_ref(&*delegate)));
+            DELEGATE.with(|d| *d.borrow_mut() = Some(delegate));
             window.center();
             CONSOLE.with(|c| *c.borrow_mut() = Some((window.clone(), view)));
             window
@@ -356,6 +406,71 @@ fn show(w: u32, h: u32, pix: &[u8]) {
             }
         }
     });
+}
+
+/// This program as one with a Dock icon and a menu bar of its own, while it has windows on
+/// the Mac (the console, the coherence windows). It starts as a background program without
+/// either; made a regular one later, the menu bar would keep showing the menus of the program
+/// that was in front before (user 2026-11-12: "为啥显示hyperMAC时候，mac的顶部是vscode的menu").
+/// So: menus of its own, and the program is activated again after the change, which is when
+/// the menu bar is drawn anew.
+///
+/// No Quit in the VM program's menu: the program is the virtual machine. The items have no key
+/// equivalents: Command combinations in these windows belong to the guest.
+pub fn regular(mtm: MainThreadMarker) {
+    use objc2_app_kit::{NSMenu, NSMenuItem};
+    let app = NSApplication::sharedApplication(mtm);
+    let was = app.activationPolicy();
+    app.setActivationPolicy(NSApplicationActivationPolicy::Regular);
+    set_app_icon(&app);
+    if app.mainMenu().is_none() {
+        let zh = objc2_foundation::NSLocale::preferredLanguages().firstObject().is_some_and(|l| l.to_string().starts_with("zh"));
+        let t = |z: &'static str, e: &'static str| NSString::from_str(if zh { z } else { e });
+        let empty = NSString::from_str("");
+        let item = |menu: &NSMenu, title: &NSString, action: objc2::runtime::Sel| unsafe {
+            menu.addItemWithTitle_action_keyEquivalent(title, Some(action), &empty);
+        };
+        let bar = NSMenu::new(mtm);
+        // the first menu is the program's: the system gives it the program's name
+        let app_menu = NSMenu::new(mtm);
+        item(&app_menu, &t("隐藏 hyperMAC", "Hide hyperMAC"), objc2::sel!(hide:));
+        item(&app_menu, &t("隐藏其他", "Hide Others"), objc2::sel!(hideOtherApplications:));
+        item(&app_menu, &t("全部显示", "Show All"), objc2::sel!(unhideAllApplications:));
+        if QUIT.load(Ordering::Relaxed) {
+            app_menu.addItem(&NSMenuItem::separatorItem(mtm));
+            item(&app_menu, &t("关闭这台虚拟机的窗口（虚拟机继续运行）", "Close This Machine's Windows (it keeps running)"), objc2::sel!(terminate:));
+        }
+        let window_menu = NSMenu::initWithTitle(NSMenu::alloc(mtm), &t("窗口", "Window"));
+        item(&window_menu, &t("最小化", "Minimize"), objc2::sel!(performMiniaturize:));
+        item(&window_menu, &t("缩放", "Zoom"), objc2::sel!(performZoom:));
+        window_menu.addItem(&NSMenuItem::separatorItem(mtm));
+        item(&window_menu, &t("前置全部窗口", "Bring All to Front"), objc2::sel!(arrangeInFront:));
+        for m in [&app_menu, &window_menu] {
+            let holder = NSMenuItem::new(mtm);
+            holder.setSubmenu(Some(m));
+            bar.addItem(&holder);
+        }
+        app.setMainMenu(Some(&bar));
+        app.setWindowsMenu(Some(&window_menu));
+    }
+    if was != NSApplicationActivationPolicy::Regular {
+        // The menu bar is drawn anew when a program becomes the active one, and a program that
+        // is active while it changes stays with the old one: the Dock in front for a moment,
+        // then this program again.
+        let dock = objc2_app_kit::NSRunningApplication::runningApplicationsWithBundleIdentifier(&NSString::from_str("com.apple.dock"));
+        if let Some(d) = dock.firstObject() {
+            #[allow(deprecated)]
+            d.activateWithOptions(objc2_app_kit::NSApplicationActivationOptions::ActivateIgnoringOtherApps);
+        }
+        std::thread::spawn(|| {
+            std::thread::sleep(std::time::Duration::from_millis(200));
+            dispatch2::DispatchQueue::main().exec_async(|| {
+                let Some(mtm) = MainThreadMarker::new() else { return };
+                #[allow(deprecated)]
+                NSApplication::sharedApplication(mtm).activateIgnoringOtherApps(true);
+            });
+        });
+    }
 }
 
 /// The Dock icon of this process: a VM started from the command line has no app bundle, so

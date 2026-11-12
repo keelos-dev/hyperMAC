@@ -11,6 +11,8 @@ for /r %1:\drivers\ %%i in (*.inf) do drvload "%%i"
 goto :eof
 :os
 pnputil /add-driver %1:\drivers\*.inf /subdirs /install > C:\Windows\Temp\hypermac-drivers.log 2>&1
+rem hyperMAC's agent (coherence: the guest's windows as windows of the Mac), when the CD has it
+if exist %1:\agent\install.cmd call %1:\agent\install.cmd nostart
 goto :eof
 :done
 rem hyperMAC (vm/src/winsetup.rs) sees this mark once the VM has shut down, and finishes up

@@ -28,14 +28,16 @@ hyperMAC 做两件事，而且两件事正好配套：
 - **免费、开源。** MIT，bhyve 移植部分 BSD-2-Clause。没有订阅、没有账号、没有遥测。
 - **小而原生。** 一个约 30 MB 的 app：Rust 和 C，不用 QEMU，没有内核扩展，没有以 root 运行的后台服务。一台虚拟机就是一个普通进程。
 - **天生无头。** 虚拟机在 Mac 上不开窗口，关掉 app 的窗口照样运行。要看就开控制台窗口，或者从别的电脑用 RDP 连。
+- **Windows 的程序和 Mac 的窗口摆在一起。** 融合模式（新，实验性）：Windows 虚拟机里的每个窗口变成 Mac 桌面上的一个窗口，周围没有 Windows 桌面。
+- **快照和克隆不占地方。** 停着的虚拟机拍快照、克隆都是一瞬间的事，本身不占空间（APFS 克隆：之后改了多少才存多少）。
 - **两个引擎，各用所长。** macOS 和 Linux 用苹果的 Virtualization.framework（苹果官方支持的路）；
   Windows 和 FreeBSD 用 bhyve——Virtualization.framework 不管的地方。
 
 ## 三步装好 Windows 11
 
-1. 准备两个文件：[微软官网](https://www.microsoft.com/software-download/windows11arm64)的 **Windows 11 ARM64 ISO**，
-   和 [virtio-win 驱动 ISO](https://fedorapeople.org/groups/virt/virtio-win/direct-downloads/)（网卡驱动）。放进「下载」。
-2. 打开 hyperMAC →「**虚拟机**」→「**新建虚拟机…**」→ **Windows 11**。两个文件它自己会找到。
+1. 打开 hyperMAC →「**虚拟机**」→「**新建虚拟机…**」→ **Windows 11**。
+2. 准备 **Windows 11 ARM64 ISO**：窗口里有个按钮打开[微软的下载页](https://www.microsoft.com/software-download/windows11arm64)，
+   在那里选语言、下载；文件到了「下载」文件夹，窗口里自己会出现。（安装要用的 virtio-win 驱动 ISO 由它自动下载。）
 3. 点「**创建**」，再点「**启动**」。在控制台窗口里像真机一样装；或者打开「无人值守」，填用户名和密码，8 分钟后回来。
 
 就这些。不用绕过 TPM，不会看到「这台电脑无法运行 Windows 11」。
@@ -169,10 +171,24 @@ mstsc（远程桌面连接）等标准 RDP 客户端也能连（`Mac地址:3389`
 ## 还毛糙的地方
 
 - **它还很新。** 虚拟机部分刚做出来。重要的东西请留备份。
-- Windows 里的 3D 加速刚做出来，默认不开：在虚拟机的 `vm.json` 里加 `"gpu3d": true`（app 里还没有开关）。
+- Windows 里的 3D 加速刚做出来，默认不开：新建虚拟机时有开关；已有的虚拟机在「编辑…」里打开
+  （这时会给 Windows 插一张带驱动的光盘，在里面运行一次 install.cmd）。
   是 Direct3D 11：桌面、Edge、WebGL 都走它，Direct3D 11 的游戏也是（Unigine Heaven 4.0，1920x1080 全屏、2 倍抗锯齿，
   Mac mini M4 上平均 78 帧；WebGL Aquarium 500 条鱼，MacBook Air M4 上 1024x768 是 57 帧）。抗锯齿最高 4 倍（Mac 的 GPU 只到这里），
   游戏要 8 倍时会说设不了显示模式。没有 Direct3D 12、OpenGL、Vulkan。不开时 Windows 用基本显示驱动，最大 1920x1200。
+- 融合模式（运行中的 Windows 虚拟机那一行的开关；要开 3D 加速，Windows 的屏幕才能变成和 Mac 一样大）是第一版。开着的时候 Mac 菜单栏里有一个按钮，
+  点开是开始菜单、Windows 桌面上的项目、文件资源管理器。指针一直是 Mac 的箭头，不跟着 Windows 变形状；Windows 的一个像素是一个点，Retina 屏上会发虚；
+  两个互相遮挡的 Windows 窗口之间夹了一个 Mac 窗口时，下面那个会露出上面那个的一块；菜单四周有一圈它在 Windows 里背后的东西；剪贴板不通；只管主显示器。
+  在这些窗口里左 Command 是 Windows 的 Ctrl（Cmd-C 就是拷贝），右 Command 是 Windows 键。
+  Mac 和 Windows 里的一个小程序之间走的是虚拟机自己的一个端口，不走网络。用这一版新建的虚拟机什么都不用管；以前建的，第一次拨开关时会插上一张光盘
+  （在 Windows 里以管理员身份运行一次上面的 install.cmd），并且要重启一次。在那之前走的是网络：要用 NAT，还要 macOS 的「本地网络」权限。
+  在一台机器上手用过一个下午（开窗口、打字、开始菜单、窗口里跑 Direct3D 基准测试），没有用过几天。开着时 Windows 11 拖窗口时顶部的贴靠布局条是关的。
+- 快照和克隆只能对停着的虚拟机做（运行中的磁盘正写到一半）。克隆出来的网卡地址是新的，系统里的电脑名和账号还是原来的。
+- 屏幕跟着控制台窗口的大小变：开了 3D 加速的 Windows、macOS 虚拟机、用 Virtualization.framework 自带显卡的 Linux 可以。
+  hyperMAC 默认建的 Linux（用自己的 virtio-gpu，这样 RDP 才能显示它）、FreeBSD、没开 3D 的 Windows 还是「编辑…」里定的大小，缩放进窗口。
+- Linux 虚拟机的 Rosetta（跑 x86-64 程序；新建和「编辑…」里有开关）要在虚拟机里运行一条命令，「编辑…」里可以拷贝。
+  用 Fedora 45 试过；虚拟机重启后设置是否还在，还没测。
+- 「登录后自动启动」是登录这台 Mac 时启动虚拟机；Mac 开机但没人登录时不会启动。
 - 虚拟机的声音只有 Windows 有：虚拟机的窗口开着时在 Mac 上播放，kRDPclient 连着这台虚拟机时发给它（刚做）。
   macOS、Linux、FreeBSD 虚拟机还没有声音。
 - 桥接网络、睡眠唤醒、长时间运行测得还不够。

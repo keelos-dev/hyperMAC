@@ -14,6 +14,8 @@
 //!   hypermac run NAME [--vnc-port P] [--console]   run it; no window unless --console / ctl console.
 //!                                         For other machines: VNC on port P
 //!   hypermac ctl NAME info|console|stop|kill   talk to a running VM (ctl.sock); console = open its window
+//!   hypermac clone SRC NEW               a second VM from a stopped one's disk (snap.rs)
+//!   hypermac snapshot NAME [LABEL]       keep a stopped VM as it is; snapshots / restore / snapshot-rm
 //!   hypermac ip NAME                      the guest's address (the host's DHCP leases)
 //!   hypermac net NAME nat|bridged[:IF]    NAT (default) or on the host's LAN (vmnet.rs)
 //!   sudo hypermac netd-install            the root helper bridged networking needs
@@ -23,10 +25,12 @@
 //!   vm.json, disk.img (sparse raw), aux.img, hardware-model, machine-id, ctl.sock, run.log
 
 mod bhyve;
+mod coherence;
 mod console;
 mod fbdev;
 mod rfb;
 mod shm;
+mod snap;
 mod sound;
 mod vgpu;
 mod vinput;
@@ -80,6 +84,19 @@ pub struct VmConf {
     /// the VM starts as before, on the framebuffer.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub gpu3d: bool,
+    /// started when the Mac's user logs in (the service does it, once per login: src/vms.rs
+    /// `autostart` in the main program)
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub autostart: bool,
+    /// Linux on Virtualization.framework: Rosetta, so the guest runs x86-64 Linux programs. The
+    /// guest sees a virtiofs share named "rosetta" with the translator in it and has to mount
+    /// it and register it for x86-64 binaries (vm/README.md has the lines).
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub rosetta: bool,
+    /// Windows: the token of hyperMAC's agent in the guest (vm/tools/win-agent), which tells
+    /// the host where the guest's windows are (coherence.rs). `hypermac agent NAME` makes it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub agent: Option<String>,
 }
 
 impl VmConf {
@@ -190,6 +207,19 @@ fn main() -> anyhow::Result<()> {
     match args.first().map(String::as_str) {
         Some("create") => vm::create(&name()?, &args[2..]),
         Some("win-resume") => winsetup::resume(&name()?),
+        Some("clone") => snap::clone(&name()?, args.get(2).context("hypermac clone SRC NEW")?),
+        Some("snapshot") => snap::take(&name()?, &args.get(2..).unwrap_or_default().join(" ")),
+        Some("snapshots") => snap::print(&name()?),
+        Some("restore") => snap::restore(&name()?, args.get(2).context("hypermac restore NAME ID (hypermac snapshots NAME lists them)")?),
+        Some("snapshot-rm") => snap::remove(&name()?, args.get(2).context("hypermac snapshot-rm NAME ID")?),
+        Some("gpu3d") => match args.get(2).map(String::as_str) {
+            Some(v @ ("on" | "off")) => bhyve::set_gpu3d(&name()?, v == "on"),
+            _ => anyhow::bail!("hypermac gpu3d NAME on|off"),
+        },
+        // a CD with the agent for coherence (coherence.rs), plugged in at the next starts
+        Some("agent") => bhyve::agent_cd(&name()?),
+        // the virtio-win driver ISO a Windows install needs, into the storage folder's iso/
+        Some("fetch-virtio") => bhyve::fetch_virtio(None).map(|p| println!("{}", p.display())),
         Some("run") => vm::run(&name()?, &args[2..]),
         Some("ctl") => ctl(&name()?, args.get(2).map(String::as_str).unwrap_or("info")),
         Some("net") => {
@@ -235,7 +265,7 @@ fn main() -> anyhow::Result<()> {
             }
             Ok(())
         }
-        _ => anyhow::bail!("usage: hypermac create NAME --ipsw PATH [...] | create NAME --os linux --iso PATH [...] | run NAME [--vnc-port P] | ctl NAME info|stop|kill|pause|resume|suspend | ip NAME | net NAME nat|bridged[:IF] | list | serve [--listen ADDR:PORT] | token new [NAME]|list|revoke ID | netd-install (sudo)"),
+        _ => anyhow::bail!("usage: hypermac create NAME --ipsw PATH [...] | create NAME --os linux --iso PATH [...] | run NAME [--vnc-port P] | ctl NAME info|stop|kill|pause|resume|suspend|size W H|coherence on|off | agent NAME | clone SRC NEW | snapshot NAME [LABEL] | snapshots NAME | restore NAME ID | snapshot-rm NAME ID | ip NAME | net NAME nat|bridged[:IF] | list | serve [--listen ADDR:PORT] | token new [NAME]|list|revoke ID | netd-install (sudo)"),
     }
 }
 

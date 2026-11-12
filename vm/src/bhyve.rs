@@ -36,9 +36,10 @@ const AUTOUNATTEND: &str = include_str!("../tools/win11-bhyve/autounattend.xml")
 const AUTOUNATTEND_MANUAL: &str = include_str!("../tools/win11-bhyve/autounattend-manual.xml");
 const HYPERMAC_CMD: &str = include_str!("../tools/win11-usb/hypermac.cmd");
 
-/// virtio-win's drivers for bhyve's devices: the NIC and the RNG. The disk is NVMe, the
-/// keyboard and pointer USB HID, the display the firmware's framebuffer: all Windows' own drivers.
-const DRIVERS: &[&str] = &["NetKVM", "viorng"];
+/// virtio-win's drivers for bhyve's devices: the NIC, the RNG, and the serial port that is the
+/// channel to hyperMAC's agent (AGENT_PORT). The disk is NVMe, the keyboard and pointer USB
+/// HID, the display the firmware's framebuffer: all Windows' own drivers.
+const DRIVERS: &[&str] = &["NetKVM", "viorng", "vioserial"];
 
 /// bhyve's framebuffer device takes this much at most
 const MAX_W: isize = 1920;
@@ -238,6 +239,17 @@ static INPUT: Mutex<Option<TcpStream>> = Mutex::new(None);
 static POINTER: Mutex<(u16, u16, u8)> = Mutex::new((0, 0, 0));
 
 /// This process runs a bhyve VM: vgpu's and vinput's entry points come here.
+/// until when (ms since the epoch) someone is at this machine in a window of another process
+static VIEWER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+fn now_ms() -> u64 {
+    std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_millis() as u64).unwrap_or(0)
+}
+
+fn watched() -> bool {
+    VIEWER.load(Ordering::Relaxed) > now_ms()
+}
+
 pub fn active() -> bool {
     ACTIVE.load(Ordering::Relaxed)
 }
@@ -306,6 +318,49 @@ fn kgpu_snapshot(last: Option<u64>) -> Option<(u64, u32, u32, Vec<u8>)> {
         seq = now;
     }
     Some((KGPU_FRAME | seq as u64, w, h, pix))
+}
+
+/// Ask the guest for another screen size (the console's window was resized; ctl "size W H").
+/// Only a machine with the 3D adapter can follow: the request goes into the adapter's shared
+/// memory (struct kgpu_shm: req_width, req_height, req_seq), the device makes it the preferred
+/// mode and tells the guest's driver that the display changed. Whether the picture then
+/// changes is the guest's doing. The framebuffer (no 3D) has the size the firmware started with.
+pub fn request_size(w: u32, h: u32) -> anyhow::Result<(u32, u32)> {
+    let name = KGPU_NAME.lock().unwrap().clone().context("this machine runs without the 3D adapter: its screen keeps the size it started with")?;
+    // (the device rounds the width down to 8 pixels itself; said here so the answer is what happens)
+    let (w, h) = ((w.clamp(640, 3840)) & !7, h.clamp(480, 2160));
+    let cname = std::ffi::CString::new(format!("/keel-gpu-{name}"))?;
+    let fd = unsafe { libc::shm_open(cname.as_ptr(), libc::O_RDWR, 0) };
+    ensure!(fd >= 0, "the 3D adapter's shared memory: {}", std::io::Error::last_os_error());
+    let p = unsafe { libc::mmap(std::ptr::null_mut(), KGPU_PIXELS, libc::PROT_READ | libc::PROT_WRITE, libc::MAP_SHARED, fd, 0) };
+    unsafe { libc::close(fd) };
+    ensure!(p != libc::MAP_FAILED, "the 3D adapter's shared memory: {}", std::io::Error::last_os_error());
+    let r = (|| {
+        let b = p as *mut u8;
+        ensure!(kgpu_u32(b, 0) == 0x3170676b, "the 3D adapter is not up yet");
+        unsafe {
+            // req_seq at 20, req_width at 24, req_height at 28: the size first, then the count
+            (b.add(24) as *mut u32).write_volatile(w);
+            (b.add(28) as *mut u32).write_volatile(h);
+            (b.add(20) as *mut u32).write_volatile(kgpu_u32(b, 20).wrapping_add(1));
+        }
+        Ok((w, h))
+    })();
+    unsafe { libc::munmap(p, KGPU_PIXELS) };
+    r
+}
+
+/// Can this machine's screen follow a window (see `request_size`)?
+pub fn resizable() -> bool {
+    KGPU_NAME.lock().unwrap().is_some()
+}
+
+/// The 3D adapter's scanout size, while its driver shows one (and this process has looked at it).
+fn kgpu_size() -> Option<(u32, u32)> {
+    let g = KGPU.lock().unwrap();
+    let p = g.0.as_ref()?.0;
+    let (active, w, h) = (kgpu_u32(p, 8), kgpu_u32(p, 12), kgpu_u32(p, 16));
+    (kgpu_u32(p, 0) == 0x3170676b && active != 0 && w != 0 && h != 0).then_some((w, h))
 }
 
 /// vgpu::snapshot for this engine.
@@ -659,6 +714,13 @@ fn arguments(name: &str, dir: &Path, conf: &VmConf, fw: &Path, tty: &str, fb_por
         },
     };
     s(format!("8,virtio-net,{net},mac={}", conf.mac));
+    if conf.os == "windows" {
+        // The channel to hyperMAC's agent in the guest (tools/win-agent: coherence): a
+        // virtio-console port, here a socket in the VM's folder, in Windows the port
+        // \\.\hypermac.agent once the vioserial driver is there. Nothing of the network in
+        // it. A guest without the driver has one device more that it has no use for.
+        s(format!("{AGENT_SLOT},virtio-console,{AGENT_PORT}={}", d("agent.sock")));
+    }
     if gpu3d {
         // The 3D adapter, a device of its own beside fbuf (the layout Triton's driver knows from
         // QEMU): the firmware, setup and a guest without the driver stay on fbuf; once the driver
@@ -676,6 +738,10 @@ fn arguments(name: &str, dir: &Path, conf: &VmConf, fw: &Path, tty: &str, fb_por
     a.push(name.into());
     a
 }
+
+/// The agent's channel: its PCI slot, and the port's name (hmagent.cs opens \\.\NAME).
+const AGENT_SLOT: u32 = 10;
+const AGENT_PORT: &str = "hypermac.agent";
 
 /// The VM gets a sound card.
 fn hda(conf: &VmConf) -> bool {
@@ -707,6 +773,8 @@ pub fn run(name: &str, args: &[String], conf: VmConf) -> anyhow::Result<()> {
     let fw = firmware().context("the UEFI firmware (QEMU_EFI.fd) is missing: run build.sh")?;
     let sock = dir.join("ctl.sock");
     kill_stale(&dir);
+    // (bhyve makes the agent's channel anew; one left from a machine that was killed is in its way)
+    let _ = std::fs::remove_file(dir.join("agent.sock"));
 
     crate::no_app_nap();
     ACTIVE.store(true, Ordering::Relaxed);
@@ -715,7 +783,7 @@ pub fn run(name: &str, args: &[String], conf: VmConf) -> anyhow::Result<()> {
     }
     if hda(&conf) {
         // the guest's sound on this Mac while its window is open (sound.rs)
-        crate::sound::start(&dir, crate::console::shown);
+        crate::sound::start(&dir, || crate::console::shown() || watched());
     }
     let vnc = crate::rfb::start(num(args, "--vnc-port", 0) as u16, conf.vnc_password.clone())?;
     VNC_PORT.store(vnc, Ordering::Relaxed);
@@ -897,6 +965,26 @@ pub fn run(name: &str, args: &[String], conf: VmConf) -> anyhow::Result<()> {
                         serde_json::json!({"error": "bhyve is not running"})
                     }
                 }
+                // "viewer 1|0": the main program's window process (src/vmwin.rs) shows this
+                // machine on the Mac (said every second while it does; believed for five)
+                l if l.starts_with("viewer") => {
+                    let until = if l.ends_with('1') { now_ms() + 5000 } else { 0 };
+                    VIEWER.store(until, Ordering::Relaxed);
+                    serde_json::json!({"ok": true})
+                }
+                // each of the guest's windows as a window of the Mac (coherence.rs)
+                l if l.starts_with("coherence") => crate::coherence::ctl(l, Some(&dir.join("agent.sock")), crate::lease(&conf.mac), conf.agent.as_deref()),
+                // "size W H": another screen size, where the guest can follow (request_size)
+                l if l.starts_with("size ") => {
+                    let a: Vec<u32> = l.split_whitespace().skip(1).filter_map(|x| x.parse().ok()).collect();
+                    match a.as_slice() {
+                        [w, h] => match request_size(*w, *h) {
+                            Ok((w, h)) => serde_json::json!({"ok": true, "w": w, "h": h}),
+                            Err(e) => serde_json::json!({"error": format!("{e:#}")}),
+                        },
+                        _ => serde_json::json!({"error": "size W H"}),
+                    }
+                }
                 "suspend" => serde_json::json!({"error": "suspending to a file is not there yet for machines on the bhyve engine: pause keeps one in memory"}),
                 // the ACPI power button; the process ends when the guest is down
                 "stop" => {
@@ -931,7 +1019,8 @@ pub fn run(name: &str, args: &[String], conf: VmConf) -> anyhow::Result<()> {
                     "mac": conf.mac,
                     "net": conf.net.clone().unwrap_or("nat".into()),
                     "ip": crate::lease(&conf.mac),
-                    "screen": size().map(|(w, h)| format!("{w}x{h}")),
+                    "screen": kgpu_size().or_else(size).map(|(w, h)| format!("{w}x{h}")),
+                    "resizable": resizable(),
                     "paused": PAUSED.load(Ordering::Relaxed),
                     "can_suspend": false,
                 }),
@@ -950,7 +1039,10 @@ pub fn run(name: &str, args: &[String], conf: VmConf) -> anyhow::Result<()> {
     // an app without a Dock icon: it has a window only while the console is open
     let mtm = MainThreadMarker::new().context("not on the main thread")?;
     let app = NSApplication::sharedApplication(mtm);
-    app.setActivationPolicy(NSApplicationActivationPolicy::Accessory);
+    // (`--console` has opened the window by now, and made this a program with a Dock icon)
+    if !crate::console::shown() {
+        app.setActivationPolicy(NSApplicationActivationPolicy::Accessory);
+    }
     app.run();
     Ok(())
 }
@@ -983,11 +1075,53 @@ fn shot(path: &Path) -> anyhow::Result<serde_json::Value> {
 
 // ---- create: Windows 11 ARM from Microsoft's ISO --------------------------------------------
 
+/// The newest stable virtio-win.iso (the Fedora project's build of the virtio drivers for
+/// Windows: the network card's, and what else `DRIVERS` names).
+const VIRTIO_URL: &str = "https://fedorapeople.org/groups/virt/virtio-win/direct-downloads/stable-virtio/virtio-win.iso";
+
+/// A virtio-win ISO in the storage folder's iso/, downloaded when none is there (about 840 MB).
+/// `progress`: the folder of the VM being created (its `installing` file gets "dlv:PERCENT").
+pub fn fetch_virtio(progress: Option<&Path>) -> anyhow::Result<PathBuf> {
+    if let Some(p) = virtio_here() {
+        return Ok(p);
+    }
+    // The stable address names the current version by a redirect, and that redirect goes to
+    // plain HTTP. Only the name is taken from it: the file itself is asked for over HTTPS.
+    let out = Command::new("/usr/bin/curl").args(["-sIL", "--max-time", "30", "-o", "/dev/null", "-w", "%{url_effective}", VIRTIO_URL]).output().context("curl")?;
+    let found = String::from_utf8_lossy(&out.stdout).trim().to_string();
+    let url = match found.strip_prefix("http://") {
+        Some(rest) => format!("https://{rest}"),
+        None => found,
+    };
+    ensure!(url.starts_with("https://fedorapeople.org/") && url.ends_with(".iso"), "virtio-win.iso: {VIRTIO_URL} leads to {url:?}; is this Mac online?");
+    let file = url.rsplit('/').next().unwrap_or("virtio-win.iso").to_string();
+    eprintln!("virtio-win: {url}");
+    crate::vm::fetch(&url, &file, progress.map(|d| (d, "dlv")), true)
+}
+
+/// The virtio-win ISO in the storage folder's iso/, if one is there (the newest by name).
+fn virtio_here() -> Option<PathBuf> {
+    let iso = crate::storage().join("iso");
+    let mut here: Vec<PathBuf> = std::fs::read_dir(&iso)
+        .into_iter()
+        .flatten()
+        .flatten()
+        .map(|e| e.path())
+        .filter(|p| p.file_name().is_some_and(|n| {
+            let n = n.to_string_lossy().to_lowercase();
+            n.starts_with("virtio-win") && n.ends_with(".iso")
+        }))
+        .collect();
+    here.sort();
+    here.pop()
+}
+
 /// `hypermac create NAME --os windows --iso WINDOWS.iso --virtio virtio-win.iso --user U`
 /// (the password in HYPERMAC_WIN_PASSWORD) on this engine.
 pub fn create_windows(name: &str, args: &[String]) -> anyhow::Result<()> {
     let iso = PathBuf::from(opt(args, "--iso").context("--iso PATH (Microsoft's Windows 11 ARM ISO)")?);
-    let virtio = PathBuf::from(opt(args, "--virtio").context("--virtio PATH (virtio-win.iso)")?);
+    // no --virtio (or "download"): the one in the storage folder's iso/, downloaded when none is there
+    let virtio = opt(args, "--virtio").filter(|v| *v != "download").map(PathBuf::from);
     // --manual: setup asks its questions in the console; else the account for the unattended install
     let account = if args.iter().any(|a| a == "--manual") {
         None
@@ -998,7 +1132,9 @@ pub fn create_windows(name: &str, args: &[String]) -> anyhow::Result<()> {
         Some((user, password))
     };
     ensure!(iso.exists(), "{}: no such file", iso.display());
-    ensure!(virtio.exists(), "{}: no such file", virtio.display());
+    if let Some(v) = &virtio {
+        ensure!(v.exists(), "{}: no such file", v.display());
+    }
     program().context("bhyve is missing: run build.sh (it builds vm/bhyve)")?;
     firmware().context("the UEFI firmware (QEMU_EFI.fd) is missing: run build.sh")?;
 
@@ -1029,12 +1165,31 @@ pub fn create_windows(name: &str, args: &[String]) -> anyhow::Result<()> {
         c.os_version.get_or_insert_with(|| "11".into());
         c.gpu3d = want3d;
     })?;
+    // every new Windows machine gets the agent (coherence.rs) with its setup
+    let token = agent_token()?;
+    ws::edit_conf(name, |c| c.agent = Some(token))?;
     // Secure Boot: the VM's UEFI variables start as the template with the keys in it
     let secure_boot = match vars_template() {
         Some(t) => std::fs::copy(&t, dir.join("vars.fd")).is_ok(),
         None => false,
     };
     let disk = std::fs::metadata(dir.join("disk.img")).map(|m| m.len()).unwrap_or(0);
+    let virtio = match virtio {
+        Some(v) => v,
+        None => {
+            ws::mark(&dir, "dlv:0");
+            match fetch_virtio(Some(&dir)) {
+                Ok(v) => v,
+                // deleted in the window meanwhile: nothing to mark
+                Err(e) if !dir.exists() => return Err(e),
+                Err(e) => {
+                    ws::fail(&dir, &format!("{e:#}"));
+                    return Err(e);
+                }
+            }
+        }
+    };
+    ws::mark(&dir, "win:stick");
     let lab = labconfig(&crate::load(name)?, disk, secure_boot);
     eprintln!("Secure Boot: {}; setup's hardware checks: {}", if secure_boot { "on" } else { "off (no key template)" }, if lab.is_empty() { "on" } else { "switched off" });
     if let Err(e) = setup_cd(name, &iso, &virtio, account.as_ref(), &lab, &setup) {
@@ -1048,6 +1203,138 @@ pub fn create_windows(name: &str, args: &[String]) -> anyhow::Result<()> {
         return Ok(());
     }
     install(name, &dir)
+}
+
+/// What the driver CD's install.cmd is (Windows: run as administrator).
+const GPU3D_CMD: &str = "@echo off\r\nrem hyperMAC: the 3D adapter's driver (Triton, viogpu3d). Run as administrator.\r\npnputil /add-driver \"%~dp0viogpu3d\\*.inf\" /subdirs /install\r\npause\r\n";
+
+/// `hypermac gpu3d NAME on|off`: 3D for a Windows VM that was made without it (the window's
+/// Edit… does this). On: vm.json "gpu3d", and a CD with the guest's driver (gpu3d-driver.iso in
+/// the VM's folder; volume HMGPU3D) plugged in at the next starts: in Windows, run its
+/// install.cmd as administrator once. Until the driver is in, Windows stays on the plain
+/// framebuffer. Off: the adapter and the CD go.
+pub fn set_gpu3d(name: &str, on: bool) -> anyhow::Result<()> {
+    let conf = crate::load(name)?;
+    let dir = vm_dir(name);
+    ensure!(is(&conf) && conf.os == "windows", "{name}: 3D acceleration is for Windows machines on the bhyve engine");
+    ensure!(std::os::unix::net::UnixStream::connect(dir.join("ctl.sock")).is_err(), "{name} is running: shut it down first");
+    let cd = dir.join("gpu3d-driver.iso");
+    let cd_s = cd.to_string_lossy().into_owned();
+    if !on {
+        ws::edit_conf(name, |c| {
+            c.gpu3d = false;
+            if c.iso.as_deref() == Some(&cd_s) {
+                c.iso = None;
+            }
+            if c.drivers.as_deref() == Some(&cd_s) {
+                c.drivers = None;
+            }
+        })?;
+        let _ = std::fs::remove_file(&cd);
+        return Ok(());
+    }
+    let g = gpu3d().context("the 3D engine (bhyve-3d and gpu3d/ beside it) is not installed")?;
+    let Some(driver) = g.driver else {
+        // no driver here to hand over: the adapter alone, the driver is the user's to find
+        eprintln!("gpu3d: no driver for the guest (gpu3d/driver/viogpu3d.inf): install Triton's viogpu3d in Windows yourself");
+        return ws::edit_conf(name, |c| c.gpu3d = true);
+    };
+    let tmp = std::env::temp_dir().join(format!("hypermac-g3-{}", std::process::id()));
+    let stage = tmp.join("cd");
+    let made = (|| {
+        ws::copy_tree(&driver, &stage.join("viogpu3d"), &|_| false)?;
+        std::fs::write(stage.join("install.cmd"), GPU3D_CMD)?;
+        let _ = std::fs::remove_file(&cd);
+        ws::run(Command::new("/usr/bin/hdiutil").args(["makehybrid", "-quiet", "-iso", "-joliet", "-default-volume-name", "HMGPU3D", "-o"]).arg(&cd).arg(&stage))?;
+        anyhow::Ok(())
+    })();
+    let _ = std::fs::remove_dir_all(&tmp);
+    made?;
+    ws::edit_conf(name, |c| {
+        c.gpu3d = true;
+        plug_cd(c, &cd_s);
+    })
+}
+
+/// Plug a CD of hyperMAC's own into one of the machine's two CD drives: the one that is free
+/// (an installer still plugged in keeps its own; another of hyperMAC's CDs gives way).
+fn plug_cd(c: &mut VmConf, cd: &str) {
+    let ours = |p: &str| p.ends_with("/gpu3d-driver.iso") || p.ends_with("/agent.iso");
+    if c.iso.as_deref() == Some(cd) || c.drivers.as_deref() == Some(cd) {
+    } else if c.drivers.as_deref().is_none_or(|d| !Path::new(d).exists()) {
+        c.drivers = Some(cd.to_string());
+    } else if c.iso.is_none() {
+        c.iso = Some(cd.to_string());
+    } else if c.drivers.as_deref().is_some_and(ours) {
+        c.drivers = Some(cd.to_string());
+    } else {
+        eprintln!("both CD drives are taken: eject the installer, then plug in {cd}");
+    }
+}
+
+const AGENT_CS: &str = include_str!("../tools/win-agent/hmagent.cs");
+const AGENT_CMD: &str = include_str!("../tools/win-agent/install.cmd");
+
+/// A new token for a machine's agent.
+fn agent_token() -> anyhow::Result<String> {
+    let mut b = [0u8; 16];
+    std::fs::File::open("/dev/urandom").and_then(|mut f| f.read_exact(&mut b))?;
+    Ok(b.iter().map(|x| format!("{x:02x}")).collect())
+}
+
+/// The agent's files into `dir`: its source, the script that compiles and installs it, the token.
+fn agent_files(dir: &Path, token: &str) -> anyhow::Result<()> {
+    std::fs::create_dir_all(dir)?;
+    std::fs::write(dir.join("hmagent.cs"), AGENT_CS)?;
+    // (cmd.exe reads its scripts with CR LF line ends)
+    std::fs::write(dir.join("install.cmd"), AGENT_CMD.replace("\r\n", "\n").replace('\n', "\r\n"))?;
+    std::fs::write(dir.join("agent.token"), token)?;
+    Ok(())
+}
+
+/// `hypermac agent NAME`: a CD with the agent that coherence needs (coherence.rs), plugged in
+/// at the next starts: agent.iso in the VM's folder, volume HMAGENT, with the agent's source,
+/// install.cmd (run it in Windows as administrator, once: it compiles and installs the agent)
+/// and the token the agent will ask of the host. The token is made once and kept in vm.json.
+pub fn agent_cd(name: &str) -> anyhow::Result<()> {
+    let conf = crate::load(name)?;
+    let dir = vm_dir(name);
+    ensure!(is(&conf) && conf.os == "windows", "{name}: the agent is for Windows machines on the bhyve engine");
+    let token = match conf.agent.clone() {
+        Some(t) => t,
+        None => agent_token()?,
+    };
+    let cd = dir.join("agent.iso");
+    let tmp = std::env::temp_dir().join(format!("hypermac-agent-{}", std::process::id()));
+    let stage = tmp.join("cd");
+    let made = (|| {
+        agent_files(&stage, &token)?;
+        // the driver of the agent's channel (AGENT_PORT), from the virtio-win ISO a Windows
+        // machine was made with: install.cmd adds it. Without the ISO the agent is reached
+        // over the network as before. (Not downloaded for this: 840 MB behind a button.)
+        match virtio_here().context("no virtio-win ISO in the storage folder's iso/").and_then(|iso| {
+            let m = ws::Mounted::iso(&iso, &tmp)?;
+            let from = m.path.join("vioserial/w11/ARM64");
+            ensure!(from.exists(), "{}: no vioserial/w11/ARM64", iso.display());
+            ws::copy_tree(&from, &stage.join("vioserial"), &|p| p.extension().is_some_and(|e| e == "pdb"))
+        }) {
+            Ok(_) => {}
+            Err(e) => eprintln!("the agent's channel driver is not on the CD ({e:#}): the agent will be reached over the network"),
+        }
+        let _ = std::fs::remove_file(&cd);
+        ws::run(Command::new("/usr/bin/hdiutil").args(["makehybrid", "-quiet", "-iso", "-joliet", "-default-volume-name", "HMAGENT", "-o"]).arg(&cd).arg(&stage))?;
+        anyhow::Ok(())
+    })();
+    let _ = std::fs::remove_dir_all(&tmp);
+    made?;
+    let running = std::os::unix::net::UnixStream::connect(dir.join("ctl.sock")).is_ok();
+    let cd_s = cd.to_string_lossy().into_owned();
+    ws::edit_conf(name, |c| {
+        c.agent = Some(token.clone());
+        plug_cd(c, &cd_s);
+    })?;
+    eprintln!("{}: the CD HMAGENT is plugged in{}. In Windows, run its install.cmd as administrator.", name, if running { " from the next start" } else { "" });
+    Ok(())
 }
 
 /// setup.iso: autounattend.xml (setup looks for it on every drive), hypermac.cmd, the drivers.
@@ -1091,6 +1378,10 @@ fn setup_cd(name: &str, iso: &Path, virtio: &Path, account: Option<&(String, Str
         if let Some(d) = &driver3d {
             ws::copy_tree(d, &stage.join("drivers").join("viogpu3d"), &|_| false)?;
             eprintln!("gpu3d: the guest's driver from {}", d.display());
+        }
+        // the agent for coherence (coherence.rs): hypermac.cmd installs it during setup
+        if let Some(token) = crate::load(name)?.agent {
+            agent_files(&stage.join("agent"), &token)?;
         }
         let _ = std::fs::remove_file(out);
         ws::run(Command::new("/usr/bin/hdiutil").args(["makehybrid", "-quiet", "-iso", "-joliet", "-default-volume-name", "HMSETUP", "-o"]).arg(out).arg(&stage))?;

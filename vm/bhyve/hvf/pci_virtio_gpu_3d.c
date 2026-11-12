@@ -14,8 +14,13 @@
  *	SET_SCANOUT_BLOB, RESOURCE_FLUSH	the blob is a shared memory object with linear
  *						pixels: copied to the 2D device's picture
  *
- * No vrend (OpenGL): VIRGL_RENDERER_NO_VIRGL, so RESOURCE_CREATE_3D and the TRANSFER_*_3D
- * commands are errors and there is no VIRGL capset; viogpu3d works without one.
+ * No vrend (OpenGL): VIRGL_RENDERER_NO_VIRGL, so RESOURCE_CREATE_3D is an error. The guest's
+ * driver wants a virgl context for one thing all the same: a present that is a copy (a
+ * Direct3D program in a window that does not flip: the picture goes from its back buffer to
+ * the surface the desktop's compositor made for the window). Without one it gives up, and
+ * such windows are black. So there is a VIRGL capset, and a context made with it is ours (the
+ * "blit context" below): the few commands the driver sends it are done here, on the pixels,
+ * which both surfaces have in shared memory.
  *
  * Threads: commands come on a vCPU thread with the device's lock held, which also keeps the
  * calls into virglrenderer one at a time. The renderer retires fences on a thread of its own
@@ -38,6 +43,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <time.h>
 #include <unistd.h>
 
 #include <Hypervisor/Hypervisor.h>
@@ -89,8 +95,16 @@ enum {
 #define	VIRTIO_GPU_BLOB_MEM_HOST3D	2
 #define	VIRTIO_GPU_SHM_ID_HOST_VISIBLE	1
 #define	VIRTIO_PCI_CAP_SHARED_MEMORY_CFG 8
+#define	CAPSET_VIRGL	1
+#define	CAPSET_VIRGL2	2
 #define	CAPSET_VENUS	4
 #define	CAPSET_NEPTUNE	7
+/* sizeof(struct virgl_caps_v1) (virgl_hw.h): what the VIRGL capset is said to be long */
+#define	VIRGL_CAPS_V1_SIZE	308
+/* virgl's commands that the driver's copy present sends (virgl_protocol.h) */
+#define	VIRGL_CCMD_RESOURCE_COPY_REGION		17
+#define	VIRGL_CCMD_PIPE_RESOURCE_SET_TYPE	49
+#define	MAX_BLT_CTX	32
 #define	MAX_CAPSETS	4
 #define	GUEST_PAGE	4096u		/* the stage-2 granule (vmmapi_hvf.c asks for 4 KiB) */
 
@@ -105,12 +119,24 @@ struct vgpu_hdr {
 struct res3d {
 	LIST_ENTRY(res3d) link;
 	uint32_t id;
+	uint32_t ctx;			/* the context that made it (a blob) */
 	struct iovec *iov;		/* the guest's pages of a blob with guest memory */
 	uint32_t niov;
 	void *map;			/* in the window: host address, offset, length */
 	uint64_t map_off, map_len;
 	uint8_t *pix;			/* a scanout blob's shared memory (linear pixels), mapped */
 	size_t pix_len;
+	/* the blit context's: the pixels to write as well, and what the driver said they are */
+	uint8_t *rw;
+	size_t rw_len;
+	uint32_t t_format, t_width, t_height, t_stride, t_offset;
+	/*
+	 * Not a blob: a texture of the blit context's own (RESOURCE_CREATE_3D), its pixels in
+	 * memory of this process (rw), the guest's copy in pages attached later (iov). The
+	 * driver makes these for surfaces Windows reads on the CPU: the redirection surface
+	 * of a window that is presented by copies, the primary before the compositor runs.
+	 */
+	int classic;
 };
 
 struct fence {
@@ -138,7 +164,19 @@ struct vtgpu3d {
 	uint32_t so_res;
 	uint8_t *so_map;
 	uint32_t so_format, so_width, so_height, so_stride, so_offset;
+	/*
+	 * The scanout is shown when its picture is whole: so_late while the context that drew
+	 * it still has fences under way that were there when the guest flipped to it (up to
+	 * so_fence), since so_late_ms (scanout_show).
+	 */
+	int so_late, no_late;		/* no_late: VTGPU3D_LATE=0, every picture at once as before */
+	uint64_t so_fence, so_late_ms;
 	int debug;
+	/* the blit context(s): contexts the guest made with the VIRGL capset */
+	int blt;
+	uint32_t blt_ctx[MAX_BLT_CTX];
+	uint32_t nblt;
+	uint64_t blt_copies, blt_said;
 };
 
 static struct res3d *
@@ -219,6 +257,7 @@ scanout_off(struct vtgpu3d *g)
 	g->host.present(g->host.arg, NULL, 0, 0, 0, 0, 0, 0);
 	g->so_map = NULL;
 	g->so_res = 0;
+	g->so_late = 0;
 }
 
 static void
@@ -231,6 +270,78 @@ scanout_present(struct vtgpu3d *g, uint32_t y, uint32_t rows)
 	    g->so_format, g->so_width, g->so_height, g->so_stride, y, rows);
 }
 
+static uint64_t
+now_ms(void)
+{
+	struct timespec ts;
+
+	clock_gettime(CLOCK_MONOTONIC, &ts);
+	return ((uint64_t)ts.tv_sec * 1000 + (uint64_t)ts.tv_nsec / 1000000);
+}
+
+/* does the scanout's context still have a fence under way from before the flip? */
+static int
+scanout_busy(struct vtgpu3d *g, uint32_t ctx, uint64_t upto)
+{
+	struct fence *p;
+
+	STAILQ_FOREACH(p, &g->pending, link)
+		if (p->ctx_id == ctx && p->fence_id <= upto)
+			return (1);
+	return (0);
+}
+
+/*
+ * The guest shows a picture (a flip to another blob, a flush): show it here. The guest says
+ * so when it has sent the drawing, not when the drawing is done: the compositor's commands
+ * are still under way in the renderer, and what is copied at once can be a frame without
+ * what is drawn last (seen 2026-11-12: with a program redrawing under another window, the
+ * upper window's title bar was missing in about one copy in thirty). The context's fences
+ * that are pending now are that work: the picture is copied when they have retired
+ * (scanout_retired, from the fence thread), or after a tenth of a second whatever happens.
+ */
+static void
+scanout_show(struct vtgpu3d *g, uint32_t y, uint32_t rows)
+{
+	struct res3d *r = res_find(g, g->so_res);
+	struct fence *p;
+	uint64_t last = 0;
+	int any = 0;
+
+	if (r != NULL && !r->classic && r->ctx != 0)
+		STAILQ_FOREACH(p, &g->pending, link)
+			if (p->ctx_id == r->ctx) {
+				any = 1;
+				if (p->fence_id > last)
+					last = p->fence_id;
+			}
+	if (!any || g->no_late || (g->so_late && now_ms() - g->so_late_ms > 100)) {
+		g->so_late = 0;
+		scanout_present(g, y, rows);
+		return;
+	}
+	if (!g->so_late)
+		g->so_late_ms = now_ms();
+	g->so_late = 1;
+	g->so_fence = last;
+}
+
+/* fences have retired (the device's lock is held): is the picture that waited whole now? */
+static void
+scanout_retired(struct vtgpu3d *g)
+{
+	struct res3d *r;
+
+	if (!g->so_late)
+		return;
+	r = res_find(g, g->so_res);
+	if (r != NULL && scanout_busy(g, r->ctx, g->so_fence) && now_ms() - g->so_late_ms <= 100)
+		return;
+	g->so_late = 0;
+	if (g->so_res != 0)
+		scanout_present(g, 0, g->so_height);
+}
+
 static void
 res_free(struct vtgpu3d *g, struct res3d *r)
 {
@@ -239,8 +350,17 @@ res_free(struct vtgpu3d *g, struct res3d *r)
 
 	if (g->so_res == r->id)
 		scanout_off(g);
+	if (r->classic) {
+		free(r->rw);
+		free(r->iov);
+		LIST_REMOVE(r, link);
+		free(r);
+		return;
+	}
 	if (r->pix != NULL)
 		munmap(r->pix, r->pix_len);
+	if (r->rw != NULL)
+		munmap(r->rw, r->rw_len);
 	res_unmap(g, r);
 	virgl_renderer_resource_detach_iov(r->id, &iov, &n);
 	virgl_renderer_resource_unref(r->id);
@@ -311,6 +431,7 @@ fence_thread(void *arg)
 			}
 			free(f);
 		}
+		scanout_retired(g);
 		g->host.unlock(g->host.arg);
 	}
 	return (NULL);
@@ -349,6 +470,305 @@ fence_or_done(struct vtgpu3d *g, const struct vgpu_hdr *h, uint64_t token)
 	return (VTGPU3D_DEFERRED);
 }
 
+/*
+ * The blit context: what viogpu3d sends a virgl context for a present that is a copy
+ * (viogpu_device.cpp GenerateBltPresent): PIPE_RESOURCE_SET_TYPE for each surface once (its
+ * format and layout), RESOURCE_COPY_REGION per rectangle, and transfers for a surface the
+ * guest also keeps in its own memory. A surface's pixels are linear, in shared memory that the
+ * renderer's texture is made on (DXMT's shared textures; the scanout is read the same way), so
+ * the copy is done here on the CPU and the compositor's texture has it at once.
+ */
+
+static int blt_red_first(uint32_t virgl_format);
+
+static int
+blt_is(struct vtgpu3d *g, uint32_t ctx_id)
+{
+	uint32_t i;
+
+	for (i = 0; i < g->nblt; i++)
+		if (g->blt_ctx[i] == ctx_id)
+			return (1);
+	return (0);
+}
+
+/* a surface's pixels, for writing too: its shared memory, mapped the first time */
+static uint8_t *
+blt_pixels(struct vtgpu3d *g, struct res3d *r, size_t *len)
+{
+	struct stat st;
+	uint32_t fd_type = 0;
+	int fd = -1;
+
+	if (r->rw == NULL && !r->classic) {
+		if (virgl_renderer_resource_export_blob(r->id, &fd_type, &fd) != 0 ||
+		    fd_type != VIRGL_RENDERER_BLOB_FD_TYPE_SHM || fstat(fd, &st) != 0 ||
+		    st.st_size <= 0) {
+			if (g->blt_said++ < 40)
+				EPRINTLN("virtio-gpu 3d: blit: resource %u is not shared memory (type %u)",
+				    r->id, fd_type);
+			if (fd >= 0)
+				close(fd);
+			return (NULL);
+		}
+		r->rw = mmap(NULL, (size_t)st.st_size, PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0);
+		close(fd);
+		if (r->rw == MAP_FAILED) {
+			r->rw = NULL;
+			return (NULL);
+		}
+		r->rw_len = (size_t)st.st_size;
+	}
+	*len = r->rw_len;
+	return (r->rw);
+}
+
+/* a texture of the blit context's own: RESOURCE_CREATE_3D */
+static uint32_t
+blt_create(struct vtgpu3d *g, const uint8_t *b, size_t len)
+{
+	/* resource_id, target, format, bind, width, height, depth, array_size, last_level, nr_samples, flags */
+	uint32_t c[11];
+	struct res3d *r;
+
+	if (len < sizeof(c))
+		return (RESP_ERR_INVALID_PARAMETER);
+	memcpy(c, b, sizeof(c));
+	if (c[0] == 0 || res_find(g, c[0]) != NULL)
+		return (RESP_ERR_INVALID_RESOURCE_ID);
+	/* a flat picture of 32-bit pixels: what a surface is */
+	if (c[1] != 2 /* PIPE_TEXTURE_2D */ || blt_red_first(c[2]) < 0 || c[4] == 0 || c[5] == 0 ||
+	    c[4] > 16384 || c[5] > 16384 || c[6] > 1 || c[8] != 0) {
+		if (g->blt_said++ < 40)
+			EPRINTLN("virtio-gpu 3d: blit: a texture of target %u, format %u, %ux%ux%u, %u levels is not made",
+			    c[1], c[2], c[4], c[5], c[6], c[8] + 1);
+		return (RESP_ERR_UNSPEC);
+	}
+	if ((r = calloc(1, sizeof(*r))) == NULL)
+		return (RESP_ERR_OUT_OF_MEMORY);
+	r->rw_len = (size_t)c[4] * c[5] * 4;
+	if ((r->rw = calloc(1, r->rw_len)) == NULL) {
+		free(r);
+		return (RESP_ERR_OUT_OF_MEMORY);
+	}
+	r->id = c[0];
+	r->classic = 1;
+	r->t_format = c[2];
+	r->t_width = c[4];
+	r->t_height = c[5];
+	r->t_stride = c[4] * 4;
+	LIST_INSERT_HEAD(&g->res, r, link);
+	return (RESP_OK_NODATA);
+}
+
+/* the guest's pages for one of those: RESOURCE_ATTACH_BACKING */
+static uint32_t
+blt_backing(struct vtgpu3d *g, struct res3d *r, const uint8_t *b, size_t len)
+{
+	/* resource_id, nr_entries; then {addr, length, padding} */
+	uint32_t n, i;
+
+	if (len < 8)
+		return (RESP_ERR_INVALID_PARAMETER);
+	memcpy(&n, b + 4, 4);
+	if (n > 1u << 20 || len < 8 + (size_t)n * 16)
+		return (RESP_ERR_INVALID_PARAMETER);
+	free(r->iov);
+	r->niov = 0;
+	if ((r->iov = calloc(n ? n : 1, sizeof(*r->iov))) == NULL)
+		return (RESP_ERR_OUT_OF_MEMORY);
+	for (i = 0; i < n; i++) {
+		uint64_t gpa;
+		uint32_t l;
+
+		memcpy(&gpa, b + 8 + (size_t)i * 16, 8);
+		memcpy(&l, b + 8 + (size_t)i * 16 + 8, 4);
+		r->iov[i].iov_base = paddr_guest2host(g->pi->pi_vmctx, gpa, l);
+		r->iov[i].iov_len = l;
+		if (r->iov[i].iov_base == NULL) {
+			free(r->iov);
+			r->iov = NULL;
+			return (RESP_ERR_INVALID_PARAMETER);
+		}
+	}
+	r->niov = n;
+	return (RESP_OK_NODATA);
+}
+
+/* bytes between a texture's pixels here and the guest's pages, from `off` in the pages */
+static void
+blt_pages(struct res3d *r, uint64_t off, uint8_t *p, size_t n, int to_guest)
+{
+	uint32_t i;
+
+	for (i = 0; i < r->niov && n != 0; i++) {
+		size_t l = r->iov[i].iov_len, m;
+
+		if (off >= l) {
+			off -= l;
+			continue;
+		}
+		m = MIN(n, l - (size_t)off);
+		if (to_guest)
+			memcpy((uint8_t *)r->iov[i].iov_base + off, p, m);
+		else
+			memcpy(p, (uint8_t *)r->iov[i].iov_base + off, m);
+		p += m;
+		n -= m;
+		off = 0;
+	}
+}
+
+/* TRANSFER_TO_HOST_3D (the guest's pages -> the texture) and TRANSFER_FROM_HOST_3D */
+static uint32_t
+blt_transfer(struct vtgpu3d *g, const uint8_t *b, size_t len, int to_guest)
+{
+	/* box x, y, z, w, h, d; offset (64 bits); resource_id, level, stride, layer_stride */
+	uint32_t c[12], x, y, w, h, stride, row;
+	uint64_t off;
+	struct res3d *r;
+
+	if (len < sizeof(c))
+		return (RESP_ERR_INVALID_PARAMETER);
+	memcpy(c, b, sizeof(c));
+	memcpy(&off, &c[6], 8);
+	if ((r = res_find(g, c[8])) == NULL || !r->classic) {
+		if (g->blt_said++ < 40)
+			EPRINTLN("virtio-gpu 3d: blit: transfer %s for resource %u: not a texture of ours",
+			    to_guest ? "from the host" : "to the host", c[8]);
+		return (RESP_OK_NODATA);
+	}
+	x = c[0], y = c[1], w = c[3], h = c[4];
+	if (x >= r->t_width || y >= r->t_height || r->iov == NULL)
+		return (RESP_OK_NODATA);
+	w = MIN(w, r->t_width - x);
+	h = MIN(h, r->t_height - y);
+	/* (no stride given: the rows of the box follow each other) */
+	stride = c[10] != 0 ? c[10] : w * 4;
+	for (row = 0; row < h; row++)
+		blt_pages(r, off + (uint64_t)row * stride,
+		    r->rw + (size_t)(y + row) * r->t_stride + (size_t)x * 4, (size_t)w * 4, to_guest);
+	/* the guest drew into what is on the screen */
+	if (!to_guest && r->id == g->so_res)
+		scanout_present(g, y, h);
+	return (RESP_OK_NODATA);
+}
+
+/* red first in memory (R8G8B8A8, R8G8B8X8, their sRGB), or blue first; -1: not a 32-bit one we know */
+static int
+blt_red_first(uint32_t virgl_format)
+{
+	switch (virgl_format) {
+	case 67: case 134: case 104:
+		return (1);
+	case 1: case 2: case 100: case 101:
+		return (0);
+	default:
+		return (-1);
+	}
+}
+
+/* dst <- src, a rectangle; the numbers are RESOURCE_COPY_REGION's */
+static void
+blt_copy(struct vtgpu3d *g, const uint32_t *c)
+{
+	struct res3d *d = res_find(g, c[0]), *s = res_find(g, c[5]);
+	uint32_t dx = c[2], dy = c[3], sx = c[7], sy = c[8], w = c[10], h = c[11], y, x;
+	uint8_t *dp, *sp;
+	size_t dlen, slen;
+	int dr, sr;
+
+	if (d == NULL || s == NULL || d->t_stride == 0 || s->t_stride == 0) {
+		if (g->blt_said++ < 40)
+			EPRINTLN("virtio-gpu 3d: blit: copy %u <- %u: %s", c[0], c[5],
+			    d == NULL || s == NULL ? "no such resource" : "a surface without its type");
+		return;
+	}
+	dr = blt_red_first(d->t_format);
+	sr = blt_red_first(s->t_format);
+	if (dr < 0 || sr < 0) {
+		if (g->blt_said++ < 40)
+			EPRINTLN("virtio-gpu 3d: blit: copy %u (format %u) <- %u (format %u): not done",
+			    c[0], d->t_format, c[5], s->t_format);
+		return;
+	}
+	/* what is outside either surface is not copied */
+	if (sx >= s->t_width || sy >= s->t_height || dx >= d->t_width || dy >= d->t_height)
+		return;
+	w = MIN(w, MIN(s->t_width - sx, d->t_width - dx));
+	h = MIN(h, MIN(s->t_height - sy, d->t_height - dy));
+	if ((dp = blt_pixels(g, d, &dlen)) == NULL || (sp = blt_pixels(g, s, &slen)) == NULL)
+		return;
+	if ((uint64_t)d->t_offset + (uint64_t)(dy + h - 1) * d->t_stride + (uint64_t)(dx + w) * 4 > dlen ||
+	    (uint64_t)s->t_offset + (uint64_t)(sy + h - 1) * s->t_stride + (uint64_t)(sx + w) * 4 > slen)
+		return;
+	for (y = 0; y < h; y++) {
+		uint8_t *o = dp + d->t_offset + (size_t)(dy + y) * d->t_stride + (size_t)dx * 4;
+		const uint8_t *i = sp + s->t_offset + (size_t)(sy + y) * s->t_stride + (size_t)sx * 4;
+
+		if (dr == sr) {
+			memcpy(o, i, (size_t)w * 4);
+			continue;
+		}
+		for (x = 0; x < w; x++, o += 4, i += 4) {
+			o[0] = i[2];
+			o[1] = i[1];
+			o[2] = i[0];
+			o[3] = i[3];
+		}
+	}
+	if (g->blt_copies++ == 0 || g->debug)
+		EPRINTLN("virtio-gpu 3d: blit: %u (format %u, %ux%u) <- %u (format %u, %ux%u): %ux%u at %u,%u from %u,%u",
+		    c[0], d->t_format, d->t_width, d->t_height, c[5], s->t_format, s->t_width,
+		    s->t_height, w, h, dx, dy, sx, sy);
+	/* the copy went into what is on the screen: show it */
+	if (d->id == g->so_res)
+		scanout_present(g, dy, h);
+}
+
+/* the commands of one SUBMIT_3D to the blit context */
+static void
+blt_submit(struct vtgpu3d *g, const uint8_t *b, uint32_t words)
+{
+	uint32_t w[16], hd, n, at = 0;
+	struct res3d *r;
+
+	while (at < words) {
+		memcpy(&hd, b + (size_t)at * 4, 4);
+		n = hd >> 16;
+		if (n > words - at - 1)
+			return;
+		memset(w, 0, sizeof(w));
+		memcpy(w, b + (size_t)(at + 1) * 4, MIN((size_t)n, nitems(w)) * 4);
+		switch (hd & 0xff) {
+		case VIRGL_CCMD_PIPE_RESOURCE_SET_TYPE:
+			/* res, format, bind, width, height, usage, modifier lo, hi, {stride, offset} */
+			if (n >= 10 && (r = res_find(g, w[0])) != NULL) {
+				r->t_format = w[1];
+				r->t_width = w[3];
+				r->t_height = w[4];
+				r->t_stride = w[8];
+				r->t_offset = w[9];
+				if (g->debug)
+					EPRINTLN("virtio-gpu 3d: blit: resource %u is format %u, %ux%u, stride %u, offset %u",
+					    w[0], w[1], w[3], w[4], w[8], w[9]);
+			}
+			break;
+		case VIRGL_CCMD_RESOURCE_COPY_REGION:
+			/* dst res, level, x, y, z; src res, level, x, y, z, width, height, depth */
+			if (n >= 13)
+				blt_copy(g, w);
+			break;
+		default:
+			if (g->blt_said++ < 40)
+				EPRINTLN("virtio-gpu 3d: blit: virgl command %u (%u words) is not done",
+				    hd & 0xff, n);
+			break;
+		}
+		at += 1 + n;
+	}
+}
+
 /* commands */
 
 static uint32_t
@@ -370,6 +790,7 @@ cmd_create_blob(struct vtgpu3d *g, const struct vgpu_hdr *h, const uint8_t *b, s
 	if ((r = calloc(1, sizeof(*r))) == NULL)
 		return (RESP_ERR_OUT_OF_MEMORY);
 	r->id = c.id;
+	r->ctx = h->ctx_id;
 	if (c.mem != VIRTIO_GPU_BLOB_MEM_HOST3D && c.n != 0) {
 		if ((r->iov = calloc(c.n, sizeof(*r->iov))) == NULL) {
 			free(r);
@@ -515,7 +936,7 @@ cmd_set_scanout_blob(struct vtgpu3d *g, const uint8_t *b, size_t len)
 	g->so_format = v[8];
 	g->so_stride = v[10];
 	g->so_offset = v[14];
-	scanout_present(g, 0, g->so_height);
+	scanout_show(g, 0, g->so_height);
 	return (RESP_OK_NODATA);
 }
 
@@ -566,7 +987,11 @@ vtgpu3d_cmd1(struct vtgpu3d *g, uint8_t *req, size_t len, uint8_t *resp, size_t 
 			return (RESP_ERR_INVALID_PARAMETER);
 		if (v[0] < g->ncapsets) {
 			out[0] = g->capsets[v[0]];
-			virgl_renderer_get_cap_set(out[0], &out[1], &out[2]);
+			if (out[0] == CAPSET_VIRGL) {
+				out[1] = 1;	/* ours (the blit context): version 1, nothing in it */
+				out[2] = VIRGL_CAPS_V1_SIZE;
+			} else
+				virgl_renderer_get_cap_set(out[0], &out[1], &out[2]);
 		}
 		memcpy(resp + HDR, out, sizeof(out));
 		*rlen = HDR + sizeof(out);
@@ -575,6 +1000,14 @@ vtgpu3d_cmd1(struct vtgpu3d *g, uint8_t *req, size_t len, uint8_t *resp, size_t 
 	case CMD_GET_CAPSET: {
 		uint32_t ver = 0, size = 0;
 		NEED(8);	/* capset_id, capset_version -> the capset */
+		if (g->blt && v[0] == CAPSET_VIRGL) {
+			/* no OpenGL behind it: every capability is "no" */
+			if (cap < HDR + VIRGL_CAPS_V1_SIZE)
+				return (RESP_ERR_INVALID_PARAMETER);
+			memset(resp + HDR, 0, VIRGL_CAPS_V1_SIZE);
+			*rlen = HDR + VIRGL_CAPS_V1_SIZE;
+			return (RESP_OK_CAPSET);
+		}
 		virgl_renderer_get_cap_set(v[0], &ver, &size);
 		if (size == 0 || cap < HDR + size)
 			return (RESP_ERR_INVALID_PARAMETER);
@@ -590,6 +1023,17 @@ vtgpu3d_cmd1(struct vtgpu3d *g, uint8_t *req, size_t len, uint8_t *resp, size_t 
 		if (len >= 8 + 64)
 			memcpy(name, b + 8, 64);
 		v[0] = MIN(v[0], 64u);
+		if (g->blt && ((v[1] & 0xff) == CAPSET_VIRGL || (v[1] & 0xff) == CAPSET_VIRGL2)) {
+			/* the blit context: ours, the renderer never hears of it */
+			if (!blt_is(g, h->ctx_id)) {
+				if (g->nblt == MAX_BLT_CTX)
+					return (RESP_ERR_OUT_OF_MEMORY);
+				g->blt_ctx[g->nblt++] = h->ctx_id;
+			}
+			if (g->debug)
+				EPRINTLN("virtio-gpu 3d: blit: context %u (\"%s\")", h->ctx_id, name);
+			return (RESP_OK_NODATA);
+		}
 		int crc = virgl_renderer_context_create_with_flags(h->ctx_id, v[1], v[0], name);
 		if (crc != 0) {
 			EPRINTLN("virtio-gpu 3d: context %u (\"%s\", init %#x) not created: %d (%s)",
@@ -599,20 +1043,37 @@ vtgpu3d_cmd1(struct vtgpu3d *g, uint8_t *req, size_t len, uint8_t *resp, size_t 
 		return (fence_or_done(g, h, token));
 	}
 	case CMD_CTX_DESTROY:
+		if (blt_is(g, h->ctx_id)) {
+			uint32_t i;
+
+			for (i = 0; i < g->nblt; i++)
+				if (g->blt_ctx[i] == h->ctx_id)
+					g->blt_ctx[i] = g->blt_ctx[--g->nblt];
+			return (RESP_OK_NODATA);
+		}
 		virgl_renderer_context_destroy(h->ctx_id);
 		return (RESP_OK_NODATA);
 	case CMD_CTX_ATTACH_RESOURCE:
 		NEED(4);
+		/* (the blit context finds resources by their number; its textures are nobody else's) */
+		if (blt_is(g, h->ctx_id) || ((r = res_find(g, v[0])) != NULL && r->classic))
+			return (RESP_OK_NODATA);
 		virgl_renderer_ctx_attach_resource(h->ctx_id, v[0]);
 		return (fence_or_done(g, h, token));
 	case CMD_CTX_DETACH_RESOURCE:
 		NEED(4);
+		if (blt_is(g, h->ctx_id) || ((r = res_find(g, v[0])) != NULL && r->classic))
+			return (RESP_OK_NODATA);
 		virgl_renderer_ctx_detach_resource(h->ctx_id, v[0]);
 		return (fence_or_done(g, h, token));
 	case CMD_SUBMIT_3D:
 		NEED(8);	/* size, padding; the commands */
 		if (v[0] > len - 8 || (v[0] & 3) != 0)
 			return (RESP_ERR_INVALID_PARAMETER);
+		if (blt_is(g, h->ctx_id)) {
+			blt_submit(g, req + HDR + 8, v[0] / 4);
+			return (RESP_OK_NODATA);
+		}
 		if (virgl_renderer_submit_cmd(req + HDR + 8, h->ctx_id, v[0] / 4) != 0)
 			return (RESP_ERR_UNSPEC);
 		return (fence_or_done(g, h, token));
@@ -629,9 +1090,16 @@ vtgpu3d_cmd1(struct vtgpu3d *g, uint8_t *req, size_t len, uint8_t *resp, size_t 
 		return (RESP_OK_NODATA);
 	case CMD_SET_SCANOUT_BLOB:
 		return (cmd_set_scanout_blob(g, b, len));
-	case CMD_RESOURCE_CREATE_3D:
 	case CMD_TRANSFER_TO_HOST_3D:
 	case CMD_TRANSFER_FROM_HOST_3D:
+		/* the blit context's textures: between the guest's pages and the pixels here */
+		if (!g->blt)
+			return (RESP_ERR_UNSPEC);
+		return (blt_transfer(g, b, len, h->type == CMD_TRANSFER_FROM_HOST_3D));
+	case CMD_RESOURCE_CREATE_3D:
+		if (!g->blt)
+			return (RESP_ERR_UNSPEC);
+		return (blt_create(g, b, len));
 	case CMD_RESOURCE_ASSIGN_UUID:
 		return (RESP_ERR_UNSPEC);	/* vrend's, or a feature that is not offered */
 
@@ -645,14 +1113,37 @@ vtgpu3d_cmd1(struct vtgpu3d *g, uint8_t *req, size_t len, uint8_t *resp, size_t 
 	case CMD_RESOURCE_ATTACH_BACKING:
 	case CMD_RESOURCE_DETACH_BACKING:
 		NEED(4);
-		if (res_find(g, v[0]) == NULL)
+		if ((r = res_find(g, v[0])) == NULL)
 			return (VTGPU3D_UNHANDLED);
+		if (r->classic) {
+			if (h->type == CMD_RESOURCE_ATTACH_BACKING)
+				return (blt_backing(g, r, b, len));
+			free(r->iov);
+			r->iov = NULL;
+			r->niov = 0;
+			return (RESP_OK_NODATA);
+		}
 		return (RESP_ERR_UNSPEC);	/* a blob has its memory from its creation */
 	case CMD_SET_SCANOUT:
 		/* a 2D resource (or none) takes the scanout: ours is over; the 2D device goes on */
 		NEED(24);
-		if (res_find(g, v[5]) != NULL)
-			return (RESP_ERR_INVALID_RESOURCE_ID);
+		if ((r = res_find(g, v[5])) != NULL) {
+			/* one of the blit context's textures (the primary before the compositor runs) */
+			if (!r->classic || v[4] != 0)
+				return (RESP_ERR_INVALID_RESOURCE_ID);
+			if (g->so_res != r->id)
+				EPRINTLN("virtio-gpu 3d: scanout texture %u: %ux%u format %u", r->id,
+				    r->t_width, r->t_height, r->t_format);
+			g->so_map = r->rw;
+			g->so_res = r->id;
+			g->so_width = r->t_width;
+			g->so_height = r->t_height;
+			g->so_format = r->t_format;
+			g->so_stride = r->t_stride;
+			g->so_offset = 0;
+			scanout_present(g, 0, g->so_height);
+			return (RESP_OK_NODATA);
+		}
 		g->so_map = NULL;
 		g->so_res = 0;
 		return (VTGPU3D_UNHANDLED);
@@ -661,7 +1152,7 @@ vtgpu3d_cmd1(struct vtgpu3d *g, uint8_t *req, size_t len, uint8_t *resp, size_t 
 		if (res_find(g, v[4]) == NULL)
 			return (VTGPU3D_UNHANDLED);
 		if (v[4] == g->so_res)
-			scanout_present(g, v[1], v[3]);
+			scanout_show(g, v[1], v[3]);
 		return (fence_or_done(g, h, token));
 	default:
 		return (VTGPU3D_UNHANDLED);
@@ -748,6 +1239,9 @@ vtgpu3d_init(struct pci_devinst *pi, int bar_hostmem, uint64_t hostmem,
 	g->bar = bar_hostmem;
 	g->hostmem = hostmem;
 	g->debug = getenv("VTGPU3D_DEBUG") != NULL;
+	g->no_late = getenv("VTGPU3D_LATE") != NULL && strcmp(getenv("VTGPU3D_LATE"), "0") == 0;
+	/* the blit context (see the top): VTGPU3D_BLT=0 is the device as it was without */
+	g->blt = getenv("VTGPU3D_BLT") == NULL || strcmp(getenv("VTGPU3D_BLT"), "0") != 0;
 	LIST_INIT(&g->res);
 	STAILQ_INIT(&g->pending);
 	STAILQ_INIT(&g->retired);
@@ -772,6 +1266,8 @@ vtgpu3d_init(struct pci_devinst *pi, int bar_hostmem, uint64_t hostmem,
 		if (size != 0 && g->ncapsets < MAX_CAPSETS)
 			g->capsets[g->ncapsets++] = ids[i];
 	}
+	if (g->blt && g->ncapsets != 0 && g->ncapsets < MAX_CAPSETS)
+		g->capsets[g->ncapsets++] = CAPSET_VIRGL;
 	if (g->ncapsets == 0) {
 		EPRINTLN("virtio-gpu 3d: the renderer has no capset (no Direct3D library found?)");
 		virgl_renderer_cleanup(g);

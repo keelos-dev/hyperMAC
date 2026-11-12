@@ -1,0 +1,18 @@
+virtio-console: a socket port's connection is not closed after a read that used the guest's
+last receive buffer.
+
+pci_vtcon_sock_rx reads into the guest's buffers while there are any. When the last one is
+used the loop ends, and the code below it is the "close" label: the host's connection was
+closed although nothing was wrong (found by reading the code, 2026-11-12, before using a port
+for hyperMAC's agent in Windows guests; not observed). Return there.
+
+--- a/usr.sbin/bhyve/pci_virtio_console.c
++++ b/usr.sbin/bhyve/pci_virtio_console.c
+@@ -453,6 +453,7 @@
+ 	} while (vq_has_descs(vq));
+ 
+ 	vq_endchains(vq, 1);
++	return;
+ 
+ close:
+ 	mevent_delete_close(sock->vss_conn_evp);

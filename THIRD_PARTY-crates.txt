@@ -1,6 +1,6 @@
 Third-party software in macrdp
 ========================================
-Cargo.lock sha256: e0280ad80a75a09ad0767f67a2c3df9217e30e9b574e8b8309bd1fc3953de4eb
+Cargo.lock sha256: baf31cddd29ed4f23978b11ace118e4c401749d200b87c45b7bb3716f4326e42
 
 addchain 0.2.1
   License: MIT OR Apache-2.0

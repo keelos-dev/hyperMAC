@@ -229,6 +229,9 @@ pub fn create(name: &str, args: &[String]) -> anyhow::Result<()> {
         os_version: opt(args, "--os-version").map(str::to_string),
         engine: None,
         gpu3d: false,
+        autostart: false,
+        rosetta: false,
+        agent: None,
     };
     let disk_gb = num(args, "--disk-gb", 64);
     let name = name.to_string();
@@ -265,6 +268,16 @@ pub fn create(name: &str, args: &[String]) -> anyhow::Result<()> {
 /// an earlier try is continued. Ends when the VM's folder is gone (deleted in the window).
 fn fetch_ipsw(from: &str, vm: &Path) -> anyhow::Result<std::path::PathBuf> {
     let file = from.rsplit('/').next().filter(|n| n.ends_with(".ipsw")).with_context(|| format!("{from}: not a restore image's address"))?;
+    fetch(from, file, Some((vm, "dl")), false)
+}
+
+/// Download `from` into the storage folder's iso/ as `file`. `progress`: a VM's folder and the
+/// word its `installing` file gets with the percentage ("dl:37"); the download ends when that
+/// VM is deleted. A file that is there already is used; a part of one is continued.
+/// `https_only`: nothing of it comes over plain HTTP, redirects included (for a file nothing
+/// checks afterwards; a restore image is checked by the installer).
+pub fn fetch(from: &str, file: &str, progress: Option<(&Path, &str)>, https_only: bool) -> anyhow::Result<std::path::PathBuf> {
+    let proto: &[&str] = if https_only { &["--proto", "=https", "--proto-redir", "=https"] } else { &[] };
     let iso = crate::storage().join("iso");
     std::fs::create_dir_all(&iso)?;
     let (done, part) = (iso.join(file), iso.join(format!("{file}.part")));
@@ -272,7 +285,7 @@ fn fetch_ipsw(from: &str, vm: &Path) -> anyhow::Result<std::path::PathBuf> {
         eprintln!("{} is here already", done.display());
         return Ok(std::fs::canonicalize(&done).unwrap_or(done));
     }
-    let head = std::process::Command::new("/usr/bin/curl").args(["-sIL", "--max-time", "30", from]).output()?;
+    let head = std::process::Command::new("/usr/bin/curl").args(proto).args(["-sIL", "--max-time", "30", from]).output()?;
     let total: u64 = String::from_utf8_lossy(&head.stdout)
         .lines()
         .filter_map(|l| l.to_ascii_lowercase().strip_prefix("content-length:").and_then(|v| v.trim().parse().ok()))
@@ -280,6 +293,7 @@ fn fetch_ipsw(from: &str, vm: &Path) -> anyhow::Result<std::path::PathBuf> {
         .unwrap_or(0);
     eprintln!("downloading {from} ({:.1} GB) to {}", total as f64 / 1e9, iso.display());
     let mut curl = std::process::Command::new("/usr/bin/curl")
+        .args(proto)
         .args(["-fsSL", "--retry", "5", "--retry-delay", "5", "-C", "-", "-o"])
         .arg(&part)
         .arg(from)
@@ -289,17 +303,19 @@ fn fetch_ipsw(from: &str, vm: &Path) -> anyhow::Result<std::path::PathBuf> {
         if let Some(st) = curl.try_wait()? {
             break st;
         }
-        if !vm.join("vm.json").exists() {
-            let _ = curl.kill();
-            anyhow::bail!("the VM was deleted: download stopped ({} stays for the next try)", part.display());
-        }
-        let got = std::fs::metadata(&part).map(|m| m.len()).unwrap_or(0);
-        if total > 0 {
-            let _ = std::fs::write(vm.join("installing"), format!("dl:{}", (got * 100 / total).min(99)));
+        if let Some((vm, word)) = progress {
+            if !vm.join("vm.json").exists() {
+                let _ = curl.kill();
+                anyhow::bail!("the VM was deleted: download stopped ({} stays for the next try)", part.display());
+            }
+            let got = std::fs::metadata(&part).map(|m| m.len()).unwrap_or(0);
+            if total > 0 {
+                let _ = std::fs::write(vm.join("installing"), format!("{word}:{}", (got * 100 / total).min(99)));
+            }
         }
         std::thread::sleep(std::time::Duration::from_secs(2));
     };
-    anyhow::ensure!(st.success(), "the download from Apple failed (curl: {st}); {} stays, the next try goes on from it", part.display());
+    anyhow::ensure!(st.success(), "the download of {from} failed (curl: {st}); {} stays, the next try goes on from it", part.display());
     std::fs::rename(&part, &done)?;
     Ok(std::fs::canonicalize(&done).unwrap_or(done))
 }
@@ -750,12 +766,13 @@ thread_local! {
 /// The console: a window in the VM's own process with Virtualization.framework's view of the
 /// VM's display (keyboard, pointer and the picture go straight to the VM, nothing in between).
 /// Opened on request (ctl "console", `run --console`); closing it leaves the VM running.
-/// The guest's resolution stays what vm.json says: the view scales it to the window.
+/// The guest's display follows the window's size (the framework tells the guest; macOS guests
+/// and Linux on VZ's virtio-gpu take it): drag the window larger and the guest has more room.
+/// vm.json keeps the size the machine starts with.
 fn open_console(vm: &VZVirtualMachine, title: &str, (w, h): (f64, f64)) {
     let Some(mtm) = MainThreadMarker::new() else { return };
+    crate::console::regular(mtm);
     let app = NSApplication::sharedApplication(mtm);
-    app.setActivationPolicy(NSApplicationActivationPolicy::Regular);
-    crate::console::set_app_icon(&app);
     let window = CONSOLE.with(|c| c.borrow().as_ref().map(|(w, _)| w.clone()));
     let window = match window {
         Some(w) => w,
@@ -774,10 +791,11 @@ fn open_console(vm: &VZVirtualMachine, title: &str, (w, h): (f64, f64)) {
             };
             unsafe { window.setReleasedWhenClosed(false) };
             window.setTitle(&NSString::from_str(title));
-            window.setContentAspectRatio(NSSize::new(w, h));
+            window.setContentMinSize(NSSize::new(640.0, 400.0));
             let view = unsafe { VZVirtualMachineView::new(mtm) };
             unsafe {
                 view.setVirtualMachine(Some(vm));
+                view.setAutomaticallyReconfiguresDisplay(true);
                 // not capturing system keys: that needs the Accessibility grant for this binary, and
                 // without it the modifiers went missing (user 2026-11-10: Shift+D gave no capital D
                 // in a Debian guest). The price: Cmd-Tab and the like stay with the host.
@@ -842,6 +860,10 @@ pub(crate) fn create_linux(name: &str, args: &[String]) -> anyhow::Result<()> {
         os_version: opt(args, "--os-version").map(str::to_string),
         engine: freebsd.then(|| "bhyve".to_string()),
         gpu3d: false,
+        autostart: false,
+        // --rosetta: x86-64 Linux programs in the guest (Virtualization.framework's Linux only)
+        rosetta: !windows && !freebsd && args.iter().any(|a| a == "--rosetta"),
+        agent: None,
     };
     std::fs::File::create(dir.join("disk.img"))?.set_len(num(args, "--disk-gb", if windows { 64 } else { 32 }) << 30)?;
     unsafe {
@@ -857,6 +879,22 @@ pub(crate) fn create_linux(name: &str, args: &[String]) -> anyhow::Result<()> {
     std::fs::write(dir.join("vm.json"), serde_json::to_vec_pretty(&conf)?)?;
     eprintln!("created. Next: hypermac run {name}");
     Ok(())
+}
+
+/// the name the guest mounts Rosetta's share by (`mount -t virtiofs rosetta /media/rosetta`)
+pub const ROSETTA_TAG: &str = "rosetta";
+
+/// Rosetta for a Linux guest, when this Mac has it.
+fn rosetta_share() -> anyhow::Result<Retained<VZDirectoryShare>> {
+    unsafe {
+        match VZLinuxRosettaDirectoryShare::availability() {
+            VZLinuxRosettaAvailability::Installed => {}
+            VZLinuxRosettaAvailability::NotInstalled => anyhow::bail!("Rosetta is not installed on this Mac (softwareupdate --install-rosetta)"),
+            _ => anyhow::bail!("this Mac has no Rosetta for Linux guests"),
+        }
+        let share = VZLinuxRosettaDirectoryShare::initWithError(VZLinuxRosettaDirectoryShare::alloc()).map_err(err)?;
+        Ok(Retained::into_super(share))
+    }
 }
 
 /// Linux: EFI, virtio disk, the ISO as a USB stick, VZ's virtio-gpu (2D: the guest renders on the
@@ -980,6 +1018,21 @@ fn config_linux(dir: &Path, c: &VmConf, iso: Option<&str>) -> anyhow::Result<Ret
         let out = VZVirtioSoundDeviceOutputStreamConfiguration::new();
         snd.setStreams(&NSArray::from_retained_slice(&[Retained::into_super(out)]));
         cfg.setAudioDevices(&NSArray::from_retained_slice(&[Retained::into_super(snd)]));
+
+        // Rosetta (vm.json "rosetta"): a virtiofs share named "rosetta" with Apple's translator
+        // in it; the guest mounts it and registers it for x86-64 binaries. Asked of the
+        // framework, not guessed: without Rosetta on this Mac the VM starts as it is.
+        if c.rosetta && c.os == "linux" {
+            match rosetta_share() {
+                Ok(share) => {
+                    let fs = VZVirtioFileSystemDeviceConfiguration::initWithTag(VZVirtioFileSystemDeviceConfiguration::alloc(), &NSString::from_str(ROSETTA_TAG));
+                    fs.setShare(Some(&share));
+                    cfg.setDirectorySharingDevices(&NSArray::from_retained_slice(&[Retained::into_super(fs)]));
+                    eprintln!("rosetta: shared with the guest as virtiofs \"{ROSETTA_TAG}\"");
+                }
+                Err(e) => eprintln!("rosetta: {e:#}: starting without"),
+            }
+        }
 
         let ser = VZVirtioConsoleDeviceSerialPortConfiguration::new();
         let att = VZFileSerialPortAttachment::initWithURL_append_error(

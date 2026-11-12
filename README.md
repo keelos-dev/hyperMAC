@@ -35,18 +35,21 @@ Don't want the second part? One switch closes every port, and it is just a local
   background daemon running as root. A virtual machine is one ordinary process.
 - **Headless by design.** Virtual machines open no window on the Mac and keep running when the
   app's window closes. Look at them in a console window, or from another computer over RDP.
+- **Windows programs among your Mac's windows.** Coherence (new, experimental): each window of
+  a Windows guest becomes a window on the Mac's desktop, with no Windows desktop around it.
+- **Snapshots and clones that cost nothing.** A stopped machine's snapshot or clone is made
+  at once and takes no room of its own (APFS clones: only what changes afterwards is stored).
 - **Two engines, each where it is best.** Apple's Virtualization.framework for macOS and Linux
   (it is what Apple supports). bhyve for Windows and FreeBSD, where Virtualization.framework
   does not go.
 
 ## Windows 11 in three steps
 
-1. Get two files: the **Windows 11 ARM64 ISO** from
-   [Microsoft](https://www.microsoft.com/software-download/windows11arm64) and the
-   [virtio-win driver ISO](https://fedorapeople.org/groups/virt/virtio-win/direct-downloads/)
-   (the network driver). Put them in Downloads.
-2. Open hyperMAC → **Virtual Machines** → **New Virtual Machine…** → **Windows 11**. It finds both
-   files by itself.
+1. Open hyperMAC → **Virtual Machines** → **New Virtual Machine…** → **Windows 11**.
+2. Get the **Windows 11 ARM64 ISO**: the window has a button that opens
+   [Microsoft's download page](https://www.microsoft.com/software-download/windows11arm64). Choose
+   a language there and download; when the file is in Downloads the window shows it by itself.
+   (The driver ISO the install needs, virtio-win, is downloaded for you.)
 3. Click **Create**, then **Start**. Install as on a real PC in the console window; or switch on
    "unattended", type a user name and password, and come back in 8 minutes.
 
@@ -199,13 +202,41 @@ kRDPclient before judging hyperMAC.
 ## What is rough
 
 - **This is young.** The virtual machine part is brand new. Keep copies of anything important.
-- 3D acceleration in Windows is new and off unless asked for: add `"gpu3d": true` to the VM's
-  `vm.json` (there is no switch in the app yet). It is Direct3D 11: the desktop, Edge and WebGL
+- 3D acceleration in Windows is new and off unless asked for: a switch in New Virtual Machine,
+  and in Edit… for a machine there is (that one hands Windows a CD with the driver: run its
+  install.cmd once). It is Direct3D 11: the desktop, Edge and WebGL
   use it, and so do Direct3D 11 games (Unigine Heaven 4.0, 1920x1080 full screen, 2x
   anti-aliasing: 78 fps on average on a Mac mini M4; WebGL Aquarium, 500 fish: 57 fps at 1024x768 on
   a MacBook Air M4). Anti-aliasing goes up to 4x (what the Mac's GPU has): a game asking for 8x
   says it cannot set the video mode. No Direct3D 12, OpenGL or Vulkan. Without it Windows has
   the basic display driver, up to 1920x1200.
+- Coherence (the switch on a running Windows machine's row; it needs 3D acceleration to give
+  Windows a screen the size of the Mac's) is a first version. While it is on, a button in the
+  Mac's menu bar opens the Start menu, the items on Windows' desktop and File Explorer. The
+  pointer keeps the Mac's arrow whatever Windows would show; one Windows pixel is one point,
+  so it is soft on a Retina display; a Mac window between two overlapping Windows windows
+  makes the lower one show a piece of the upper one; menus have a thin edge of what is behind
+  them in Windows; the clipboard is not shared; only the main display. The left Command key
+  is Windows' Control there (Cmd-C copies), the right one the Windows key.
+  The Mac talks to a small program in Windows through a port of the machine's own, not over
+  the network. A machine made with this version has everything for it; one made earlier gets
+  a CD when the switch is first used (run its install.cmd in Windows as administrator, once)
+  and must be restarted once. Until then it is reached over the network, which needs NAT
+  networking and macOS' permission for the local network.
+  Used by hand for an afternoon on one machine (windows, typing, the Start menu, a Direct3D
+  benchmark in a window), not for days. Windows' snap layouts bar is off while it is on.
+- Snapshots and clones are of a stopped machine (a running one's disk is in the middle of
+  things). A clone has a new network address; the computer name and accounts inside are the
+  original's.
+- The screen follows the console window's size for Windows with 3D acceleration, for macOS
+  guests, and for Linux on Virtualization.framework's own graphics. Linux as hyperMAC makes it
+  (its own virtio-gpu, so RDP can show it), FreeBSD and Windows without 3D keep the size from
+  Edit…, scaled into the window.
+- Rosetta for Linux guests (x86-64 programs; a switch in New Virtual Machine and Edit…) needs
+  one command run in the guest, which Edit… copies for you. Tried with Fedora 45; that the
+  setup survives a restart of the guest is not tested yet.
+- Start at Login starts a machine when you log in to the Mac, not when the Mac starts with
+  nobody logged in.
 - Sound from virtual machines: Windows only. It plays on the Mac while the VM's window is open,
   and goes to kRDPclient when that is connected to the VM (new). macOS, Linux and
   FreeBSD guests have no sound yet.

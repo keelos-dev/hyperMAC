@@ -112,6 +112,7 @@ cat > "$APP/Contents/Info.plist" <<PLIST
   <key>LSUIElement</key><true/>
   <key>LSApplicationCategoryType</key><string>public.app-category.utilities</string>
   <key>NSHumanReadableCopyright</key><string>© keelOS</string>
+  <key>NSLocalNetworkUsageDescription</key><string>hyperMAC talks to its virtual machines over their network: coherence mode asks Windows where its windows are.</string>
   <key>NSAudioCaptureUsageDescription</key><string>hyperMAC plays this Mac's sound on the remote client and mutes it here meanwhile.</string>
 </dict></plist>
 PLIST

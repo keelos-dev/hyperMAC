@@ -165,6 +165,8 @@ define_class!(
 
         #[unsafe(method(tick:))]
         fn tick(&self, _timer: &AnyObject) {
+            // (the wizard's window is its own: looked at whatever the main window shows)
+            vmui::wizard_tick();
             // the menu bar process keeps the closed window: nothing to keep fresh then
             if !UI.with(|u| u.borrow().as_ref().is_some_and(|u| u.window.isVisible())) {
                 return;

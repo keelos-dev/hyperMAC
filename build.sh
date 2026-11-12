@@ -40,8 +40,31 @@ if [ -f "$INST" ]; then
 		&& echo "installed copy refreshed: $INST" \
 		&& echo "restart it with:  launchctl kickstart -k gui/$(id -u)/dev.keelos.hypermac"
 	# the menu bar's copy, with a bundle id of its own (main.rs write_menu_binary)
-	"$INST" menu-binary --state "$STATE" && echo "menu bar copy refreshed: $INST-menu" \
+	# Signed with the same identity afterwards (the program itself signs its copy ad hoc): to
+	# macOS an ad-hoc copy is a new program after every build, and each one is announced
+	# ("hypermac-menu can run in the background", seen once per build on 2026-11-12).
+	"$INST" menu-binary --state "$STATE" && { [ -z "$ID" ] || codesign --force --sign "$ID" --identifier dev.keelos.hypermac.menu --timestamp=none "$INST-menu" 2>/dev/null; } && echo "menu bar copy refreshed: $INST-menu" \
 		&& echo "restart it with:  launchctl kickstart -k gui/$(id -u)/dev.keelos.hypermac.menu"
+	# The windows of bhyve machines (src/vmwin.rs) run from an app bundle of their own: the
+	# agent in a Windows guest is reached over the machine's network, which macOS lets a
+	# program do only after asking the user ("local network"), and for a bare executable
+	# started by launchd it neither asks nor allows (seen 2026-11-12). A bundle is asked for
+	# once. (hyperMAC.app from tools/package.sh is one already.)
+	WIN="$STATE/bin/hyperMAC Windows.app"
+	rm -rf "$WIN.new" && mkdir -p "$WIN.new/Contents/MacOS" && cp target/release/hypermac "$WIN.new/Contents/MacOS/hypermac-win" && cat > "$WIN.new/Contents/Info.plist" <<'PLIST'
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0"><dict>
+  <key>CFBundleIdentifier</key><string>dev.keelos.hypermac.win</string>
+  <key>CFBundleExecutable</key><string>hypermac-win</string>
+  <key>CFBundleName</key><string>hyperMAC</string>
+  <key>CFBundlePackageType</key><string>APPL</string>
+  <key>LSUIElement</key><true/>
+  <key>NSLocalNetworkUsageDescription</key><string>hyperMAC talks to its virtual machines over their network: coherence mode asks Windows where its windows are.</string>
+</dict></plist>
+PLIST
+	codesign --force --sign "${ID:--}" --identifier dev.keelos.hypermac.win --timestamp=none "$WIN.new" 2>/dev/null \
+		&& rm -rf "$WIN" && mv "$WIN.new" "$WIN" && echo "window program installed: $WIN"
 fi
 # efiprobe (vm/tools/efiprobe): the EFI program a Windows VM boots through (vm/src/winsetup.rs)
 (cd "$D/vm/tools/efiprobe" && cargo build --release --target aarch64-unknown-uefi)

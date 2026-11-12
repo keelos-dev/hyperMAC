@@ -346,8 +346,9 @@ fn vm_row(vm: &Vm) -> Retained<NSView> {
     let op = with(|u| u.pending.iter().find(|(n, _, _)| n == &vm.name).map(|(_, op, _)| *op));
 
     // the icons, left to right; each branch below fills in what can be done now
-    let (mut copy_a, mut console_a, mut run_a, mut suspend_a, mut stop_a, mut eject_a, mut edit_a, mut delete_a): (Act, Act, Act, Act, Act, Act, Act, Act) =
-        (None, None, None, None, None, None, None, None);
+    let (mut copy_a, mut console_a, mut run_a, mut suspend_a, mut stop_a, mut eject_a, mut snap_a, mut edit_a, mut delete_a): (Act, Act, Act, Act, Act, Act, Act, Act, Act) =
+        (None, None, None, None, None, None, None, None, None);
+    // Windows on bhyve: its windows as windows of the Mac (vm/src/coherence.rs)
     // the third one starts, pauses or resumes
     let (mut run_icon, mut run_tip) = ("play.fill", t("启动", "Start"));
     let mut delete_tip = t("删除…", "Delete…");
@@ -356,10 +357,18 @@ fn vm_row(vm: &Vm) -> Retained<NSView> {
     // the row's ground says how the machine is (user 2026-11-11: running light green, paused
     // light yellow, an error light red, stopped plain)
     let mut tint: Option<Retained<NSColor>> = None;
+    // A machine on the bhyve engine has its windows in a process of this program's
+    // (vmwin.rs); one on Virtualization.framework in the VM's own (Apple's view lives there).
+    let own_window = str_of(c, "engine") == Some("bhyve");
     let console = |n: String| {
         act(move || {
-            // the VM's own process opens the window
-            let _ = ctl_request(&n, "console");
+            if own_window {
+                if let Err(e) = crate::vmwin::request(&n, "console") {
+                    alert(t("没能打开控制台", "Could not open the console"), &format!("{e:#}"), &[t("好", "OK")], None, true);
+                }
+            } else {
+                let _ = ctl_request(&n, "console");
+            }
         })
     };
 
@@ -414,6 +423,19 @@ fn vm_row(vm: &Vm) -> Retained<NSView> {
             }
         }
         console_a = console(name.clone());
+        if os_key == "windows" && str_of(c, "engine") == Some("bhyve") {
+            // Coherence is a state of the running machine: a switch, as it is now (user
+            // 2026-11-12: "虚拟机界面可以有一个slide？")
+            let (n, has_agent) = (name.clone(), str_of(c, "agent").is_some());
+            let on = crate::vmwin::peek(&name, "coherence status").and_then(|s| s.get("on").and_then(|v| v.as_bool())).unwrap_or(false);
+            let sw = super::switch(on, move |_| coherence(&n, has_agent));
+            sw.setControlSize(objc2_app_kit::NSControlSize::Small);
+            let tip = t("融合模式：Windows 的每个窗口变成 Mac 桌面上的一个窗口", "Coherence: each of Windows' windows as a window on the Mac's desktop");
+            sw.setToolTip(Some(&ns(tip)));
+            sw.setAccessibilityLabel(Some(&ns(t("融合模式", "Coherence"))));
+            let l = super::label(t("融合", "Coherence"), 11.0, unsafe { objc2_app_kit::NSFontWeightRegular }, &NSColor::secondaryLabelColor());
+            lead.push(as_view(&hstack(&[&l, &sw], 4.0)));
+        }
         // pause: the machine stands still in memory. suspend (where the engine can): its memory
         // goes to a file, the process ends, the next start goes on from there
         let paused = is_paused(info);
@@ -450,6 +472,9 @@ fn vm_row(vm: &Vm) -> Retained<NSView> {
         }
         edit_a = act(move || edit_vm(&n5));
         delete_a = act(move || delete(&n2));
+        // snapshots and clones are of a machine that stands still (vm/src/snap.rs)
+        let n6 = name.clone();
+        snap_a = act(move || snapshots_vm(&n6));
         // suspended: its memory is in a file; Start goes on from there (vm/src/vm.rs SAVED)
         let suspended = vm_dir(&name).join("suspend.vzvmsave").exists();
         if suspended {
@@ -473,6 +498,7 @@ fn vm_row(vm: &Vm) -> Retained<NSView> {
         icon_button("moon.fill", t("挂起", "Suspend"), suspend_a),
         icon_button("power", t("停止…", "Stop…"), stop_a),
         icon_button("eject.fill", t("弹出安装盘", "Eject Installer"), eject_a),
+        icon_button("clock.arrow.circlepath", t("快照和克隆…", "Snapshots and Clone…"), snap_a),
         icon_button("slider.horizontal.3", t("编辑…", "Edit…"), edit_a),
         icon_button("trash", delete_tip, delete_a),
     ]);
@@ -502,13 +528,40 @@ fn vm_row(vm: &Vm) -> Retained<NSView> {
 /// The VM program: <state>/bin/hypermac-vm (build.sh installs it, signed with the
 /// virtualization entitlement), else beside this executable.
 fn runner() -> Option<PathBuf> {
-    let installed = super::state().join("bin/hypermac-vm");
-    if installed.exists() {
-        return Some(installed);
-    }
-    let beside = std::env::current_exe().ok()?.parent()?.join("hypermac-vm");
-    beside.exists().then_some(beside)
+    crate::vms::runner(&super::state())
 }
+
+/// `hypermac-vm ARGS`, waited for (the short commands: clone, snapshot, restore): what it
+/// printed, or what it said went wrong.
+fn vm_cmd(args: &[&str]) -> Result<String, String> {
+    let exe = runner().ok_or_else(|| t("找不到虚拟机程序（hypermac-vm）。", "The VM program (hypermac-vm) is missing.").to_string())?;
+    let out = std::process::Command::new(exe).args(args).stdin(std::process::Stdio::null()).output().map_err(|e| e.to_string())?;
+    if out.status.success() {
+        return Ok(String::from_utf8_lossy(&out.stdout).trim().to_string());
+    }
+    let err = String::from_utf8_lossy(&out.stderr);
+    // the last line is the error ("Error: ..."); what came before is progress
+    Err(err.lines().rev().find(|l| !l.trim().is_empty()).unwrap_or("?").trim_start_matches("Error: ").to_string())
+}
+
+/// The 3D engine for Windows guests beside the VM program (bhyve-3d and its gpu3d folder;
+/// hyperMAC.app keeps the folder in Contents/Resources).
+fn gpu3d_ok() -> bool {
+    runner().and_then(|r| r.parent().map(|d| d.to_path_buf())).is_some_and(|d| d.join("bhyve-3d").exists() && (d.join("gpu3d").exists() || d.join("../Resources/gpu3d").exists()))
+}
+
+/// Rosetta for Linux guests is on this Mac (it comes with Rosetta: softwareupdate --install-rosetta).
+/// The VM program asks the framework at every start; this is for what the window offers.
+fn rosetta_ok() -> bool {
+    std::path::Path::new("/Library/Apple/usr/libexec/oah/RosettaLinux/rosetta").exists()
+}
+
+/// What a Linux guest runs once to use Rosetta: mount the share at every start, before the
+/// system registers binary formats, and register the translator for x86-64 programs.
+/// With SELinux (Fedora) the share is mounted labelled as programs: systemd-binfmt may not
+/// open the translator otherwise ("Failed to add binary format 'rosetta': Permission denied",
+/// Fedora 45, 2026-11-12).
+const ROSETTA_GUEST: &str = r#"O=ro,nofail,x-systemd.before=systemd-binfmt.service; if command -v selinuxenabled >/dev/null && selinuxenabled; then O=$O,context=system_u:object_r:bin_t:s0; fi; sudo mkdir -p /media/rosetta && echo "rosetta /media/rosetta virtiofs $O 0 0" | sudo tee -a /etc/fstab && sudo systemctl daemon-reload && sudo mount /media/rosetta && echo ':rosetta:M::\x7fELF\x02\x01\x01\x00\x00\x00\x00\x00\x00\x00\x00\x00\x02\x00\x3e\x00:\xff\xff\xff\xff\xff\xfe\xfe\x00\xff\xff\xff\xff\xff\xff\xff\xff\xfe\xff\xff\xff:/media/rosetta/rosetta:CF' | sudo tee /etc/binfmt.d/rosetta.conf && sudo systemctl restart systemd-binfmt"#;
 
 /// `hypermac-vm ARGS` as its own session, output to `log`: it outlives this window.
 fn spawn_detached(args: &[&str], log: &std::path::Path, env: &[(&str, &str)]) -> std::io::Result<()> {
@@ -543,6 +596,59 @@ fn alert(title: &str, text: &str, buttons: &[&str], accessory: Option<&NSView>, 
     }
     // NSAlertFirstButtonReturn = 1000, the second 1001, ...
     (a.runModal() - 1000).max(0) as usize
+}
+
+/// The row's Coherence button: on, or off when it is on. A machine made before the agent
+/// existed gets a CD with it first.
+fn coherence(name: &str, has_agent: bool) {
+    let install = t(
+        "融合模式要在 Windows 里装一个小程序，它告诉 Mac 各个窗口在哪里。已经给这台虚拟机插上光盘 HMAGENT（运行中的虚拟机要重启一次才看得到）：在 Windows 的「此电脑」里打开它，右键 install.cmd →「以管理员身份运行」。装一次就行，之后再点这个按钮。",
+        "Coherence needs a small program in Windows that tells the Mac where the windows are. The CD HMAGENT is now plugged into this machine (a running machine sees it after one restart): open it in This PC in Windows, right-click install.cmd and choose Run as administrator. Once is enough; then click this button again.",
+    );
+    if !has_agent {
+        match vm_cmd(&["agent", name]) {
+            Ok(_) => alert(t("先装一次小程序", "One thing to install first"), install, &[t("好", "OK")], None, false),
+            Err(e) => alert(t("没能执行", "That did not work"), &e, &[t("好", "OK")], None, true),
+        };
+        return render();
+    }
+    // (the windows are a process of this program's: vmwin.rs)
+    let status = |n: &str| crate::vmwin::peek(n, "coherence status");
+    let on = status(name).and_then(|s| s.get("on").and_then(|v| v.as_bool())).unwrap_or(false);
+    match crate::vmwin::request(name, if on { "coherence off" } else { "coherence on" }) {
+        Ok(a) => {
+            if let Some(e) = str_of(&a, "error") {
+                alert(t("没能执行", "That did not work"), e, &[t("好", "OK")], None, true);
+            } else if !on {
+                // does the agent answer? (the windows come by themselves when it does) The first
+                // time, macOS asks whether hyperMAC may use the local network: time to answer
+                let connected = |n: &str| status(n).and_then(|s| str_of(&s, "state").map(str::to_string)).unwrap_or_default();
+                let mut state = String::new();
+                for _ in 0..16 {
+                    std::thread::sleep(std::time::Duration::from_millis(500));
+                    state = connected(name);
+                    if state == "connected" {
+                        break;
+                    }
+                }
+                if state != "connected" {
+                    let _ = crate::vmwin::request(name, "coherence off");
+                    let text = if zh() {
+                        format!("Windows 里的小程序没有回应。先看这三样：Windows 登录到桌面了吗？macOS 刚才问过「本地网络」权限的话，允许之后再拨一次开关（也可以在「系统设置 → 隐私与安全性 → 本地网络」里打开 hyperMAC）。小程序从没装过的话：{install}")
+                    } else {
+                        format!("The program in Windows does not answer. Three things to check: is Windows logged on to its desktop? If macOS just asked about the local network, allow it and flip the switch again (or turn hyperMAC on in System Settings → Privacy & Security → Local Network). If the program was never installed: {install}")
+                    };
+                    // (the CD again, in case it was ejected since)
+                    let _ = vm_cmd(&["agent", name]);
+                    alert(t("融合模式没能打开", "Coherence did not start"), &text, &[t("好", "OK")], None, true);
+                }
+            }
+        }
+        Err(e) => {
+            alert(t("没能执行", "That did not work"), &format!("{e:#}"), &[t("好", "OK")], None, true);
+        }
+    }
+    render();
 }
 
 fn start(name: &str) {
@@ -602,6 +708,8 @@ enum Step {
     Settings,
     /// not a step of New Virtual Machine: the same window as a stopped VM's settings (`edit_vm`)
     Edit,
+    /// nor this: a stopped VM's snapshots, and cloning it (`snapshots_vm`)
+    Snapshots,
 }
 
 /// The wizard's state while it is open (Ui.wizard). It has a window of its own (user
@@ -631,6 +739,18 @@ pub struct Wizard {
     h: String,
     disk_now: u64,
     iso: Option<Option<PathBuf>>,
+    /// Windows on bhyve: Direct3D on the Mac's GPU (vm.json "gpu3d"); `gpu3d_was`: as the VM has it
+    gpu3d: bool,
+    gpu3d_was: bool,
+    /// Linux: Rosetta for x86-64 programs (vm.json "rosetta")
+    rosetta: bool,
+    /// start at login (vm.json "autostart")
+    autostart: bool,
+    /// Step::Snapshots: the next snapshot's label, the clone's name
+    label: String,
+    clone: String,
+    /// Step::Image: the installers listed, to notice a download that has arrived
+    listed: Vec<PathBuf>,
 }
 
 fn wiz<R>(f: impl FnOnce(&mut Wizard) -> R) -> Option<R> {
@@ -679,6 +799,13 @@ fn new_vm() {
             h: String::new(),
             disk_now: 0,
             iso: None,
+            gpu3d: false,
+            gpu3d_was: false,
+            rosetta: false,
+            autostart: false,
+            label: String::new(),
+            clone: String::new(),
+            listed: Vec::new(),
         })
     });
     render_wizard();
@@ -711,12 +838,148 @@ fn edit_vm(name: &str) {
         w.disk_now = disk_now;
         w.bridged = str_of(&c, "net").is_some();
         w.image = str_of(&c, "iso").map(PathBuf::from);
+        let on = |k: &str| c.get(k).and_then(|v| v.as_bool()).unwrap_or(false);
+        (w.gpu3d, w.gpu3d_was, w.rosetta, w.autostart) = (on("gpu3d"), on("gpu3d"), on("rosetta"), on("autostart"));
         w.window.clone()
     });
     if let Some(window) = window {
         window.setTitle(&ns(&if zh() { format!("编辑「{name}」") } else { format!("Edit “{name}”") }));
     }
     render_wizard();
+}
+
+/// Snapshots and Clone…: a stopped VM's snapshots, in the wizard's window.
+fn snapshots_vm(name: &str) {
+    if wiz(|_| ()).is_some() {
+        close_wizard();
+    }
+    new_vm();
+    let window = wiz(|w| {
+        w.step = Step::Snapshots;
+        w.edit = name.to_string();
+        w.clone = (2..).map(|i| format!("{name}-{i}")).find(|n| !vm_dir(n).exists()).unwrap_or_default();
+        w.window.clone()
+    });
+    if let Some(window) = window {
+        window.setTitle(&ns(&if zh() { format!("「{name}」的快照和克隆") } else { format!("Snapshots and Clone of “{name}”") }));
+    }
+    render_wizard();
+}
+
+/// A VM's snapshots, oldest first: (id, label, taken). They are folders in the VM's
+/// (vm/src/snap.rs: snapshots/ID/meta.json).
+fn snapshots_of(name: &str) -> Vec<(String, String, u64)> {
+    let mut v: Vec<(String, String, u64)> = std::fs::read_dir(vm_dir(name).join("snapshots"))
+        .into_iter()
+        .flatten()
+        .flatten()
+        .filter_map(|e| {
+            let m: serde_json::Value = serde_json::from_slice(&std::fs::read(e.path().join("meta.json")).ok()?).ok()?;
+            Some((e.file_name().to_string_lossy().into_owned(), str_of(&m, "label").unwrap_or("").to_string(), num_of(&m, "taken")))
+        })
+        .collect();
+    v.sort();
+    v
+}
+
+/// "2026-11-12 15:30" in this Mac's time.
+fn when(secs: u64) -> String {
+    let t = secs as libc::time_t;
+    let mut tm: libc::tm = unsafe { std::mem::zeroed() };
+    unsafe { libc::localtime_r(&t, &mut tm) };
+    format!("{:04}-{:02}-{:02} {:02}:{:02}", tm.tm_year + 1900, tm.tm_mon + 1, tm.tm_mday, tm.tm_hour, tm.tm_min)
+}
+
+/// Run one of the VM program's snapshot commands on the wizard's VM; what went wrong is the
+/// window's note.
+fn snap_do(args: &[&str]) {
+    save_fields();
+    let r = vm_cmd(args);
+    wiz(|w| match r {
+        Ok(_) => {
+            w.note.clear();
+            w.label.clear();
+        }
+        Err(e) => w.note = e,
+    });
+    render_wizard();
+}
+
+fn step_snapshots(root_stack: &NSStackView, width: f64) {
+    let Some((name, label_, clone, note)) = wiz(|w| (w.edit.clone(), w.label.clone(), w.clone.clone(), w.note.clone())) else { return };
+    let list = snapshots_of(&name);
+    let mut rows: Vec<Retained<NSView>> = list
+        .iter()
+        .rev()
+        .map(|(id, label_, taken)| {
+            let title = if label_.is_empty() { when(*taken) } else { label_.clone() };
+            let sub = if label_.is_empty() { None } else { Some(when(*taken)) };
+            let (n, i, shown) = (name.clone(), id.clone(), title.clone());
+            let restore = button(t("恢复…", "Restore…"), move || {
+                let q = if zh() { format!("把「{n}」恢复到「{shown}」？") } else { format!("Restore “{n}” to “{shown}”?") };
+                let text = t(
+                    "虚拟机会回到拍这个快照时的样子，之后的改动都会丢。想留着现在的样子，先拍一个快照。",
+                    "The machine goes back to what it was when this snapshot was taken; everything since is lost. To keep what it is now, take a snapshot first.",
+                );
+                if alert(&q, text, &[t("取消", "Cancel"), t("恢复", "Restore")], None, true) == 1 {
+                    snap_do(&["restore", &n, &i]);
+                }
+            });
+            let (n, i, shown) = (name.clone(), id.clone(), title.clone());
+            let del = button(t("删除…", "Delete…"), move || {
+                let q = if zh() { format!("删除快照「{shown}」？") } else { format!("Delete the snapshot “{shown}”?") };
+                if alert(&q, t("删掉后不能恢复。虚拟机现在的样子不受影响。", "It cannot be brought back. The machine as it is now is not touched."), &[t("取消", "Cancel"), t("删除", "Delete")], None, true) == 1 {
+                    snap_do(&["snapshot-rm", &n, &i]);
+                }
+            });
+            let acc = hstack(&[&*restore, &*del], 8.0);
+            row(Some(("camera.fill", NSColor::systemBlueColor())), &title, sub.as_deref(), Some(&acc))
+        })
+        .collect();
+    let n = name.clone();
+    let take = button(t("拍快照", "Take Snapshot"), move || {
+        save_fields();
+        let label_ = wiz(|w| w.label.clone()).unwrap_or_default();
+        snap_do(&["snapshot", &n, &label_]);
+    });
+    let acc = hstack(&[&*text_field("label", &label_, 200.0, false), &*take], 8.0);
+    rows.push(row(Some(("plus.circle.fill", NSColor::systemGreenColor())), t("新快照", "New Snapshot"), Some(t("名字可以不填", "A name is optional")), Some(&acc)));
+    section(
+        root_stack,
+        t("快照", "SNAPSHOTS"),
+        &rows,
+        Some(t(
+            "快照把停着的虚拟机原样留一份：磁盘、固件设置、TPM。在 APFS 上不额外占空间，之后改动了多少才占多少。删除虚拟机时快照一起删。",
+            "A snapshot keeps a stopped machine as it is: its disk, firmware settings and TPM. On APFS it takes no room of its own, only what changes afterwards. Deleting the machine deletes its snapshots.",
+        )),
+    );
+    let n = name.clone();
+    let go = button(t("克隆", "Clone"), move || {
+        save_fields();
+        let new = wiz(|w| w.clone.clone()).unwrap_or_default();
+        match vm_cmd(&["clone", &n, &new]) {
+            // the new machine is in the list behind this window
+            Ok(_) => close_wizard(),
+            Err(e) => {
+                wiz(|w| w.note = e);
+                render_wizard();
+            }
+        }
+    });
+    let acc = hstack(&[&*text_field("clone", &clone, 160.0, false), &*go], 8.0);
+    section(
+        root_stack,
+        t("克隆", "CLONE"),
+        &[row(Some(("plus.square.on.square", NSColor::systemOrangeColor())), t("新虚拟机的名称", "The New Machine's Name"), Some(t("字母、数字、- 和 _", "Letters, digits, - and _")), Some(&acc))],
+        Some(t(
+            "克隆是另一台独立的虚拟机：磁盘内容相同，网卡地址是新的。系统里的电脑名和账号还和原来一样，需要的话在克隆里改。",
+            "A clone is a machine of its own: the same disk contents, a new network address. The computer name and the accounts inside are still the original's: change them in the clone if that matters.",
+        )),
+    );
+    if !note.is_empty() {
+        root_stack.addArrangedSubview(&wrapping(&note, 13.0, &NSColor::systemRedColor(), width - 40.0));
+    }
+    super::buttons_right(root_stack, None, &[button(t("完成", "Done"), close_wizard)]);
 }
 
 fn step_edit(root_stack: &NSStackView, width: f64) {
@@ -726,6 +989,7 @@ fn step_edit(root_stack: &NSStackView, width: f64) {
         return;
     };
     let bhyve = std::fs::read(vm_dir(&name).join("vm.json")).ok().and_then(|b| serde_json::from_slice::<serde_json::Value>(&b).ok()).is_some_and(|c| str_of(&c, "engine") == Some("bhyve"));
+    let (gpu3d, rosetta, autostart) = wiz(|w| (w.gpu3d, w.rosetta, w.autostart)).unwrap_or_default();
     let net = switch(bridged, |on| {
         wiz(|w| w.bridged = on);
     });
@@ -775,6 +1039,40 @@ fn step_edit(root_stack: &NSStackView, width: f64) {
         let acc = hstack(&[&*choose, &*eject], 8.0);
         rows.push(row(None, t("安装盘", "Installer"), Some(&title), Some(&acc)));
     }
+    rows.push(row(
+        None,
+        t("登录后自动启动", "Start at Login"),
+        Some(t("登录这台 Mac 后这台虚拟机自己启动（每次登录一次）", "The VM starts by itself after you log in to this Mac (once per login)")),
+        Some(&switch(autostart, |on| {
+            wiz(|w| w.autostart = on);
+        })),
+    ));
+    if os == Os::Windows && bhyve && (gpu3d_ok() || gpu3d) {
+        rows.push(row(
+            None,
+            t("3D 加速", "3D Acceleration"),
+            Some(t("Direct3D 11，由 Mac 的显卡来画；分辨率跟着控制台窗口的大小变", "Direct3D 11 on the Mac's GPU; the resolution follows the console window's size")),
+            Some(&switch(gpu3d, |on| {
+                wiz(|w| w.gpu3d = on);
+            })),
+        ));
+    }
+    if os == Os::Linux && !bhyve && (rosetta_ok() || rosetta) {
+        let sw = switch(rosetta, |on| {
+            save_fields();
+            wiz(|w| w.rosetta = on);
+            render_wizard();
+        });
+        let cp = button(t("拷贝命令", "Copy Command"), || copy(ROSETTA_GUEST.into()));
+        cp.setEnabled(rosetta);
+        let acc = hstack(&[&*cp, &*sw], 8.0);
+        rows.push(row(
+            None,
+            "Rosetta",
+            Some(t("虚拟机里能跑 x86-64 的 Linux 程序；那条命令在虚拟机里运行一次", "x86-64 Linux programs run in the VM. Run the command in the VM once")),
+            Some(&acc),
+        ));
+    }
     section(root_stack, t("设置", "SETTINGS"), &rows, Some(t("下次启动时生效。", "Takes effect at the next start.")));
     if !note.is_empty() {
         root_stack.addArrangedSubview(&wrapping(&note, 13.0, &NSColor::systemRedColor(), width - 40.0));
@@ -804,6 +1102,14 @@ fn save_vm() {
         return render_wizard();
     }
     let (c, m, d, w, h) = (cpus.parse::<u64>().unwrap(), mem.parse::<u64>().unwrap(), disk.parse::<u64>().unwrap(), w_.parse::<u64>().unwrap(), h_.parse::<u64>().unwrap());
+    let (gpu3d, gpu3d_was, rosetta, autostart) = wiz(|w| (w.gpu3d, w.gpu3d_was, w.rosetta, w.autostart)).unwrap_or_default();
+    if gpu3d != gpu3d_was {
+        // the VM program does it: with the adapter goes a CD with the guest's driver
+        if let Err(e) = vm_cmd(&["gpu3d", &name, if gpu3d { "on" } else { "off" }]) {
+            wiz(|w| w.note = e);
+            return render_wizard();
+        }
+    }
     if d > disk_now {
         // a sparse file: longer costs nothing until the guest writes there
         let grown = std::fs::OpenOptions::new().write(true).open(vm_dir(&name).join("disk.img")).and_then(|f| f.set_len(d << 30));
@@ -833,8 +1139,28 @@ fn save_vm() {
             }
             None => {}
         }
+        for (k, on) in [("rosetta", rosetta), ("autostart", autostart)] {
+            if on {
+                j.insert(k.into(), true.into());
+            } else {
+                j.remove(k);
+            }
+        }
     });
     close_wizard();
+    if gpu3d && !gpu3d_was {
+        // the adapter is there from the next start; its driver is the one thing left to the user
+        alert(
+            t("3D 加速：还差装一次驱动", "3D acceleration: the driver, once"),
+            t(
+                "启动这台虚拟机，在 Windows 的「此电脑」里打开光盘 HMGPU3D，右键 install.cmd →「以管理员身份运行」。装好后画面会闪一下，之后就是 3D 加速的了。装驱动之前 Windows 照常用原来的显示方式。",
+                "Start the machine; in Windows open the CD HMGPU3D in This PC, right-click install.cmd and choose Run as administrator. The screen blinks once and is 3D accelerated from then on. Until the driver is in, Windows shows its picture as before.",
+            ),
+            &[t("好", "OK")],
+            None,
+            false,
+        );
+    }
 }
 
 /// Rebuild the wizard's window for its current step.
@@ -889,6 +1215,8 @@ fn save_fields() {
                 "w" => w.w = v.trim().to_string(),
                 "h" => w.h = v.trim().to_string(),
                 "user" => w.user = v.trim().to_string(),
+                "label" => w.label = v.trim().to_string(),
+                "clone" => w.clone = v.trim().to_string(),
                 "password" => w.password = v,
                 _ => {}
             }
@@ -915,8 +1243,11 @@ fn wizard_page(root_stack: &NSStackView, width: f64) {
     if step == Step::Edit {
         return step_edit(root_stack, width);
     }
+    if step == Step::Snapshots {
+        return step_snapshots(root_stack, width);
+    }
     let (n, what) = match step {
-        Step::Edit => unreachable!(),
+        Step::Edit | Step::Snapshots => unreachable!(),
         Step::Os => (1, t("选择系统", "Choose the system")),
         Step::Image => (2, t("选择安装映像", "Choose the installer")),
         Step::Settings => (3, t("设置", "Settings")),
@@ -928,7 +1259,7 @@ fn wizard_page(root_stack: &NSStackView, width: f64) {
         Step::Os => step_os(root_stack),
         Step::Image => step_image(root_stack, os, width),
         Step::Settings => step_settings(root_stack, os, width),
-        Step::Edit => {}
+        Step::Edit | Step::Snapshots => {}
     }
 }
 
@@ -1020,6 +1351,18 @@ fn files_in(dirs: &[PathBuf], keep: impl Fn(&str) -> bool) -> Vec<PathBuf> {
     v
 }
 
+/// Where Microsoft gives out the Windows 11 ARM64 ISO.
+const WINDOWS_PAGE: &str = "https://www.microsoft.com/software-download/windows11arm64";
+
+/// The window's timer: the wizard is at "choose the installer" and a file has come (a download
+/// finished) or gone: show the list as it is now.
+pub fn wizard_tick() {
+    let Some((os, listed)) = wiz(|w| (w.step == Step::Image).then(|| (w.os, w.listed.clone()))).flatten() else { return };
+    if candidates(os) != listed {
+        render_wizard();
+    }
+}
+
 /// The installers for `os` the folders hold.
 fn candidates(os: Os) -> Vec<PathBuf> {
     files_in(&image_dirs(), |n| match os {
@@ -1047,6 +1390,7 @@ fn step_image(root_stack: &NSStackView, os: Os, width: f64) {
         }
     };
     let list = candidates(os);
+    wiz(|w| w.listed = list.clone());
     let rows: Vec<Retained<NSView>> = list
         .iter()
         .map(|p| {
@@ -1068,6 +1412,21 @@ fn step_image(root_stack: &NSStackView, os: Os, width: f64) {
             ),
         );
     }
+    if os == Os::Windows {
+        // Microsoft's page hands the ISO to a person in a browser (it asks for the language
+        // and checks that it is one); the file lands in Downloads, where this list looks
+        rows.push(row(
+            Some(("arrow.down.circle.fill", NSColor::systemBlueColor())),
+            t("从微软下载 Windows 11 ARM64", "Get Windows 11 ARM64 from Microsoft"),
+            Some(t(
+                "打开微软的下载页（约 5 GB）。下到「下载」文件夹后会自己出现在这里",
+                "Opens Microsoft's page. The ISO (about 5 GB) shows up here once it is in Downloads",
+            )),
+            Some(&button(t("打开网页", "Open the Page"), || {
+                let _ = std::process::Command::new("/usr/bin/open").arg(WINDOWS_PAGE).status();
+            })),
+        ));
+    }
     let hint = match os {
         Os::Mac => t(
             "也可以用自己的恢复映像（.ipsw，ipsw.me 上有各个版本）；版本不能比这台 Mac 新。",
@@ -1086,12 +1445,12 @@ fn step_image(root_stack: &NSStackView, os: Os, width: f64) {
             "From download.freebsd.org: the arm64 aarch64 disc1.iso (or bootonly.iso).",
         ),
     };
-    if rows.is_empty() {
+    if list.is_empty() && os != Os::Mac && os != Os::Windows {
         let where_ = image_dirs().iter().map(|d| d.display().to_string()).collect::<Vec<_>>().join("、");
         let text = if zh() { format!("在 {where_} 里没找到 {} 的安装映像。{hint}", os_name(os)) } else { format!("No {} installer in {where_}. {hint}", os_name(os)) };
         root_stack.addArrangedSubview(&wrapping(&text, 13.0, &NSColor::secondaryLabelColor(), width - 40.0));
     } else {
-        section(root_stack, t("找到的映像", "INSTALLERS FOUND"), &rows, Some(hint));
+        section(root_stack, if list.is_empty() { t("安装映像", "INSTALLER") } else { t("找到的映像", "INSTALLERS FOUND") }, &rows, Some(hint));
     }
     super::buttons_right(
         root_stack,
@@ -1226,6 +1585,28 @@ fn step_settings(root_stack: &NSStackView, os: Os, width: f64) {
     if os == Os::Mac {
         rows.push(row(None, t("安装", "Install"), Some(t("创建后自动安装 macOS，10–20 分钟", "macOS installs by itself after Create, 10–20 minutes")), None));
     }
+    if os == Os::Linux && rosetta_ok() {
+        let on = wiz(|w| w.rosetta).unwrap_or(false);
+        rows.push(row(
+            None,
+            "Rosetta",
+            Some(t("虚拟机里能跑 x86-64 的 Linux 程序；装好后到「编辑…」里拷贝一条命令", "x86-64 Linux programs run in the VM; Edit… has the guest's command")),
+            Some(&switch(on, |on| {
+                wiz(|w| w.rosetta = on);
+            })),
+        ));
+    }
+    if os == Os::Windows && bhyve_ok() && gpu3d_ok() {
+        let on = wiz(|w| w.gpu3d).unwrap_or(false);
+        rows.push(row(
+            None,
+            t("3D 加速", "3D Acceleration"),
+            Some(t("Direct3D 11，由 Mac 的显卡来画；驱动随安装自动装上", "Direct3D 11, drawn by the Mac's GPU; the driver goes in with the install")),
+            Some(&switch(on, |on| {
+                wiz(|w| w.gpu3d = on);
+            })),
+        ));
+    }
     if os == Os::Linux || os == Os::FreeBsd {
         rows.push(row(None, t("安装", "Install"), Some(t("创建后点「启动」，在「控制台」里装系统", "After Create: Start it and install in the Console")), None));
     }
@@ -1269,6 +1650,11 @@ fn step_settings(root_stack: &NSStackView, os: Os, width: f64) {
         let virtio_row = {
             let (title, sub) = match &virtio {
                 Some(p) => (p.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default(), p.parent().map(|d| d.display().to_string()).unwrap_or_default()),
+                // (the old engine's install wants the file at hand)
+                None if bhyve_ok() => (
+                    t("virtio-win.iso：创建时自动下载", "virtio-win.iso: downloaded at Create").to_string(),
+                    t("网卡驱动，约 840 MB，来自 fedorapeople.org", "The network driver, about 840 MB, from fedorapeople.org").to_string(),
+                ),
                 None => (
                     t("没找到 virtio-win.iso", "virtio-win.iso not found").to_string(),
                     t("网卡和显卡的驱动：在 fedorapeople.org 下载 virtio-win.iso", "Drivers for the NIC and graphics: download virtio-win.iso from fedorapeople.org").to_string(),
@@ -1281,7 +1667,7 @@ fn step_settings(root_stack: &NSStackView, os: Os, width: f64) {
                 }
                 render_wizard();
             });
-            let color = if virtio.is_some() { NSColor::systemGreenColor() } else { NSColor::systemRedColor() };
+            let color = if virtio.is_some() { NSColor::systemGreenColor() } else if bhyve_ok() { NSColor::systemBlueColor() } else { NSColor::systemRedColor() };
             row(Some(("shippingbox.fill", color)), &title, Some(&sub), Some(&b))
         };
         let wim = if wimlib_ok() {
@@ -1335,10 +1721,20 @@ fn create_vm() {
             let mut args: Vec<String> = vec!["create".into(), name.clone()];
             match os {
                 Os::Mac => args.extend(["--ipsw".into(), image]),
-                Os::Linux => args.extend(["--os".into(), "linux".into(), "--iso".into(), image]),
+                Os::Linux => {
+                    args.extend(["--os".into(), "linux".into(), "--iso".into(), image]);
+                    if wiz(|w| w.rosetta).unwrap_or(false) && rosetta_ok() {
+                        args.push("--rosetta".into());
+                    }
+                }
                 Os::FreeBsd => args.extend(["--os".into(), "freebsd".into(), "--iso".into(), image]),
                 Os::Windows => {
-                    args.extend(["--os".into(), "windows".into(), "--iso".into(), image, "--virtio".into(), virtio.unwrap_or_default().to_string_lossy().into_owned()]);
+                    // no driver ISO at hand: the VM program downloads it (vm/src/bhyve.rs fetch_virtio)
+                    let virtio = virtio.map(|p| p.to_string_lossy().into_owned()).unwrap_or_else(|| "download".into());
+                    args.extend(["--os".into(), "windows".into(), "--iso".into(), image, "--virtio".into(), virtio]);
+                    if wiz(|w| w.gpu3d).unwrap_or(false) && bhyve_ok() && gpu3d_ok() {
+                        args.push("--gpu3d".into());
+                    }
                     if manual {
                         args.push("--manual".into());
                     } else {
@@ -1407,11 +1803,12 @@ fn check(os: Os, image: &Option<PathBuf>, virtio: &Option<PathBuf>, name: &str, 
         if password.is_empty() {
             return Err(s("要设一个密码：远程桌面登录要用。", "Set a password: Remote Desktop logons need one."));
         }
-        if virtio.as_ref().is_none_or(|p| !p.exists()) {
-            return Err(s("还没选 virtio-win.iso。", "virtio-win.iso is not chosen yet."));
-        }
+        // (on bhyve the VM program downloads it when there is none)
         if bhyve_ok() {
             return Ok(());
+        }
+        if virtio.as_ref().is_none_or(|p| !p.exists()) {
+            return Err(s("还没选 virtio-win.iso。", "virtio-win.iso is not chosen yet."));
         }
         if !wimlib_ok() {
             return Err(s("先装 wimlib：brew install wimlib。", "Install wimlib first: brew install wimlib."));
@@ -1432,9 +1829,10 @@ fn install_state(what: &str) -> String {
         "win:stick" => t("正在准备安装盘", "Preparing the install media").into(),
         "win:phase1" => t("正在安装 Windows：1/2 复制系统文件", "Installing Windows: 1/2 copying the system").into(),
         "win:phase2" => t("正在安装 Windows：2/2 设置和首次登录", "Installing Windows: 2/2 setup and first logon").into(),
-        pct => match pct.strip_prefix("dl:") {
-            Some(p) => format!("{} {p}%", t("正在从苹果下载 macOS", "Downloading macOS from Apple")),
-            None => format!("{} {pct}%", t("正在安装 macOS", "Installing macOS")),
+        pct => match (pct.strip_prefix("dlv:"), pct.strip_prefix("dl:")) {
+            (Some(p), _) => format!("{} {p}%", t("正在下载 virtio 驱动", "Downloading the virtio drivers")),
+            (_, Some(p)) => format!("{} {p}%", t("正在从苹果下载 macOS", "Downloading macOS from Apple")),
+            _ => format!("{} {pct}%", t("正在安装 macOS", "Installing macOS")),
         },
     }
 }

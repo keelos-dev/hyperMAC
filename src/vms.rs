@@ -102,6 +102,97 @@ pub fn list() -> Vec<Vm> {
     v
 }
 
+/// The VM program: <state>/bin/hypermac-vm (build.sh installs it there), else beside this
+/// executable (hyperMAC.app).
+pub fn runner(state: &std::path::Path) -> Option<PathBuf> {
+    let installed = state.join("bin/hypermac-vm");
+    if installed.exists() {
+        return Some(installed);
+    }
+    let beside = std::env::current_exe().ok()?.parent()?.join("hypermac-vm");
+    beside.exists().then_some(beside)
+}
+
+/// `hypermac-vm run NAME` as its own session, output to the VM's run.log: it outlives whoever
+/// started it (the window, this service).
+pub fn start_detached(state: &std::path::Path, name: &str) -> std::io::Result<()> {
+    use std::os::unix::process::CommandExt;
+    let exe = runner(state).ok_or_else(|| std::io::Error::new(std::io::ErrorKind::NotFound, "hypermac-vm is not installed"))?;
+    let out = std::fs::OpenOptions::new().create(true).append(true).open(dir(name).join("run.log"))?;
+    let mut cmd = std::process::Command::new(exe);
+    cmd.args(["run", name]).stdin(std::process::Stdio::null()).stdout(out.try_clone()?).stderr(out);
+    unsafe {
+        cmd.pre_exec(|| {
+            libc::setsid();
+            Ok(())
+        });
+    }
+    cmd.spawn().map(|_| ())
+}
+
+/// This login: when the Mac started, and the process of this user's login session. A VM that
+/// is to start by itself starts once per login, not every time the service starts (an update
+/// restarts the service; a machine its user shut down since stays down).
+fn login_mark() -> Option<String> {
+    let mut boot: libc::timeval = unsafe { std::mem::zeroed() };
+    let mut len = std::mem::size_of::<libc::timeval>();
+    let r = unsafe { libc::sysctlbyname(c"kern.boottime".as_ptr(), (&mut boot as *mut libc::timeval).cast(), &mut len, std::ptr::null_mut(), 0) };
+    if r != 0 {
+        return None;
+    }
+    // loginwindow runs once per login session of the user
+    let uid = unsafe { libc::getuid() }.to_string();
+    let out = std::process::Command::new("/usr/bin/pgrep").args(["-x", "-u", &uid, "loginwindow"]).output().ok()?;
+    let pid = String::from_utf8_lossy(&out.stdout).lines().next()?.trim().to_string();
+    (!pid.is_empty()).then(|| format!("{}:{pid}", boot.tv_sec))
+}
+
+/// Start the VMs whose vm.json says "autostart" (the window's Edit… sets it), once per login.
+/// Called when the service starts, which launchd does at login.
+pub fn autostart(state: &std::path::Path) {
+    let Some(mark) = login_mark() else { return };
+    let file = state.join("autostart.login");
+    if std::fs::read_to_string(&file).is_ok_and(|m| m.trim() == mark) {
+        return;
+    }
+    let state = state.to_path_buf();
+    let start = move |guests: Option<PathBuf>| {
+        // (written before the starts: a start that goes wrong is not tried again and again)
+        let _ = std::fs::write(&file, &mark);
+        let Some(guests) = guests else {
+            warn!("autostart: the storage folder {} is not there", guests_dir().display());
+            return;
+        };
+        for e in std::fs::read_dir(guests).into_iter().flatten().flatten() {
+            let name = e.file_name().to_string_lossy().into_owned();
+            let Some(conf) = std::fs::read(e.path().join("vm.json")).ok().and_then(|b| serde_json::from_slice::<serde_json::Value>(&b).ok()) else { continue };
+            let wanted = conf.get("autostart").and_then(|v| v.as_bool()).unwrap_or(false);
+            // not one that runs already, or that an install is still working on
+            if !wanted || e.path().join("installing").exists() || std::os::unix::net::UnixStream::connect(e.path().join("ctl.sock")).is_ok() {
+                continue;
+            }
+            match start_detached(&state, &name) {
+                Ok(()) => info!(vm = %name, "autostart: started"),
+                Err(e) => warn!(vm = %name, "autostart: {e}"),
+            }
+        }
+    };
+    // the folder is there: now (the service may have nothing else to do and end). Not there:
+    // an external disk comes up some seconds after the login, waited for in the background
+    let g = guests_dir();
+    if g.is_dir() {
+        return start(Some(g));
+    }
+    std::thread::spawn(move || {
+        let guests = (0..30).find_map(|_| {
+            std::thread::sleep(Duration::from_secs(2));
+            let g = guests_dir();
+            g.is_dir().then_some(g)
+        });
+        start(guests)
+    });
+}
+
 /// The same UUID hyperMAC gives the VM (hyperMAC src/serve.rs uuid_of).
 pub fn uuid_of(name: &str) -> String {
     let h = Sha256::digest(format!("hypermac:{name}").as_bytes());
@@ -309,13 +400,14 @@ const MAX_PIXELS: usize = 3840 * 2160;
 const SIZE: usize = HEADER + MAX_PIXELS * 4;
 const MAGIC: u64 = u64::from_le_bytes(*b"HMSCRN01");
 
-struct Shm {
+pub(crate) struct Shm {
     p: *mut u8,
 }
 unsafe impl Send for Shm {}
+unsafe impl Sync for Shm {}
 
 impl Shm {
-    fn open(name: &str) -> Option<Shm> {
+    pub(crate) fn open(name: &str) -> Option<Shm> {
         let f = std::fs::OpenOptions::new().read(true).write(true).open(dir(name).join("screen.shm")).ok()?;
         if f.metadata().ok()?.len() < SIZE as u64 {
             return None;
@@ -335,17 +427,17 @@ impl Shm {
         unsafe { &*(self.p.add(off) as *const AtomicU64) }
     }
 
-    fn want(&self, ms: u64) {
+    pub(crate) fn want(&self, ms: u64) {
         let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_millis() as u64).unwrap_or(0);
         self.a64(24).store(now + ms, Ordering::Relaxed);
     }
 
-    fn peek(&self) -> (u64, u32, u32) {
+    pub(crate) fn peek(&self) -> (u64, u32, u32) {
         let seq = self.a64(8).load(Ordering::Acquire);
         unsafe { (seq, (self.p.add(16) as *const u32).read_volatile(), (self.p.add(20) as *const u32).read_volatile()) }
     }
 
-    fn read(&self, last: u64) -> Option<(u64, u32, u32, Vec<u8>)> {
+    pub(crate) fn read(&self, last: u64) -> Option<(u64, u32, u32, Vec<u8>)> {
         for _ in 0..4 {
             let (seq, w, h) = self.peek();
             if seq == last || seq % 2 == 1 || w == 0 || h == 0 || (w as usize * h as usize) > MAX_PIXELS {

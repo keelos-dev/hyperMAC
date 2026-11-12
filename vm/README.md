@@ -28,7 +28,12 @@ sh vm/build.sh     # 只编这个：vm/target/release/hypermac，ad-hoc 签名
 窗口不拥有虚拟机：每台是独立的 `hypermac-vm run NAME` 进程，窗口关了、服务重启了它们照样运行。
 
 「控制台」是虚拟机自己的进程按需开的一个原生窗口（`src/console.rs`，`src/vm.rs` 的 `open_console`）：
-画面、键盘、鼠标直接进虚拟机；关掉窗口虚拟机不受影响。窗口按比例缩放 guest 的画面，不改 guest 的分辨率。
+画面、键盘、鼠标直接进虚拟机；关掉窗口虚拟机不受影响。
+窗口改了大小，guest 的分辨率跟着变（2026-11-12 实测）：
+- VZ 自己的显卡（macOS guest、`--vz-devices` 的 Linux）：`VZVirtualMachineView` 的 `automaticallyReconfiguresDisplay`。Fedora 45 实测跟上；macOS guest 没实测。
+- bhyve + 3D 的 Windows：窗口松手后把大小写进 3D 显卡的共享内存（`bhyve.rs` `request_size`，keelOS 给 keel-rdp 留的 `req_width/req_height`），
+  设备发 `VIRTIO_GPU_EVENT_DISPLAY`，Triton 驱动自己换模式。实测 1024x768 到 2560x1440、奇数尺寸（宽取 8 的倍数）都跟上。`ctl NAME size W H` 是同一件事。
+- 其余（自己的 virtio-gpu 的 Linux、FreeBSD、没开 3D 的 Windows）：还是 `vm.json` 的大小，按比例缩放进窗口。
 
 命令行：
 
@@ -42,12 +47,37 @@ hypermac ctl mac1 stop      # 请求 guest 关机；关完进程退出
 hypermac ctl mac1 kill      # 直接杀掉
 hypermac ip mac1            # guest 的 IP
 hypermac net mac1 bridged   # 桥接到宿主的默认网卡（bridged:en0 指定网卡）；nat 改回去。下次启动生效
+hypermac clone mac1 mac2    # 克隆一台停着的 VM：磁盘内容相同，MAC 地址、machine-id、VNC 密码是新的
+hypermac snapshot mac1 装好系统   # 给停着的 VM 拍快照（名字可省），打印快照的 id
+hypermac snapshots mac1     # 列出快照：id、名字
+hypermac restore mac1 ID    # 回到那个快照（现在的样子会丢：想留就先拍一个）
+hypermac snapshot-rm mac1 ID
 hypermac list
 ```
 
 `create` 的可选项：`--cpus N`（默认 4）、`--mem-gb G`（macOS 默认 6，Linux 默认 4）、`--disk-gb G`（macOS 默认 64，Linux 默认 32，稀疏文件）、`--w W --h H`（默认 1920x1080）。
 Linux VM 每次启动都把 `vm.json` 里的 `iso` 当 U 盘挂上（装完系统后把这一项删掉）；`run NAME --iso PATH` 可以临时指定。
 guest 的 macOS 版本不能比宿主新。
+
+克隆和快照（`src/snap.rs`）拷的是「这台机器」的文件：`vm.json`、`disk.img`、`aux.img`、`nvram`、`vars.fd`、`hardware-model`、`machine-id`、
+挂起文件和 `tpm/`，用 `clonefile(2)`：APFS 上瞬间完成、不占空间，改了多少才占多少；别的文件系统上是整个拷贝。快照在 `guests/NAME/snapshots/ID/`，
+删 VM 时一起删。只能对停着的 VM 做；VZ 挂起的 VM 算停着，快照带着挂起文件，恢复后从挂起处继续。
+2026-11-12 实测：Windows 11（bhyve + TPM + 3D）克隆后能进桌面；快照、恢复、删除在命令行和窗口里都走过；克隆后的网络没测（测试镜像里没有网卡驱动），
+带挂起文件的快照、macOS guest 的克隆没测。
+
+`vm.json` 里还有两个开关（窗口的「编辑…」里都有）：`"autostart": true`（登录 Mac 后由主服务启动，每次登录一次，`src/vms.rs` `autostart`；
+实测是手动起服务：第一次启动了标了的那台，同一次登录里第二次不再启动。真的注销再登录没测）；
+`"rosetta": true`（Linux，VZ 引擎：给 guest 一个名叫 `rosetta` 的 virtiofs 共享，里面是苹果的翻译器；`create … --os linux --rosetta`）。
+guest 里要挂载并注册一次（「编辑…」里「拷贝命令」就是这几条连成的一行；Fedora 这类开着 SELinux 的系统要给挂载加 `context=`，命令里已经判断了）：
+
+```sh
+O=ro,nofail,x-systemd.before=systemd-binfmt.service; if command -v selinuxenabled >/dev/null && selinuxenabled; then O=$O,context=system_u:object_r:bin_t:s0; fi
+sudo mkdir -p /media/rosetta && echo "rosetta /media/rosetta virtiofs $O 0 0" | sudo tee -a /etc/fstab && sudo systemctl daemon-reload && sudo mount /media/rosetta
+echo ':rosetta:M::\x7fELF\x02\x01\x01\x00\x00\x00\x00\x00\x00\x00\x00\x00\x02\x00\x3e\x00:\xff\xff\xff\xff\xff\xfe\xfe\x00\xff\xff\xff\xff\xff\xff\xff\xff\xfe\xff\xff\xff:/media/rosetta/rosetta:CF' | sudo tee /etc/binfmt.d/rosetta.conf && sudo systemctl restart systemd-binfmt
+```
+
+2026-11-12 实测（Fedora 45 live，SELinux Enforcing）：x86-64 的 busybox `uname -m` 输出 `x86_64`。重启 guest 后是否还在（fstab 的顺序）没测：live 系统重启就没了。
+不加 `context=` 时 Fedora 上 systemd-binfmt 报 `Failed to add binary format 'rosetta': Permission denied`。
 
 存储位置（主窗口「虚拟机」页底部可改，`settings.json` 的 `vm_dir`，默认是状态目录）照 keelOS 的数据集布局：`guests/NAME/`（一台 VM 一个目录）、`iso/`（安装盘）、`images/`（留给磁盘镜像）。旧布局的 `vms/` 在没有 `guests/` 时照用。一台 VM 的目录里：
 `vm.json`（配置）、`disk.img`、`aux.img`、`hardware-model`、`machine-id`、`ctl.sock`。
@@ -91,6 +121,7 @@ Windows 不再走 Virtualization.framework + efiprobe，改跑在 `vm/bhyve`（F
 ```sh
 sh build.sh        # 仓库根目录：编 vm/bhyve，把 bhyve 和 QEMU_EFI.fd 装到 hypermac-vm 旁边（要有 ~/Developer/keelOS）
 HYPERMAC_WIN_PASSWORD=密码 hypermac create win1 --os windows --iso Win11_arm64.iso --virtio virtio-win.iso --user win [--net bridged]
+# 不给 --virtio（或 --virtio download）：用存储位置 iso/ 里已有的 virtio-win*.iso，没有就从 fedorapeople.org 下载（约 840 MB，只走 HTTPS；2026-11-12 实测）
 hypermac win-resume win1     # 中途停了从断点接着装
 ```
 
@@ -105,9 +136,37 @@ hypermac win-resume win1     # 中途停了从断点接着装
   本机听到 Windows 的开机声；kRDPclient 连上这台 VM 听到声音（Opus）。mstsc（PCM）和 44.1 kHz 的转换没实测。只有 Windows 来宾有，没有录音。
 - `create … --engine vz` 仍走下面的老办法；没装 bhyve 引擎的机器自动走老办法。
 
+### 融合模式（coherence，2026-11-12 第一版）
+
+Windows 的每个窗口变成 Mac 桌面上的一个窗口（`src/coherence.rs`，文件头是原理）。`hypermac ctl NAME coherence on|off|status|start|run 命令|click X Y`，
+主窗口里是运行中的 Windows 虚拟机那一行的按钮。
+
+- guest 的屏幕改成和 Mac 主屏一样大（靠 3D 显卡的 `request_size`，所以要 `gpu3d`；没有的话画面按比例拉伸），位置一一对应。
+- guest 里的小程序 `vm/tools/win-agent/hmagent.cs` 每 16 ms 列一遍顶层窗口（`FindWindowEx`：`EnumWindows` 不给开始菜单这类 shell 窗口），
+  变了就把位置、标题、前台窗口发给宿主；宿主对每个窗口开一个无边框的 NSWindow，内容是整屏画面的那一块（`contentsRect`）。
+  窗口的边框是 Windows 自己画的：点关闭、拖标题栏都是点在 guest 里，小程序报了新位置，Mac 的窗口跟过去。
+- 小程序是 C# 源码，在 guest 里用系统自带的 csc 编译（`install.cmd`），不带二进制。新建的 Windows 虚拟机装系统时自动装上（setup.iso 的 `agent\`，
+  `hypermac.cmd` 的 os 一步）；以前建的用 `hypermac agent NAME` 插一张 HMAGENT 光盘，在 Windows 里以管理员身份运行 `install.cmd`。
+  它监听 TCP 47800，要宿主先说对 `vm.json` 里的 `agent` 口令；开机登录后自动启动（HKLM 的 Run）。
+- 任务栏设成自动隐藏；Mac 的菜单栏和 Dock 占的边由小程序在 Windows 里登记成「应用栏」留出来，最大化的窗口停在它们旁边
+  （试过 `SPI_SETWORKAREA`：Explorer 会改回去）。断开连接时都恢复。
+- 开始菜单：`coherence start`（发一下 Windows 键），它自己是一个窗口。背后那张盖满全屏的透明窗口被小程序跳过。
+- 键盘：左 Command 当 Ctrl，右 Command 是 Windows 键；带 Command 的组合键按一下算一下（AppKit 不给它们的 keyUp）。
+
+实测（脚本，宿主 1920x1080 的 1x 屏，guest 日文 26300）：记事本、计算器、命令行各成一个 Mac 窗口，圆角对得上；在 guest 里打字标题跟着变；
+Alt 打开菜单出现弹出窗口；Win+左贴靠后窗口到 (0,0,960x1080)；`coherence click` 点最大化后停在 (72,22)-(1920,1080)（Mac 可用区是 x≥74、y≥30，
+多出来的几像素是 Windows 最大化窗口本来就有的出血）；开始菜单是一个 858x890 的窗口；重启虚拟机后小程序自己起来。
+没测：真的用鼠标和键盘在这些窗口上操作（往进程里投递合成的鼠标事件到不了视图，所以只验证了坐标换算和送进 guest 这一段）、Retina 屏、Dock 在底部、多显示器、桥接网络、长时间使用。
+
+已知的毛病：指针形状不跟 guest；Retina 上发虚（guest 一个像素对一个点）；两个互相遮挡的 guest 窗口之间夹了 Mac 窗口时下面那个露出上面那个的一块
+（画面是合成后的整屏，不是每个窗口自己的像素）；菜单窗口比看得见的菜单大一圈（阴影的位置），那一圈是它在 guest 里背后的东西；拖动窗口时内容比位置晚一两帧；
+剪贴板不通；地址靠 DHCP 租约查，桥接的虚拟机查不到；口令和窗口标题在虚拟网络上是明文。
+
 ### 3D 加速（Direct3D 11，2026-11-11 实测：MacBook Air M4 / macOS 27.2，guest 26300 日文版）
 
-`create … --os windows … --gpu3d`，或已有的虚拟机在 `vm.json` 里加 `"gpu3d": true`。guest 的 Direct3D 调用在宿主的 GPU 上执行：
+`create … --os windows … --gpu3d`（新建向导里有开关）；已有的虚拟机用 `hypermac gpu3d NAME on|off`（窗口「编辑…」里的开关调的就是它）：
+打开时在 VM 目录里做一张 `gpu3d-driver.iso`（卷名 HMGPU3D：Triton 驱动和 `install.cmd`）插上，用户在 Windows 里以管理员身份运行一次 `install.cmd`
+（光盘的内容和开关实测过，在 Windows 里从这张光盘装驱动这一步没实测）。guest 的 Direct3D 调用在宿主的 GPU 上执行：
 桌面合成（DWM）、Edge、WebGL 都走它。实测 WebGL Aquarium 500 条鱼 57 帧（1024x768）。
 
 要先造出 3D 引擎（不是默认构建的一部分，要 LLVM 15、meson，约十分钟）：`vm/bhyve/gpu3d.sh`，得到 `vm/bhyve/build/bhyve-3d` 和
