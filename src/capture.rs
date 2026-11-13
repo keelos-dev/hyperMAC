@@ -489,8 +489,9 @@ impl Output {
         };
         if let Some(v) = &self.ivars().video {
             let (w, h) = unsafe { (CVPixelBufferGetWidth(&pb) as u32, CVPixelBufferGetHeight(&pb) as u32) };
-            match v.begin(w, h) {
-                crate::video::Go::Encode { stream, key } => {
+            // (this Mac's own desktop is never a screen of few colours: always H.264)
+            match v.begin(w, h, false) {
+                crate::video::Go::Encode { stream, key, .. } => {
                     let mut enc = self.ivars().encoder.lock().unwrap();
                     if enc.as_ref().map(|(_, s)| *s) != Some(stream) {
                         *enc = None; // the old stream's encoder, and its drain thread, go

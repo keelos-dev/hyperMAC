@@ -58,6 +58,8 @@ const STALL: std::time::Duration = std::time::Duration::from_secs(2);
 pub const VERSION: u32 = 1;
 pub const CODEC_VP9: u8 = 1;
 pub const CODEC_H264: u8 = 3;
+/// The lossless picture of a screen of few colours (indexed.rs; keelOS docs/71 §4.4).
+pub const CODEC_INDEXED: u8 = 4;
 
 // --- messages (little-endian; copied from keel-rdp video.rs) ---------------------------------
 
@@ -120,6 +122,11 @@ impl Caps {
     pub fn h264(&self) -> Option<u8> {
         self.codecs.iter().find(|(id, _)| *id == CODEC_H264).map(|&(_, f)| f)
     }
+
+    /// Does the client take the lossless picture (indexed.rs)?
+    pub fn indexed(&self) -> bool {
+        self.codecs.iter().any(|(id, _)| *id == CODEC_INDEXED)
+    }
 }
 
 pub fn start_body(stream: u32, codec: u8, w: u16, h: u16, fps: u16) -> Vec<u8> {
@@ -177,6 +184,8 @@ struct State {
     /// The stream id in progress, if any, and its size.
     stream: Option<u32>,
     size: (u32, u32),
+    /// The current stream's codec_id.
+    codec: u8,
     /// Frames of the current stream sent (or being encoded) and not yet acknowledged.
     in_flight: u32,
     /// Since when begin() has answered Busy with no FRAME_ACK in between (the stall watchdog).
@@ -198,8 +207,8 @@ pub type Offers = Arc<Mutex<HashMap<u32, (Vec<u8>, Video, Instant)>>>;
 
 /// What the capture should do with a frame (begin()).
 pub enum Go {
-    /// Encode it for this stream, as a keyframe if asked.
-    Encode { stream: u32, key: bool },
+    /// Encode it for this stream, as a keyframe if asked: H.264, or `indexed` (indexed.rs).
+    Encode { stream: u32, key: bool, indexed: bool },
     /// A stream runs but the client has enough in flight: drop this frame, send no bitmap.
     Busy,
     /// No video for this connection: the bitmap path.
@@ -320,39 +329,44 @@ impl Video {
     }
 
     /// A captured frame of this size is here: encode it, drop it, or take the bitmap path.
-    /// Starts a stream (START) when the client can take video and none runs at this size.
-    pub fn begin(&self, w: u32, h: u32) -> Go {
+    /// Starts a stream (START) when the client can take video and none runs at this size and
+    /// in this codec. `indexed`: the caller has this picture as a lossless one (takes_indexed(),
+    /// indexed.rs) — a client that does not take those gets H.264 as before.
+    pub fn begin(&self, w: u32, h: u32, indexed: bool) -> Go {
         let mut s = self.state.lock().unwrap();
-        let wants = {
+        let codec = {
             let ready = self.ready.load(Ordering::Relaxed);
-            s.caps.as_ref().is_some_and(|c| {
-                ready
-                    && c.h264().is_some()
-                    && w <= c.max_width as u32
-                    && h <= c.max_height as u32
-                    && w % 2 == 0
-                    && h % 2 == 0
+            s.caps.as_ref().and_then(|c| {
+                let fits = w <= c.max_width as u32 && h <= c.max_height as u32;
+                if indexed && c.indexed() && fits {
+                    Some(CODEC_INDEXED)
+                } else if ready && c.h264().is_some() && fits && w % 2 == 0 && h % 2 == 0 {
+                    Some(CODEC_H264)
+                } else {
+                    None
+                }
             })
         };
-        if !wants {
+        let Some(codec) = codec else {
             if let Some(id) = s.stream.take() {
                 drop(s);
                 self.stop(id);
             }
             return Go::NoVideo;
-        }
-        if s.stream.is_none() || s.size != (w, h) {
+        };
+        if s.stream.is_none() || s.size != (w, h) || s.codec != codec {
             let id = self.next_stream.fetch_add(1, Ordering::Relaxed);
-            info!(stream = id, w, h, "keelOS::Video: START (H.264)");
+            info!(stream = id, w, h, codec = if codec == CODEC_INDEXED { "lossless" } else { "H.264" }, "keelOS::Video: START");
             s.stream = Some(id);
             s.size = (w, h);
+            s.codec = codec;
             s.in_flight = 0;
             s.next_frame = 0;
             s.keyframe = true;
             drop(s);
             // fps_hint = the capture ceiling actually in force (MACRDP_FPS), not a constant
             let hint = self.fps() as u16;
-            self.send(vec![message(START, &start_body(id, CODEC_H264, w as u16, h as u16, hint))]);
+            self.send(vec![message(START, &start_body(id, codec, w as u16, h as u16, hint))]);
             s = self.state.lock().unwrap();
         }
         if s.in_flight >= Self::max_in_flight(&s) {
@@ -369,7 +383,12 @@ impl Video {
         s.busy_since = None;
         s.in_flight += 1;
         let key = std::mem::take(&mut s.keyframe);
-        Go::Encode { stream: s.stream.unwrap(), key }
+        Go::Encode { stream: s.stream.unwrap(), key, indexed: s.codec == CODEC_INDEXED }
+    }
+
+    /// The client takes the lossless picture (indexed.rs): worth looking whether the screen is one.
+    pub fn takes_indexed(&self) -> bool {
+        self.state.lock().unwrap().caps.as_ref().is_some_and(Caps::indexed)
     }
 
     /// No encoder for this connection (VideoToolbox refused): bitmaps from now on. Ends the
@@ -457,7 +476,7 @@ impl Video {
                         info!(?c, "keelOS::Video: client capabilities");
                         self.ready.store(c.h264().is_some(), Ordering::Relaxed);
                         if c.h264().is_none() {
-                            info!("keelOS::Video: client offers no H.264 — staying on EGFX");
+                            info!(lossless = c.indexed(), "keelOS::Video: client offers no H.264 — staying on EGFX");
                         }
                         s.caps = Some(c);
                     }

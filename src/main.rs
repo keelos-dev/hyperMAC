@@ -19,6 +19,7 @@ mod display;
 mod encoder;
 mod guest;
 mod gui;
+mod indexed;
 mod input;
 mod shutdown;
 mod l2;

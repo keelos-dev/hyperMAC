@@ -558,6 +558,12 @@ impl RdpServerDisplay for VmDisplay {
             };
             let (mut last, mut size) = (0u64, told);
             let mut enc: Option<(crate::encoder::Encoder, u32)> = None;
+            // The lossless picture (indexed.rs) while the screen has few colours (a text
+            // console, a boot menu): `few`. `had`: the picture the client has and its stream,
+            // for sending only what changed. In H.264 the screen is looked at once a second.
+            let mut few = false;
+            let mut had: Option<(Vec<u8>, u32)> = None;
+            let mut look_at = std::time::Instant::now();
             // what a frame costs here, said every 600 frames: (frames, busy, read, buffer, encode) µs
             let mut cost = (0u32, 0u32, 0u64, 0u64, 0u64, std::time::Instant::now());
             loop {
@@ -587,8 +593,51 @@ impl RdpServerDisplay for VmDisplay {
                     }
                     size = (w, h);
                     if let Some(v) = &video {
-                        match v.begin(w, h) {
-                            crate::video::Go::Encode { stream, key } => {
+                        let whole = (0, 0, w as usize, h as usize);
+                        // a whole picture made while looking: sent as the keyframe, not made twice
+                        let mut made = None;
+                        if !v.takes_indexed() {
+                            few = false;
+                        } else if !few && std::time::Instant::now() >= look_at {
+                            look_at = std::time::Instant::now() + Duration::from_secs(1);
+                            made = crate::indexed::encode(&pix, w as usize, whole);
+                            few = made.is_some();
+                            if few {
+                                info!(w, h, "VM video: a screen of few colours, lossless from here");
+                            }
+                        }
+                        match v.begin(w, h, few) {
+                            crate::video::Go::Encode { stream, key, indexed: true } => {
+                                enc = None;
+                                let before = had.as_ref().filter(|(p, s)| *s == stream && p.len() == pix.len() && !key);
+                                let rect = match before {
+                                    Some((p, _)) => crate::indexed::changed(p, &pix, w as usize, h as usize),
+                                    None => Some(whole),
+                                };
+                                let Some(rect) = rect else {
+                                    v.abort(stream); // the same picture again: nothing to send
+                                    continue;
+                                };
+                                let key = before.is_none();
+                                match made.filter(|_| key).or_else(|| crate::indexed::encode(&pix, w as usize, rect)) {
+                                    Some(data) => {
+                                        v.frame_out(stream, key, &data, crate::video::now_us());
+                                        had = Some((pix, stream));
+                                    }
+                                    None => {
+                                        // more colours than a palette holds: this frame again, as H.264
+                                        info!("VM video: the screen has many colours now, H.264 from here");
+                                        v.abort(stream);
+                                        few = false;
+                                        look_at = std::time::Instant::now() + Duration::from_secs(1);
+                                        had = None;
+                                        last = 0;
+                                    }
+                                }
+                                continue;
+                            }
+                            crate::video::Go::Encode { stream, key, indexed: false } => {
+                                had = None;
                                 if enc.as_ref().map(|(_, s)| *s) != Some(stream) {
                                     enc = None; // the old stream's encoder, and its drain thread, go
                                     match crate::encoder::Encoder::new(w, h, v.fps() as u32, v.kbps()) {

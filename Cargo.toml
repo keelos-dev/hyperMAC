@@ -1,11 +1,13 @@
 [package]
 name = "hypermac"
-version = "1.4.2"
+version = "1.4.3"
 edition = "2024"
 description = "RDP server for the Mac's physical desktop (docs/design.md)"
 publish = false
 
 [dependencies]
+# the lossless picture of a screen of few colours (src/indexed.rs)
+flate2 = "1"
 # IronRDP: keel-rdp's pin (8f9bf5b8 + ironrdp-keel.patch); build.sh puts it in vendor/IronRDP
 ironrdp-server = { path = "vendor/IronRDP/crates/ironrdp-server", default-features = false, features = ["helper", "rayon", "egfx"] }
 ironrdp-pdu = { path = "vendor/IronRDP/crates/ironrdp-pdu" }

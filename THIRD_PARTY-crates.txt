@@ -1,6 +1,6 @@
 Third-party software in macrdp
 ========================================
-Cargo.lock sha256: c96f2ceaf6a0d0d43ec1407ccdba82eae30b92d0bca8f0b1fb6d84a1ac1ec1c7
+Cargo.lock sha256: e65d8c37f2613def166f417c0fbd57b1940d80f0ec96b21029071dad9fc07678
 
 addchain 0.2.1
   License: MIT OR Apache-2.0
@@ -69131,6 +69131,33 @@ zerovec-derive 0.11.7
   
   Portions of ICU4X may have been adapted from ICU4C and/or ICU4J.
   ICU 1.8.1 to ICU 57.1 © 1995-2016 International Business Machines Corporation and others.
+
+
+----------------------------------------
+
+zlib-rs 0.6.8
+  License: Zlib
+
+  --- LICENSE ---
+  (C) 2024 Trifecta Tech Foundation 
+  
+  This software is provided 'as-is', without any express or implied
+  warranty. In no event will the authors be held liable for any damages
+  arising from the use of this software.
+  
+  Permission is granted to anyone to use this software for any purpose,
+  including commercial applications, and to alter it and redistribute it
+  freely, subject to the following restrictions:
+  
+  1. The origin of this software must not be misrepresented; you must not
+     claim that you wrote the original software. If you use this software
+     in a product, an acknowledgment in the product documentation would be
+     appreciated but is not required.
+  
+  2. Altered source versions must be plainly marked as such, and must not be
+     misrepresented as being the original software.
+  
+  3. This notice may not be removed or altered from any source distribution.
 
 
 ----------------------------------------
