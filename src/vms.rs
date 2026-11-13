@@ -91,7 +91,10 @@ pub fn list() -> Vec<Vm> {
             let conf: serde_json::Value = serde_json::from_slice(&std::fs::read(e.path().join("vm.json")).ok()?).ok()?;
             Some(Vm {
                 os: conf.get("os").and_then(|o| o.as_str()).unwrap_or("linux").to_string(),
-                own_devices: conf.get("own_devices").and_then(|o| o.as_bool()).unwrap_or(false),
+                // (a Linux machine with its installer plugged in runs on the framework's
+                // display and has no screen.shm: vm/src/vm.rs run)
+                own_devices: conf.get("own_devices").and_then(|o| o.as_bool()).unwrap_or(false)
+                    && (conf.get("os").and_then(|o| o.as_str()) != Some("linux") || e.path().join("screen.shm").exists()),
                 os_version: conf.get("os_version").and_then(|o| o.as_str()).unwrap_or("").to_string(),
                 running: std::os::unix::net::UnixStream::connect(e.path().join("ctl.sock")).is_ok(),
                 name,

@@ -111,7 +111,51 @@ VNC 控制台的已知毛病：大写字母和 Shift 符号会变成小写（路
 `create --os linux --iso …` 后 `run`，约 35 秒到 GNOME 桌面（1280x800，4 核 4 GB）。VNC 控制台里鼠标点击、键盘输入都正常
 （搜索框里敲 terminal 回车能开终端）。串口输出在 VM 目录的 `console.log`。
 显卡是 Virtualization.framework 自带的 virtio-gpu，只有 2D：guest 的桌面和 OpenGL 都是 CPU 软件渲染（llvmpipe）。
-还没做：装到硬盘、guest 里的远程桌面（gnome-remote-desktop / xrdp）、3D。
+还没做：3D。
+
+**插着安装盘的 Linux 虚拟机这一次运行用系统自带的显示和键盘**（`vm/src/vm.rs` `run`，日志里有一行 `installer plugged in`）：
+固件不认识我们自己的 virtio 显卡和键盘，安装盘的启动菜单既看不见也按不动；Debian 的菜单没有超时，会一直等（2026-11-12 实测：黑屏、键送不进去）。
+弹出安装盘后，硬盘上的 GRUB 自己倒数启动，内核接手我们的设备。这样的运行里没有 `screen.shm`、`ctl vkey / vshot` 不管用，RDP 也连不到这台（主程序按有没有 `screen.shm` 判断）。
+`HYPERMAC_VIRTIO=1` 强制用自己的设备。Fedora Live 这类直接从安装盘跑的系统因此也在系统自带的显示上。
+
+### Debian 13 从 ISO 到能用 RDP 连（2026-11-12 实测，debian-13.7.0-arm64-netinst.iso，NAT，4 核 4 GB）
+
+1. `hypermac create deb1 --os linux --iso debian-13.7.0-arm64-netinst.iso`，`hypermac run deb1 --console`（或主窗口里新建、点控制台）。
+   启动菜单选 Install 或 Graphical install，照常装；分区时选 **Virtual disk 1 (vda)**（安装盘本身是 sda，排在前面），软件选 GNOME 和 SSH server。
+   实测是无人值守装的：菜单里按 `c`，敲 `linux /install.a64/vmlinuz auto=true priority=critical url=http://宿主地址:端口/p.cfg ---`、`initrd /install.a64/initrd.gz`、`boot`；
+   应答文件里要有 `d-i partman-auto/disk string /dev/vda`，否则停在选盘那一步。从启动到装完关机约 5 分钟，磁盘占 6.5 GB。
+2. 弹出安装盘（主窗口的按钮，或删掉 `vm.json` 的 `iso`），再启动：约 40 秒到 GDM，这时已经在我们自己的显卡上。
+3. guest 里开 GNOME 的远程桌面（gnome-remote-desktop 48，Debian 的 GNOME 自带）。用「共享已登录的桌面」这一种，要自动登录和一个不加密的密钥环：
+   ```sh
+   # 自动登录（root）
+   sed -i 's/^# *AutomaticLoginEnable *=.*/AutomaticLoginEnable = true/; s/^# *AutomaticLogin *=.*/AutomaticLogin = deb/' /etc/gdm3/daemon.conf
+   # 不加密的默认密钥环（用户 deb）：自动登录时没有密码去解锁密钥环，grdctl set-credentials 会一直等
+   mkdir -p ~/.local/share/keyrings && chmod 700 ~/.local/share/keyrings
+   printf '[keyring]\ndisplay-name=Default keyring\nctime=0\nmtime=0\nlock-on-idle=false\nlock-after=false\n' > ~/.local/share/keyrings/Default_keyring.keyring
+   printf 'Default_keyring' > ~/.local/share/keyrings/default
+   # 重启 gdm（或整机）让桌面登录进去，然后（用户 deb；经 SSH 时先 export XDG_RUNTIME_DIR=/run/user/1000 DBUS_SESSION_BUS_ADDRESS=unix:path=/run/user/1000/bus）
+   G=~/.local/share/gnome-remote-desktop; mkdir -p $G
+   openssl req -new -newkey rsa:4096 -days 3650 -nodes -x509 -subj "/CN=$(hostname)" -out $G/tls.crt -keyout $G/tls.key
+   grdctl rdp set-tls-key $G/tls.key; grdctl rdp set-tls-cert $G/tls.crt     # 第一条会报证书无效（另一半还没设），不碍事
+   grdctl rdp set-credentials 用户名 密码
+   grdctl rdp disable-view-only; grdctl rdp enable
+   systemctl --user enable --now gnome-remote-desktop.service
+   ```
+   之后 guest 的 3389 在监听，重启后自己回来（实测）。
+4. 连接实测：IronRDP 的 viewer（`vendor/IronRDP` 的 `ironrdp-viewer`，`--egfx`）连上，看到桌面，鼠标点击和键盘输入都到（搜索框里敲 calc 出结果）。
+   - GNOME **只接受支持图形管线（RDPEGFX）的客户端**：不带 `--egfx` 时它直接断开（`Client did not advertise support for the Graphics Pipeline`）。
+   - viewer 原样会在连上后退出：GNOME 往一个客户端拒绝了的动态通道（声音）发数据，IronRDP 把这当成错误（`access to non existing DVC channel`，`ironrdp-dvc/src/client.rs`）。
+     测试时临时改成丢弃才连得住，改动没留。**kRDPclient 没试**；它如果是同一套 IronRDP，这两条都会碰到。
+   - 另一种「远程登录」（`grdctl --system`，不用先登录桌面）也配通了，但它在认证后发 Server Redirection，IronRDP 不认（`unexpected share control PDU type`），只有 FreeRDP、mstsc 这类客户端能用；没用它们试过。
+5. 更简单的路：不在 guest 里开 RDP，直接用 hyperMAC 的 RDP 连这台虚拟机的屏幕（用户名填虚拟机的名字），不用装任何东西。这次没重测这条。
+
+**Linux 的键盘走系统自带的 USB 键盘**（2026-11-13，`vm/src/vm.rs` `usb_key`）：我们的 virtio-input 键盘对配置空间的每个查询答同一串字节，按键位图同时被读成属性位，
+键 1..7 的位置正好是「加速度计」：Debian 13 的 udev 给它打上 `ID_INPUT_ACCELEROMETER`，libinput 整个忽略它，一个键也进不去（鼠标是另一个设备，正常）。
+现在键经私有接口（`-[VZVirtualMachine _keyboards]`、`_VZKeyEvent initWithType:keyCode:`，类型 0 按下 1 抬起，键码是 macOS 的虚拟键码）送进框架的 USB 键盘，不需要它的画面视图。
+实测：`ctl vkey` 在 GNOME 搜索框里打出 `Calc 5%_`（含 Shift）；guest 里 `/dev/input/event2` 收到的键码正确。`HYPERMAC_VIRTIO_KBD=1` 退回原来的 virtio 键盘。
+这块 USB 键盘固件和 GRUB 也认，所以启动菜单其实已经能按了（没试），只是还看不见。Windows（VZ 引擎的老路）没改。
+
+顺带修的：guest 的画面缓冲可以比屏幕大（Debian 的 GNOME 给 1280x832 的缓冲显示 1280x800），原来按缓冲的大小出图，底部多一条 32 像素的黑边；现在按 `SET_SCANOUT` 给的矩形裁（`vm/src/vgpu.rs` `view`）。
 
 ## Windows 11 ARM guest：bhyve 引擎（2026-11-11 起的默认）
 

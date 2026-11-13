@@ -33,6 +33,33 @@ static PAUSED: AtomicBool = AtomicBool::new(false);
 /// where a suspended VM's memory and devices are kept (ctl "suspend"; `run` starts from it)
 pub const SAVED: &str = "suspend.vzvmsave";
 
+/// The machine whose keys go to the framework's USB keyboard (Linux on our own display).
+static USB_KBD: std::sync::Mutex<Option<std::sync::Arc<OnMain<Retained<VZVirtualMachine>>>>> = std::sync::Mutex::new(None);
+
+/// A key (Linux input code) into the framework's USB keyboard, by its private interface
+/// (`-[VZVirtualMachine _keyboards]`, `_VZKeyEvent`): false when this machine's keys do not go
+/// that way. Why not our virtio-input keyboard: it answers every query of its config space
+/// with the same bytes (vinput.rs), so its key bitmap is also read as its property bits, and
+/// keys 1..7 there say "accelerometer": udev on Debian 13 tags it so and libinput drops the
+/// device, no key arrives (2026-11-12). The USB keyboard is a plain one and is also the one
+/// the firmware and GRUB listen to.
+pub fn usb_key(code: u16, down: bool) -> bool {
+    let Some(vm) = USB_KBD.lock().unwrap().clone() else { return false };
+    static MAC: std::sync::OnceLock<std::collections::HashMap<u16, u16>> = std::sync::OnceLock::new();
+    let mac = MAC.get_or_init(|| (0u16..0x80).filter_map(|kc| crate::console::mac_to_linux(kc).map(|l| (l, kc))).collect());
+    let Some(&kc) = mac.get(&code) else { return true };
+    DispatchQueue::main().exec_async(move || unsafe {
+        let Some(cls) = objc2::runtime::AnyClass::get(c"_VZKeyEvent") else { return };
+        let kbds: Option<Retained<NSArray<NSObject>>> = msg_send![&*vm.0, _keyboards];
+        let Some(kbd) = kbds.and_then(|k| k.firstObject()) else { return };
+        let e: objc2::rc::Allocated<NSObject> = msg_send![cls, alloc];
+        // type: 0 = down, 1 = up
+        let e: Retained<NSObject> = msg_send![e, initWithType: (!down) as isize, keyCode: kc];
+        let _: () = msg_send![&*kbd, sendKeyEvents: &*NSArray::from_retained_slice(&[e])];
+    });
+    true
+}
+
 fn url(p: &Path) -> Retained<NSURL> {
     NSURL::fileURLWithPath(&NSString::from_str(&p.to_string_lossy()))
 }
@@ -436,6 +463,19 @@ pub fn run(name: &str, args: &[String]) -> anyhow::Result<()> {
     if crate::bhyve::is(&conf) {
         return crate::bhyve::run(name, args, conf);
     }
+    // A Linux machine with its installer plugged in runs on the framework's display and
+    // keyboard: the firmware has no driver for ours, so the installer's boot menu would be
+    // neither seen nor answered (Debian's waits for a key for ever; seen 2026-11-12). With
+    // the installer ejected GRUB on the disk starts by itself and the kernel takes our devices.
+    let mut conf = conf;
+    if conf.os == "linux" && conf.own_devices && std::env::var_os("HYPERMAC_VIRTIO").is_none() && opt(args, "--iso").or(conf.iso.as_deref()).is_some() {
+        eprintln!("installer plugged in: the framework's display and keyboard for this run");
+        conf.own_devices = false;
+    }
+    if !conf.own_devices() {
+        // (the main program reads "on our own display" from this file being there)
+        let _ = std::fs::remove_file(dir.join("screen.shm"));
+    }
 
     let cfg = match conf.os.as_str() {
         "macos" => config_macos(&dir, &conf, None)?,
@@ -508,6 +548,9 @@ pub fn run(name: &str, args: &[String]) -> anyhow::Result<()> {
         Some(crate::vnc::Vnc::start(&vm, num(args, "--vnc-port", 0) as u16, &conf.vnc_password)?)
     };
     let vm = std::sync::Arc::new(OnMain(vm));
+    if conf.os == "linux" && conf.own_devices() && std::env::var_os("HYPERMAC_VIRTIO_KBD").is_none() {
+        *USB_KBD.lock().unwrap() = Some(vm.clone());
+    }
     let vnc = std::sync::Arc::new(OnMain(vnc));
 
     // every second on the main queue: the VNC port once it is known; exit when the guest has shut down

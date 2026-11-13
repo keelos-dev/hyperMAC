@@ -58,6 +58,9 @@ struct Gpu {
     height: u32,
     res: HashMap<u32, Res>,
     scanout: u32,
+    /// the part of that resource SET_SCANOUT showed (x, y, w, h): a guest's buffer may be
+    /// larger than its screen (GNOME on Debian 13: 1280x832 for 1280x800, seen 2026-11-12)
+    view: (u32, u32, u32, u32),
     counts: HashMap<u32, u64>,
     /// frames flushed to the scanout so far (cursor changes count too)
     pub frames: u64,
@@ -300,6 +303,7 @@ fn command(device: &AnyObject, req: &[u8]) -> Vec<u8> {
                 return ok(RESP_ERR_INVALID_RESOURCE_ID);
             }
             g.scanout = id;
+            g.view = (le32(req, 24), le32(req, 28), w, h);
             ok(RESP_OK_NODATA)
         }
         CMD_TRANSFER_TO_HOST_2D if req.len() >= 56 => {
@@ -436,13 +440,36 @@ fn after() {
     }
 }
 
+/// The shown part of the scanout's resource: (x, y, w, h), inside the resource.
+fn view(g: &Gpu, r: &Res) -> (usize, usize, usize, usize) {
+    let (x, y, w, h) = g.view;
+    if w == 0 || h == 0 || x + w > r.w || y + h > r.h {
+        return (0, 0, r.w as usize, r.h as usize);
+    }
+    (x as usize, y as usize, w as usize, h as usize)
+}
+
+/// That part's pixels, as they are in the resource.
+fn shown(g: &Gpu, r: &Res) -> (usize, usize, Vec<u8>) {
+    let (x, y, w, h) = view(g, r);
+    if (w, h) == (r.w as usize, r.h as usize) {
+        return (w, h, r.pix.clone());
+    }
+    let stride = r.w as usize * 4;
+    let mut pix = Vec::with_capacity(w * h * 4);
+    for row in y..y + h {
+        pix.extend_from_slice(&r.pix[row * stride + x * 4..row * stride + (x + w) * 4]);
+    }
+    (w, h, pix)
+}
+
 /// The scanout as a 32-bit top-down BMP (ctl NAME vshot).
 pub fn shot(path: &std::path::Path) -> anyhow::Result<serde_json::Value> {
     let g = GPU.lock().unwrap();
     let g = g.as_ref().ok_or_else(|| anyhow::anyhow!("no virtio-gpu"))?;
     let r = g.res.get(&g.scanout).ok_or_else(|| anyhow::anyhow!("nothing on the scanout yet"))?;
     let rfirst = matches!(r.fmt, 67 | 68 | 121 | 134);
-    let (w, h) = (r.w as usize, r.h as usize);
+    let (w, h, pix) = shown(g, r);
     let mut out = Vec::with_capacity(54 + w * h * 4);
     out.extend_from_slice(b"BM");
     out.extend_from_slice(&((54 + w * h * 4) as u32).to_le_bytes());
@@ -454,7 +481,7 @@ pub fn shot(path: &std::path::Path) -> anyhow::Result<serde_json::Value> {
     out.extend_from_slice(&1u16.to_le_bytes());
     out.extend_from_slice(&32u16.to_le_bytes());
     out.extend_from_slice(&[0; 24]);
-    for p in r.pix.chunks_exact(4) {
+    for p in pix.chunks_exact(4) {
         if rfirst {
             out.extend_from_slice(&[p[2], p[1], p[0], 0]);
         } else {
@@ -462,7 +489,9 @@ pub fn shot(path: &std::path::Path) -> anyhow::Result<serde_json::Value> {
         }
     }
     std::fs::write(path, out)?;
-    Ok(serde_json::json!({"ok": true, "w": w, "h": h, "format": r.fmt, "frames": g.frames, "path": path}))
+    // how many of each command so far: tells what a guest that shows nothing did draw
+    let counts: std::collections::BTreeMap<String, u64> = g.counts.iter().map(|(k, v)| (format!("{k:#x}"), *v as u64)).collect();
+    Ok(serde_json::json!({"ok": true, "w": w, "h": h, "format": r.fmt, "frames": g.frames, "path": path, "counts": counts}))
 }
 
 /// The configuration of the device, for VZVirtualMachineConfiguration.customVirtioDevices.
@@ -472,6 +501,7 @@ pub fn configuration(width: u32, height: u32) -> anyhow::Result<Retained<AnyObje
         height,
         res: HashMap::new(),
         scanout: 0,
+        view: (0, 0, 0, 0),
         counts: HashMap::new(),
         frames: 0,
         log: Instant::now(),
@@ -520,16 +550,20 @@ pub fn snapshot(last: Option<u64>) -> Option<(u64, u32, u32, Vec<u8>)> {
     let g = g.as_ref()?;
     let r = g.res.get(&g.scanout)?;
     if last == Some(g.frames) {
-        return Some((g.frames, r.w, r.h, Vec::new()));
+        let (_, _, w, h) = view(g, r);
+        return Some((g.frames, w as u32, h as u32, Vec::new()));
     }
     let rfirst = matches!(r.fmt, 67 | 68 | 121 | 134);
-    let mut pix: Vec<u8> = if rfirst {
-        r.pix.chunks_exact(4).flat_map(|p| [p[2], p[1], p[0], 0]).collect()
-    } else {
-        r.pix.clone()
-    };
-    draw_cursor(g, &mut pix, r.w, r.h);
-    Some((g.frames, r.w, r.h, pix))
+    let (w, h, mut pix) = shown(g, r);
+    if rfirst {
+        for p in pix.chunks_exact_mut(4) {
+            p.swap(0, 2);
+            p[3] = 0;
+        }
+    }
+    let (w, h) = (w as u32, h as u32);
+    draw_cursor(g, &mut pix, w, h);
+    Some((g.frames, w, h, pix))
 }
 
 /// The scanout's size, if there is one.
@@ -539,7 +573,10 @@ pub fn size() -> Option<(u32, u32)> {
     }
     let g = GPU.lock().unwrap();
     let g = g.as_ref()?;
-    g.res.get(&g.scanout).map(|r| (r.w, r.h))
+    g.res.get(&g.scanout).map(|r| {
+        let (_, _, w, h) = view(g, r);
+        (w as u32, h as u32)
+    })
 }
 
 /// Where the guest says its pointer is (scanout pixels), if it uses the hardware cursor.

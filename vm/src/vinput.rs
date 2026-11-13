@@ -164,6 +164,10 @@ pub fn key(code: u16, down: bool) -> u64 {
     if crate::bhyve::active() {
         return crate::bhyve::key(code, down);
     }
+    // Linux: the framework's USB keyboard (vm.rs usb_key says why)
+    if crate::vm::usb_key(code, down) {
+        return 1;
+    }
     send(KBD.load(std::sync::atomic::Ordering::Relaxed), &[(EV_KEY, code, down as i32), (EV_SYN, 0, 0)])
 }
 
