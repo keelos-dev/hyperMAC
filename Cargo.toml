@@ -1,6 +1,6 @@
 [package]
 name = "hypermac"
-version = "1.4.1"
+version = "1.4.2"
 edition = "2024"
 description = "RDP server for the Mac's physical desktop (docs/design.md)"
 publish = false

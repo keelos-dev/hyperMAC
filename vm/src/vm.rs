@@ -586,11 +586,12 @@ pub fn run(name: &str, args: &[String]) -> anyhow::Result<()> {
     let vshot_path = dir.join("vscreen.bmp");
     let own_virtio = conf.own_devices();
     let vnc_password = conf.vnc_password.clone();
+    let linux = conf.os == "linux";
     if open_now {
         if own_virtio {
             crate::console::open(&title);
         } else {
-            open_console(&vm.0, &title, conf_wh);
+            open_console(&vm.0, &title, conf_wh, linux);
         }
     }
     // one thread per connection: hypermac serve's RDP keeps one open for a whole session
@@ -659,7 +660,7 @@ pub fn run(name: &str, args: &[String]) -> anyhow::Result<()> {
                             DispatchQueue::main().exec_async(move || crate::console::open(&title));
                         } else {
                             let (vm, title) = (vm.clone(), title.clone());
-                            DispatchQueue::main().exec_async(move || open_console(&vm.0, &title, conf_wh));
+                            DispatchQueue::main().exec_async(move || open_console(&vm.0, &title, conf_wh, linux));
                         }
                         serde_json::json!({"ok": true})
                     }
@@ -812,7 +813,7 @@ thread_local! {
 /// The guest's display follows the window's size (the framework tells the guest; macOS guests
 /// and Linux on VZ's virtio-gpu take it): drag the window larger and the guest has more room.
 /// vm.json keeps the size the machine starts with.
-fn open_console(vm: &VZVirtualMachine, title: &str, (w, h): (f64, f64)) {
+fn open_console(vm: &VZVirtualMachine, title: &str, (w, h): (f64, f64), linux: bool) {
     let Some(mtm) = MainThreadMarker::new() else { return };
     crate::console::regular(mtm);
     let app = NSApplication::sharedApplication(mtm);
@@ -838,7 +839,12 @@ fn open_console(vm: &VZVirtualMachine, title: &str, (w, h): (f64, f64)) {
             let view = unsafe { VZVirtualMachineView::new(mtm) };
             unsafe {
                 view.setVirtualMachine(Some(vm));
-                view.setAutomaticallyReconfiguresDisplay(true);
+                // A Linux guest is not told the display is a Retina one: following the window
+                // there gave it every device pixel and text half the size (user 2026-11-13, a
+                // MacBook Air: Debian's installer unreadable). It keeps vm.json's size on such a
+                // screen and the view scales the picture; macOS guests know about Retina.
+                let retina = NSScreen::mainScreen(mtm).map(|s| s.backingScaleFactor() > 1.0).unwrap_or(false);
+                view.setAutomaticallyReconfiguresDisplay(!(linux && retina));
                 // not capturing system keys: that needs the Accessibility grant for this binary, and
                 // without it the modifiers went missing (user 2026-11-10: Shift+D gave no capital D
                 // in a Debian guest). The price: Cmd-Tab and the like stay with the host.

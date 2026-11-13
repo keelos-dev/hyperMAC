@@ -1522,8 +1522,10 @@ fn on_installed(result: Result<(), String>, app: PathBuf, tag: String) {
         "现在重启 hyperMAC 就换成新版本：后台服务重启，正在通过 hyperMAC 连着的会话会断开几秒，之后重新连上即可；这个窗口也会重新打开。\n\n选「稍后」的话，新版本在下次重启服务（或下次打开 hyperMAC）时生效。",
         "Restart hyperMAC now to switch to the new version: the background service restarts, a session connected through hyperMAC drops for a few seconds (reconnect then), and this window reopens.\n\nWith \"Later\" the new version takes over at the next service restart (or the next time you open hyperMAC).",
     );
+    // the status line says so while the question is up (it showed the download's last percentage)
+    set_upd(Upd::Installed(tag, app.clone()));
     if gui::ask(mtm(), &title, text, &[t("稍后", "Later"), t("立即重启", "Restart Now")]) != 1 {
-        return set_upd(Upd::Installed(tag, app));
+        return;
     }
     reload(app);
 }

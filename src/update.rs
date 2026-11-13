@@ -240,6 +240,9 @@ fn download(url: &str, to: &Path, progress: &Progress) -> anyhow::Result<()> {
                 }
                 bail!("the download broke off: {}", err.trim().trim_start_matches("curl: "));
             }
+            // the whole file: the last look at it was up to 200 ms before curl ended, and the
+            // window would show that percentage through the checks and the install
+            progress.received.store(std::fs::metadata(to).map(|m| m.len()).unwrap_or(u64::MAX), Ordering::Relaxed);
             return Ok(());
         }
         let n = std::fs::metadata(to).map(|m| m.len()).unwrap_or(0);
