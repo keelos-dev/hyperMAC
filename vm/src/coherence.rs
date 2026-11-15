@@ -16,6 +16,11 @@
 //! lower one then shows a piece of the upper one. (Each window's own pixels would need the
 //! guest's compositor to hand them over one by one.)
 //!
+//! The clipboard's text is one clipboard while this is on: what is copied on the Mac can be
+//! pasted in a Windows program and the other way (`clip_*` below; the agent's side is its
+//! Clip thread). Text only; what a password manager marks as not to be kept is left alone.
+//! HYPERMAC_CLIP=0: off.
+//!
 //! `ctl NAME coherence on|off|run COMMAND|status`.
 
 use std::cell::{Cell, RefCell};
@@ -23,7 +28,7 @@ use std::collections::HashMap;
 use std::io::{BufRead, BufReader, Write};
 use std::net::{TcpStream, ToSocketAddrs};
 use std::sync::Mutex;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU64, Ordering};
 use std::time::Duration;
 
 use dispatch2::DispatchQueue;
@@ -31,7 +36,7 @@ use objc2::rc::Retained;
 use objc2::runtime::AnyObject;
 use objc2::{DefinedClass, MainThreadMarker, MainThreadOnly, define_class, msg_send};
 use objc2_app_kit::{
-    NSApplication, NSApplicationActivationPolicy, NSBackingStoreType, NSEvent, NSImage, NSResponder, NSScreen, NSStatusBar, NSStatusItem, NSView, NSWindow, NSWindowStyleMask,
+    NSApplication, NSApplicationActivationPolicy, NSBackingStoreType, NSEvent, NSImage, NSPasteboard, NSPasteboardTypeString, NSResponder, NSScreen, NSStatusBar, NSStatusItem, NSView, NSWindow, NSWindowStyleMask,
 };
 use objc2_core_foundation::CFData;
 use objc2_core_graphics::{CGBitmapInfo, CGColorRenderingIntent, CGColorSpace, CGDataProvider, CGImage, CGImageAlphaInfo, CGImageByteOrderInfo};
@@ -85,6 +90,94 @@ static PUMP: std::sync::Once = std::sync::Once::new();
 static QUEUED: AtomicBool = AtomicBool::new(false);
 static WHEEL: Mutex<f64> = Mutex::new(0.0);
 
+/// The Mac's clipboard as last seen or set here (NSPasteboard's changeCount): another number
+/// is something copied on the Mac since.
+static CLIP_SEEN: AtomicI64 = AtomicI64::new(i64::MIN);
+/// The agent answered on this connection: the clipboard goes to it.
+static CLIP_UP: AtomicBool = AtomicBool::new(false);
+/// More text than this (bytes) is not carried: the channel is a serial port.
+const CLIP_MAX: usize = 1 << 20;
+
+fn clip_on() -> bool {
+    std::env::var("HYPERMAC_CLIP").as_deref() != Ok("0")
+}
+
+fn b64(data: &[u8]) -> String {
+    const T: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    let mut o = String::with_capacity(data.len().div_ceil(3) * 4);
+    for c in data.chunks(3) {
+        let n = (c[0] as u32) << 16 | (*c.get(1).unwrap_or(&0) as u32) << 8 | *c.get(2).unwrap_or(&0) as u32;
+        o.push(T[(n >> 18) as usize & 63] as char);
+        o.push(T[(n >> 12) as usize & 63] as char);
+        o.push(if c.len() > 1 { T[(n >> 6) as usize & 63] as char } else { '=' });
+        o.push(if c.len() > 2 { T[n as usize & 63] as char } else { '=' });
+    }
+    o
+}
+
+fn un_b64(text: &str) -> Option<Vec<u8>> {
+    let mut o = Vec::with_capacity(text.len() / 4 * 3);
+    let (mut n, mut bits) = (0u32, 0);
+    for c in text.bytes() {
+        let v = match c {
+            b'A'..=b'Z' => c - b'A',
+            b'a'..=b'z' => c - b'a' + 26,
+            b'0'..=b'9' => c - b'0' + 52,
+            b'+' => 62,
+            b'/' => 63,
+            b'=' => break,
+            _ => return None,
+        };
+        n = n << 6 | v as u32;
+        bits += 6;
+        if bits >= 8 {
+            bits -= 8;
+            o.push((n >> bits) as u8);
+        }
+    }
+    Some(o)
+}
+
+/// The agent's "P": Windows' clipboard has this text now, so the Mac's has too.
+fn clip_from_guest(rest: &str) {
+    if !clip_on() {
+        return;
+    }
+    // (Windows ends its lines with CR LF)
+    let Some(text) = un_b64(rest).and_then(|b| String::from_utf8(b).ok()).map(|t| t.replace("\r\n", "\n")) else { return };
+    DispatchQueue::main().exec_async(move || {
+        let pb = NSPasteboard::generalPasteboard();
+        pb.clearContents();
+        pb.setString_forType(&NSString::from_str(&text), unsafe { NSPasteboardTypeString });
+        // (ours: not to be sent back)
+        CLIP_SEEN.store(pb.changeCount() as i64, Ordering::Relaxed);
+    });
+}
+
+/// On the main thread, every tick: something new on the Mac's clipboard goes to the agent.
+fn clip_to_guest() {
+    if !CLIP_UP.load(Ordering::Relaxed) || !clip_on() {
+        return;
+    }
+    let pb = NSPasteboard::generalPasteboard();
+    let count = pb.changeCount() as i64;
+    if CLIP_SEEN.swap(count, Ordering::Relaxed) == count {
+        return;
+    }
+    // what password managers put there for a moment says so with these types (nspasteboard.org)
+    let secret = ["org.nspasteboard.ConcealedType", "org.nspasteboard.TransientType"];
+    if pb.types().is_some_and(|t| t.iter().any(|t| secret.contains(&t.to_string().as_str()))) {
+        return;
+    }
+    let Some(text) = pb.stringForType(unsafe { NSPasteboardTypeString }).map(|s| s.to_string()) else { return };
+    if text.is_empty() || text.len() > CLIP_MAX {
+        return;
+    }
+    // (not from this thread: a long text takes the port a while)
+    let text = text.replace("\r\n", "\n").replace('\n', "\r\n");
+    std::thread::spawn(move || send(&format!("P {}", b64(text.as_bytes()))));
+}
+
 /// One line to the agent.
 fn send(line: &str) {
     if let Some(s) = LINK.lock().unwrap().as_mut() {
@@ -109,6 +202,7 @@ fn parse(line: &str, building: &mut Option<Snap>) -> Option<Snap> {
             }
         }
         "E" => return building.take(),
+        "P" => clip_from_guest(rest),
         _ => {}
     }
     None
@@ -201,6 +295,9 @@ fn link(run: u64, mut ways: Vec<String>, token: String) {
                         if !heard {
                             heard = true;
                             say("connected");
+                            // what is on the Mac's clipboard now goes over first
+                            CLIP_SEEN.store(i64::MIN, Ordering::Relaxed);
+                            CLIP_UP.store(true, Ordering::Relaxed);
                         }
                         let mut g = SNAP.lock().unwrap();
                         snap.seq = g.seq + 1;
@@ -208,6 +305,7 @@ fn link(run: u64, mut ways: Vec<String>, token: String) {
                     }
                 }
                 up.store(false, Ordering::Relaxed);
+                CLIP_UP.store(false, Ordering::Relaxed);
                 if let Some(s) = LINK.lock().unwrap().take() {
                     s.shutdown();
                 }
@@ -638,6 +736,7 @@ fn tick(mtm: MainThreadMarker) {
             *h = Host::default();
             return;
         }
+        clip_to_guest();
         let fresh = new_image(&mut h);
         let guest = h.guest;
         if guest.0 == 0 || h.image.is_none() {
@@ -876,6 +975,15 @@ pub fn ctl(line: &str, port: Option<&std::path::Path>, addr: Option<String>, tok
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn base64_both_ways() {
+        for t in ["", "a", "ab", "abc", "abcd", "中文 と emoji 🙂\r\nline"] {
+            assert_eq!(un_b64(&b64(t.as_bytes())).unwrap(), t.as_bytes());
+        }
+        assert_eq!(b64(b"hello"), "aGVsbG8=");
+        assert!(un_b64("a b").is_none());
+    }
 
     #[test]
     fn the_agents_list_is_read() {

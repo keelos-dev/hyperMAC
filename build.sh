@@ -40,10 +40,12 @@ if [ -f "$INST" ]; then
 		&& echo "installed copy refreshed: $INST" \
 		&& echo "restart it with:  launchctl kickstart -k gui/$(id -u)/dev.keelos.hypermac"
 	# the menu bar's copy, with a bundle id of its own (main.rs write_menu_binary)
-	# Signed with the same identity afterwards (the program itself signs its copy ad hoc): to
-	# macOS an ad-hoc copy is a new program after every build, and each one is announced
-	# ("hypermac-menu can run in the background", seen once per build on 2026-11-12).
-	"$INST" menu-binary --state "$STATE" && { [ -z "$ID" ] || codesign --force --sign "$ID" --identifier dev.keelos.hypermac.menu --timestamp=none "$INST-menu" 2>/dev/null; } && echo "menu bar copy refreshed: $INST-menu" \
+	# Signed with the same identity (HYPERMAC_MENU_SIGN; without it the program signs its copy
+	# ad hoc): to macOS an ad-hoc copy is a new program after every build, and each one is
+	# announced ("hypermac-menu can run in the background", seen once per build on 2026-11-12).
+	# The program signs the new file before it takes the name: the running copy is never
+	# written to.
+	HYPERMAC_MENU_SIGN="$ID" "$INST" menu-binary --state "$STATE" && echo "menu bar copy refreshed: $INST-menu" \
 		&& echo "restart it with:  launchctl kickstart -k gui/$(id -u)/dev.keelos.hypermac.menu"
 	# The windows of bhyve machines (src/vmwin.rs) run from an app bundle of their own: the
 	# agent in a Windows guest is reached over the machine's network, which macOS lets a

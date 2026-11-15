@@ -14,6 +14,7 @@
 //     S <screen width> <screen height> <foreground hwnd>
 //     W <hwnd> <x> <y> <width> <height> <flags> <pid> <class>\t<title>     top window first
 //     E
+//     P <base64>          the clipboard has this text now (UTF-8), copied in Windows
 //   flags: 1 = a popup (menu, tooltip, drop-down: never the active window), 2 = maximized
 //   host -> agent:
 //     A <hwnd>            make it the foreground window
@@ -23,6 +24,7 @@
 //                         stays free (maximized windows stop there)
 //     X <command line>    start a program
 //     R                   send the list again
+//     P <base64>          put this text (UTF-8) on the clipboard: it was copied on the Mac
 // Numbers are decimal; coordinates are physical pixels of the primary screen.
 
 using System;
@@ -80,6 +82,55 @@ static class Agent
     static readonly HashSet<string> Shell = new HashSet<string> { "Progman", "WorkerW", "Shell_TrayWnd", "Shell_SecondaryTrayWnd" };
 
     static volatile bool again;
+
+    // ---- the clipboard's text, one with the Mac's while the host is there ----------------------
+
+    [DllImport("user32.dll")] static extern uint GetClipboardSequenceNumber();
+    /// text the host sent, to put on the clipboard; text copied here, to send to the host
+    static string clipIn, clipOut;
+    const int ClipMax = 1 << 20;
+
+    /// The clipboard is used from one thread of its own (it wants a single-threaded apartment),
+    /// through .NET's Clipboard: it retries while another program has the clipboard open and
+    /// leaves the text there when this program ends.
+    static void Clip()
+    {
+        uint seen = GetClipboardSequenceNumber();
+        while (true)
+        {
+            Thread.Sleep(100);
+            try
+            {
+                string put = Interlocked.Exchange(ref clipIn, null);
+                if (put != null)
+                {
+                    System.Windows.Forms.Clipboard.SetDataObject(put, true, 5, 100);
+                    // (ours: not to be sent back)
+                    seen = GetClipboardSequenceNumber();
+                    continue;
+                }
+                uint now = GetClipboardSequenceNumber();
+                if (now == seen) continue;
+                // what a password manager marks as not to be kept or watched stays here
+                if (!System.Windows.Forms.Clipboard.ContainsData("ExcludeClipboardContentFromMonitorProcessing")
+                    && System.Windows.Forms.Clipboard.ContainsText())
+                {
+                    string t = System.Windows.Forms.Clipboard.GetText();
+                    if (t.Length > 0 && t.Length <= ClipMax) clipOut = t;
+                }
+                seen = now;
+            }
+            catch (Exception) { }   // (the clipboard was busy: the next round)
+        }
+    }
+
+    /// The line for the host when something was copied here, else null.
+    static byte[] ClipLine()
+    {
+        string t = Interlocked.Exchange(ref clipOut, null);
+        if (t == null) return null;
+        return new UTF8Encoding(false).GetBytes("P " + Convert.ToBase64String(new UTF8Encoding(false).GetBytes(t)) + "\n");
+    }
     static bool barWasAutoHide, barChanged;
     // The room the host wants kept free at the screen's edges (the Mac's menu bar and Dock are
     // there): left, top, right, bottom, in pixels. Kept free the way a taskbar keeps its own:
@@ -222,9 +273,48 @@ static class Agent
         APPBARDATA d = new APPBARDATA();
         d.cbSize = (uint)Marshal.SizeOf(typeof(APPBARDATA));
         bool was = (SHAppBarMessage(4 /* ABM_GETSTATE */, ref d).ToUInt64() & 1) != 0;
-        if (!barChanged) { barWasAutoHide = was; barChanged = true; }
+        if (!barChanged)
+        {
+            // What it was is kept in the registry too (like the snap bar's below): an agent or a
+            // machine killed with the windows on the Mac left the taskbar hidden, and the next
+            // agent took "hidden" for what the person had chosen. A value already there is from
+            // such a run and is the one to believe.
+            try
+            {
+                using (Microsoft.Win32.RegistryKey ours = Microsoft.Win32.Registry.CurrentUser.CreateSubKey(Ours))
+                {
+                    object kept = ours.GetValue("TaskbarAutoHideWas");
+                    if (kept != null) was = Convert.ToInt32(kept) != 0;
+                    else ours.SetValue("TaskbarAutoHideWas", was ? 1 : 0, Microsoft.Win32.RegistryValueKind.DWord);
+                }
+            }
+            catch (Exception) { }
+            barWasAutoHide = was; barChanged = true;
+        }
         d.lParam = (IntPtr)(hide ? 1 : 0);
         SHAppBarMessage(10 /* ABM_SETSTATE */, ref d);
+    }
+
+    /// The taskbar as the person had it, also after a run that ended without putting it back
+    /// (the registry still has what it was).
+    static void TaskbarBack()
+    {
+        try
+        {
+            using (Microsoft.Win32.RegistryKey ours = Microsoft.Win32.Registry.CurrentUser.CreateSubKey(Ours))
+            {
+                object kept = ours.GetValue("TaskbarAutoHideWas");
+                if (kept == null && !barChanged) return;
+                bool was = kept != null ? Convert.ToInt32(kept) != 0 : barWasAutoHide;
+                APPBARDATA d = new APPBARDATA();
+                d.cbSize = (uint)Marshal.SizeOf(typeof(APPBARDATA));
+                d.lParam = (IntPtr)(was ? 1 : 0);
+                SHAppBarMessage(10 /* ABM_SETSTATE */, ref d);
+                ours.DeleteValue("TaskbarAutoHideWas", false);
+            }
+        }
+        catch (Exception) { }
+        barChanged = false;
     }
 
     [DllImport("user32.dll", CharSet = CharSet.Unicode)]
@@ -275,7 +365,7 @@ static class Agent
     {
         lock (barsLock) want = new int[4];
         SnapBar(false);
-        if (barChanged) { Taskbar(barWasAutoHide); barChanged = false; }
+        TaskbarBack();
     }
 
     static void Command(string line)
@@ -310,6 +400,14 @@ static class Agent
                 catch (Exception) { }
                 break;
             case "R": again = true; break;
+            case "P":
+                try
+                {
+                    string t = new UTF8Encoding(false).GetString(Convert.FromBase64String(rest));
+                    if (t.Length > 0 && t.Length <= ClipMax) clipIn = t;
+                }
+                catch (Exception) { }
+                break;
         }
     }
 
@@ -323,6 +421,7 @@ static class Agent
         string hello = rd.ReadLine();
         if (hello == null || hello != "T " + token) return;
         s.ReadTimeout = Timeout.Infinite;
+        clipOut = null;   // (copied while no host was there: not news to this one)
         bool gone = false;
         Thread t = new Thread(delegate ()
         {
@@ -345,6 +444,8 @@ static class Agent
                     byte[] b = utf8.GetBytes(now);
                     s.Write(b, 0, b.Length);
                 }
+                byte[] clip = ClipLine();
+                if (clip != null) s.Write(clip, 0, clip.Length);
                 Thread.Sleep(16);
             }
         }
@@ -548,6 +649,7 @@ static class Agent
                         if (l.StartsWith("T "))
                         {
                             session = l == "T " + token;
+                            clipOut = null;   // (copied while no host was there: not news to this one)
                             again = true;
                             heard = Environment.TickCount;
                         }
@@ -583,6 +685,8 @@ static class Agent
                         byte[] b = utf8.GetBytes(now);
                         s.Write(b, 0, b.Length);
                     }
+                    byte[] clip = ClipLine();
+                    if (clip != null) s.Write(clip, 0, clip.Length);
                     Thread.Sleep(16);
                 }
             }
@@ -606,9 +710,14 @@ static class Agent
         try { token = File.ReadAllText(Path.Combine(dir, "agent.token")).Trim(); } catch (Exception) { return; }
         if (token.Length < 16) return;
         SnapBar(false);   // (left off by an agent that did not end properly)
+        TaskbarBack();    // (the same for the taskbar's auto-hide)
         Thread bars = new Thread(Bars);
         bars.IsBackground = true;
         bars.Start();
+        Thread clip = new Thread(Clip);
+        clip.SetApartmentState(ApartmentState.STA);
+        clip.IsBackground = true;
+        clip.Start();
         Thread channel = new Thread(delegate () { Channel(token); });
         channel.IsBackground = true;
         channel.Start();

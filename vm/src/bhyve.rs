@@ -4,8 +4,9 @@
 //!
 //! `hypermac run NAME` is then a supervisor around one bhyve process:
 //! - bhyve exits 0 when the guest reboots: start it again; 1 or 2 = the guest powered off;
-//! - the picture: bhyve's framebuffer speaks VNC on a loopback port; this process is its only
-//!   client (`viewer`) and hands the frames to what the VZ engine's own virtio-gpu feeds
+//! - the picture: bhyve's framebuffer speaks VNC on a socket in the VM's folder (fb.sock: a
+//!   file only this user can open; until 1.4.3 a loopback port without a password, which
+//!   every user of the Mac could connect to); this process is its only client (`viewer`) and hands the frames to what the VZ engine's own virtio-gpu feeds
 //!   (vgpu::snapshot -> screen.shm for hyperMAC's RDP, rfb.rs's VNC server with the VM's
 //!   password, the console window);
 //! - keyboard and pointer (vinput::key / abs / button, so ctl.sock's vkey / vabs / vbtn, the
@@ -20,7 +21,7 @@
 //! the hardware checks and brings the drivers.
 
 use std::io::{BufRead, BufReader, Read, Write};
-use std::net::TcpStream;
+use std::os::unix::net::UnixStream;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::Mutex;
@@ -234,7 +235,7 @@ struct Screen {
 static ACTIVE: AtomicBool = AtomicBool::new(false);
 static SCREEN: Mutex<Option<Screen>> = Mutex::new(None);
 /// the connection's writing side: key and pointer events
-static INPUT: Mutex<Option<TcpStream>> = Mutex::new(None);
+static INPUT: Mutex<Option<UnixStream>> = Mutex::new(None);
 /// pointer: x, y (pixels), RFB button mask
 static POINTER: Mutex<(u16, u16, u8)> = Mutex::new((0, 0, 0));
 
@@ -512,7 +513,7 @@ const WHEEL_GAP: std::time::Duration = std::time::Duration::from_millis(16);
 /// More notches than this waiting are not worth sending: the hand has stopped long ago.
 const WHEEL_MAX: i32 = 40;
 
-fn exact(s: &mut TcpStream, n: usize) -> std::io::Result<Vec<u8>> {
+fn exact(s: &mut UnixStream, n: usize) -> std::io::Result<Vec<u8>> {
     let mut b = vec![0u8; n];
     s.read_exact(&mut b)?;
     Ok(b)
@@ -523,13 +524,12 @@ fn be16(b: &[u8], o: usize) -> usize {
 }
 
 /// One connection to bhyve's VNC server, until it ends (bhyve exited).
-fn view(port: u16) -> anyhow::Result<()> {
-    let mut s = TcpStream::connect(("127.0.0.1", port))?;
+fn view(sock: &Path) -> anyhow::Result<()> {
+    let mut s = UnixStream::connect(sock)?;
     // a new bhyve: its 3D device's shared memory is a new object
     if let Some(k) = KGPU.lock().unwrap().0.take() {
         unsafe { libc::munmap(k.0 as *mut _, KGPU_SIZE) };
     }
-    s.set_nodelay(true)?;
     exact(&mut s, 12)?;
     s.write_all(b"RFB 003.008\n")?;
     let n = exact(&mut s, 1)?[0] as usize;
@@ -556,7 +556,7 @@ fn view(port: u16) -> anyhow::Result<()> {
     };
     resize(w, h);
     *INPUT.lock().unwrap() = Some(s.try_clone()?);
-    let request = |s: &mut TcpStream, incremental: bool, w: usize, h: usize| -> std::io::Result<()> {
+    let request = |s: &mut UnixStream, incremental: bool, w: usize, h: usize| -> std::io::Result<()> {
         let mut m = vec![3u8, incremental as u8, 0, 0, 0, 0];
         m.extend_from_slice(&(w as u16).to_be_bytes());
         m.extend_from_slice(&(h as u16).to_be_bytes());
@@ -610,11 +610,11 @@ fn view(port: u16) -> anyhow::Result<()> {
     }
 }
 
-/// Keep a connection to bhyve's VNC server on `port` (each bhyve start is a new one).
-fn viewer(port: u16) {
+/// Keep a connection to bhyve's VNC server on `sock` (each bhyve start is a new one).
+fn viewer(sock: PathBuf) {
     std::thread::spawn(move || {
         loop {
-            if let Err(e) = view(port) {
+            if let Err(e) = view(&sock) {
                 // refused = bhyve is not up (yet, or between a reboot's two runs)
                 // (the end of the stream is bhyve going away: a reboot or the power-off)
                 let was_up = INPUT.lock().unwrap().take().is_some();
@@ -647,10 +647,6 @@ extern "C" fn on_term(_: libc::c_int) {
     }
 }
 
-fn free_port() -> anyhow::Result<u16> {
-    Ok(std::net::TcpListener::bind(("127.0.0.1", 0))?.local_addr()?.port())
-}
-
 /// A pty for the guest's serial console: (the master, the slave's path). The slave stays open
 /// here so the master does not see the end between two bhyve runs.
 fn pty() -> anyhow::Result<(std::fs::File, String)> {
@@ -675,7 +671,7 @@ fn kill_stale(dir: &Path) {
     let _ = std::fs::remove_file(dir.join("bhyve.pid"));
 }
 
-fn arguments(name: &str, dir: &Path, conf: &VmConf, fw: &Path, tty: &str, fb_port: u16, iso: Option<&str>, gpu3d: bool) -> Vec<String> {
+fn arguments(name: &str, dir: &Path, conf: &VmConf, fw: &Path, tty: &str, iso: Option<&str>, gpu3d: bool) -> Vec<String> {
     let d = |f: &str| dir.join(f).to_string_lossy().into_owned();
     let mut a: Vec<String> = vec!["-c".into(), conf.cpus.to_string(), "-m".into(), format!("{}G", conf.mem_gb)];
     let mut o = |v: String| a.extend(["-o".into(), v]);
@@ -705,7 +701,7 @@ fn arguments(name: &str, dir: &Path, conf: &VmConf, fw: &Path, tty: &str, fb_por
     }
     s("5,xhci,tablet,kbd".into());
     s("6,virtio-rnd".into());
-    s(format!("7,fbuf,rfb=127.0.0.1:{fb_port},w={},h={}", conf.w.clamp(640, MAX_W), conf.h.clamp(480, MAX_H)));
+    s(format!("7,fbuf,rfb=unix:{},w={},h={}", d(FB_SOCK), conf.w.clamp(640, MAX_W), conf.h.clamp(480, MAX_H)));
     let net = match conf.net.as_deref().unwrap_or("nat") {
         "nat" => "nat".to_string(),
         n => match n.strip_prefix("bridged:") {
@@ -738,6 +734,10 @@ fn arguments(name: &str, dir: &Path, conf: &VmConf, fw: &Path, tty: &str, fb_por
     a.push(name.into());
     a
 }
+
+/// bhyve's VNC server for its framebuffer, in the VM's folder (bhyve removes a stale one
+/// before it binds).
+const FB_SOCK: &str = "fb.sock";
 
 /// The agent's channel: its PCI slot, and the port's name (hmagent.cs opens \\.\NAME).
 const AGENT_SLOT: u32 = 10;
@@ -788,8 +788,7 @@ pub fn run(name: &str, args: &[String], conf: VmConf) -> anyhow::Result<()> {
     let vnc = crate::rfb::start(num(args, "--vnc-port", 0) as u16, conf.vnc_password.clone())?;
     VNC_PORT.store(vnc, Ordering::Relaxed);
     eprintln!("console: vnc://127.0.0.1:{vnc}");
-    let fb_port = free_port()?;
-    viewer(fb_port);
+    viewer(dir.join(FB_SOCK));
 
     let (mut master, tty) = pty()?;
     let install = args.iter().any(|a| a == "--install");
@@ -844,7 +843,7 @@ pub fn run(name: &str, args: &[String], conf: VmConf) -> anyhow::Result<()> {
                 // (Windows only: FreeBSD's and Linux's CDs boot without a key, and the Enters
                 // would answer their installers on the serial console)
                 PRESS_KEY.store(conf.os == "windows" && iso.is_some() && ((install && runs == 1) || unpartitioned(&dir.join("disk.img"))), Ordering::Relaxed);
-                let mut a = arguments(&name, &dir, &conf, &fw, &tty, fb_port, iso.as_deref(), g3.is_some());
+                let mut a = arguments(&name, &dir, &conf, &fw, &tty, iso.as_deref(), g3.is_some());
                 // Windows gets a TPM 2.0 where swtpm is installed
                 // the TPM inside bhyve when it has one (its state in DIR/tpm), else an swtpm process
                 let builtin = conf.os == "windows" && tpm_builtin();
@@ -861,6 +860,11 @@ pub fn run(name: &str, args: &[String], conf: VmConf) -> anyhow::Result<()> {
                         eprintln!("tpm: swtpm, state in {}", dir.join("tpm").display());
                     }
                 }
+                // The agent's channel is a socket bhyve binds and never removes: the one of the
+                // run before is in the way of this one ("cannot create port 0: Address already
+                // in use", and the machine ended at every restart of Windows; seen in an
+                // unattended install 2026-11-15, and in w3d's log before that).
+                let _ = std::fs::remove_file(dir.join("agent.sock"));
                 let mut cmd = Command::new(&exe);
                 cmd.args(&a).stdin(std::process::Stdio::null());
                 if let Some(g) = &g3 {

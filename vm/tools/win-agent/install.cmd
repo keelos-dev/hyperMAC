@@ -16,7 +16,7 @@ rem \\.\hypermac.agent): its driver, when this disc has it. Without it: over the
 if exist "%~dp0vioserial\vioser.inf" pnputil /add-driver "%~dp0vioserial\vioser.inf" /install > "%D%\driver.log" 2>&1
 sc stop hyperMACAgentChannel >nul 2>&1
 taskkill /im hmagent.exe /f >nul 2>&1
-"%CSC%" /nologo /optimize /target:winexe /r:System.ServiceProcess.dll /out:"%D%\hmagent.exe" "%~dp0hmagent.cs" > "%D%\install.log" 2>&1
+"%CSC%" /nologo /optimize /target:winexe /r:System.ServiceProcess.dll /r:System.Windows.Forms.dll /out:"%D%\hmagent.exe" "%~dp0hmagent.cs" > "%D%\install.log" 2>&1
 if errorlevel 1 exit /b 1
 copy /y "%~dp0agent.token" "%D%\agent.token" >nul
 rem the token is this machine's: its users read it (the agent runs as the one logged on), nobody changes it

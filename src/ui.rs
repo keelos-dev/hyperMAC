@@ -968,7 +968,9 @@ fn page_permissions(root: &NSStackView) {
                 }
                 go_on();
             }),
-            primary(t("继续", "Continue"), go_on),
+            // without Accessibility a client sees the screen and can do nothing on it: say so
+            // on the button, so that this is a choice and not a surprise later
+            primary(if gui::ax_ok() { t("继续", "Continue") } else { t("继续（只能看，不能操作）", "Continue (View Only)") }, go_on),
         ][if can_virtualize() { 0 } else { 1 }..],
     );
 }
@@ -1092,6 +1094,11 @@ fn main_header(root: &NSStackView) {
         (_, Some(_)) if !crate::settings::remote(&st) => {
             (t("远程连接已关闭：没有开放端口", "Remote access is off: no port is open"), NSColor::systemGrayColor())
         }
+        // (the pointer of a client then stays where the Mac's is, and nothing it types arrives)
+        (_, Some(_)) if !gui::ax_ok() && crate::settings::host_desktop(&st) => (
+            t("服务运行中，但键盘鼠标不可用：缺「辅助功能」权限", "Service running, but no keyboard or mouse: the Accessibility permission is missing"),
+            NSColor::systemOrangeColor(),
+        ),
         (_, Some(_)) => (t("服务运行中", "Service running"), NSColor::systemGreenColor()),
         (true, None) => (t("服务没在运行：检查授权，或稍等它重启", "Service not running: check the permissions, or wait for its restart"), NSColor::systemOrangeColor()),
         (false, None) => (t("没有开启自动运行", "Not set to run"), NSColor::systemGrayColor()),
@@ -1158,11 +1165,16 @@ fn page_main(root: &NSStackView) {
             render();
         });
         disconnect.setEnabled(now.connections > 0);
-        section(
-            &left,
-            t("远程", "REMOTE"),
-            &[
-                row(Some(("person.2.fill", NSColor::systemIndigoColor())), &who, None, Some(&disconnect)),
+        let mut rows = vec![row(Some(("person.2.fill", NSColor::systemIndigoColor())), &who, None, Some(&disconnect))];
+        if !gui::ax_ok() && crate::settings::host_desktop(&st) {
+            rows.push(row(
+                Some(("exclamationmark.triangle.fill", NSColor::systemOrangeColor())),
+                t("键盘鼠标不可用", "No keyboard or mouse"),
+                Some(t("缺「辅助功能」权限：对方只能看，不能操作", "The Accessibility permission is missing: a client can watch, not act")),
+                Some(&button(t("打开设置…", "Open Settings…"), || gui::open(gui::SETTINGS_AX))),
+            ));
+        }
+        rows.push(
                 row(
                     Some(("pause.circle.fill", NSColor::systemOrangeColor())),
                     t("暂停远程", "Pause remote"),
@@ -1172,9 +1184,8 @@ fn page_main(root: &NSStackView) {
                         render();
                     })),
                 ),
-            ],
-            None,
         );
+        section(&left, t("远程", "REMOTE"), &rows, None);
     }
 
     // connection

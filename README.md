@@ -216,7 +216,7 @@ kRDPclient before judging hyperMAC.
   pointer keeps the Mac's arrow whatever Windows would show; one Windows pixel is one point,
   so it is soft on a Retina display; a Mac window between two overlapping Windows windows
   makes the lower one show a piece of the upper one; menus have a thin edge of what is behind
-  them in Windows; the clipboard is not shared; only the main display. The left Command key
+  them in Windows; the clipboard is shared for text only (since 1.4.4; no pictures or files); only the main display. The left Command key
   is Windows' Control there (Cmd-C copies), the right one the Windows key.
   The Mac talks to a small program in Windows through a port of the machine's own, not over
   the network. A machine made with this version has everything for it; one made earlier gets

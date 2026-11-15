@@ -468,6 +468,12 @@ pub fn run(name: &str, args: &[String]) -> anyhow::Result<()> {
     // neither seen nor answered (Debian's waits for a key for ever; seen 2026-11-12). With
     // the installer ejected GRUB on the disk starts by itself and the kernel takes our devices.
     let mut conf = conf;
+    if conf.os == "linux" && conf.iso.is_some() && dir.join(FIRST_INSTALL).exists() && disk_boots(&dir.join("disk.img")) {
+        eprintln!("the disk starts by itself now: the installer disc is unplugged");
+        crate::winsetup::edit_conf(name, |c| c.iso = None)?;
+        conf.iso = None;
+        let _ = std::fs::remove_file(dir.join(FIRST_INSTALL));
+    }
     if conf.os == "linux" && conf.own_devices && std::env::var_os("HYPERMAC_VIRTIO").is_none() && opt(args, "--iso").or(conf.iso.as_deref()).is_some() {
         eprintln!("installer plugged in: the framework's display and keyboard for this run");
         conf.own_devices = false;
@@ -486,6 +492,7 @@ pub fn run(name: &str, args: &[String]) -> anyhow::Result<()> {
     // the devices)? Asked of the framework for this very configuration.
     let can_suspend = unsafe { cfg.validateSaveRestoreSupportWithError() }.is_ok();
     let vm = unsafe { VZVirtualMachine::initWithConfiguration(VZVirtualMachine::alloc(), &cfg) };
+    on_term(&sock, can_suspend);
     let saved = dir.join(SAVED);
     if saved.exists() {
         // suspended: go on from the file. It is used once: gone when read, and when it cannot
@@ -926,8 +933,96 @@ pub(crate) fn create_linux(name: &str, args: &[String]) -> anyhow::Result<()> {
         .map_err(err)?;
     }
     std::fs::write(dir.join("vm.json"), serde_json::to_vec_pretty(&conf)?)?;
+    if conf.os == "linux" && conf.iso.is_some() {
+        // (`run` takes the installer out by itself once the disk can start: FIRST_INSTALL)
+        let _ = std::fs::write(dir.join(FIRST_INSTALL), "");
+    }
     eprintln!("created. Next: hypermac run {name}");
     Ok(())
+}
+
+/// SIGTERM (the Mac logs out, restarts or shuts down; or a plain `kill`) is not the end of the
+/// guest's power: a machine that can be suspended goes to its file (seconds, nothing in the
+/// guest is lost, and the next start, also the one at the next login, goes on from there);
+/// one that cannot is asked to shut down. Until 1.4.3 the process just died, which for the
+/// guest was the plug pulled. Both are the ctl socket's own commands, sent to ourselves: the
+/// signal handler only sets a flag. The system waits some seconds and then kills: a guest that
+/// takes longer to shut down still loses its power, as before.
+fn on_term(sock: &Path, can_suspend: bool) {
+    static TERM: AtomicBool = AtomicBool::new(false);
+    extern "C" fn flag(_: libc::c_int) {
+        TERM.store(true, Ordering::Relaxed);
+    }
+    unsafe { libc::signal(libc::SIGTERM, flag as extern "C" fn(libc::c_int) as libc::sighandler_t) };
+    let sock = sock.to_path_buf();
+    std::thread::spawn(move || {
+        loop {
+            std::thread::sleep(std::time::Duration::from_millis(100));
+            if !TERM.swap(false, Ordering::Relaxed) {
+                continue;
+            }
+            let what = if can_suspend { "suspend" } else { "stop" };
+            eprintln!("SIGTERM: {what}");
+            // (a signal in the first moments finds the socket not listening yet)
+            let sent = (0..20).any(|_| {
+                let ok = std::os::unix::net::UnixStream::connect(&sock).and_then(|mut c| writeln!(c, "{what}")).is_ok();
+                if !ok {
+                    std::thread::sleep(std::time::Duration::from_millis(250));
+                }
+                ok
+            });
+            if !sent {
+                eprintln!("SIGTERM: the machine did not take it: ending");
+                std::process::exit(1);
+            }
+        }
+    });
+}
+
+/// A Linux machine made with an installer disc has this file until its disk can start by
+/// itself: `run` then unplugs the disc, and the machine is on hyperMAC's own display again
+/// (kRDPclient can open it) without the person knowing that the disc had to come out (user
+/// 2026-11-13: installed Debian, could not connect). A disc plugged in later (a rescue disc)
+/// has no such file and stays.
+const FIRST_INSTALL: &str = "first-install";
+
+/// Whether the disk has a boot loader: a GPT with an EFI system partition whose first 64 MB
+/// hold a directory entry of a *AA64.EFI file (BOOTAA64.EFI, grubaa64.efi, shimaa64.efi: the
+/// FAT keeps short names as "BOOTAA64EFI"). Installers write it as one of their last steps.
+fn disk_boots(disk: &Path) -> bool {
+    use std::io::{Read, Seek, SeekFrom};
+    const ESP: [u8; 16] = [0x28, 0x73, 0x2A, 0xC1, 0x1F, 0xF8, 0xD2, 0x11, 0xBA, 0x4B, 0x00, 0xA0, 0xC9, 0x3E, 0xC9, 0x3B];
+    let Ok(mut f) = std::fs::File::open(disk) else { return false };
+    let mut read = |at: u64, n: usize| -> Option<Vec<u8>> {
+        let mut b = vec![0u8; n];
+        f.seek(SeekFrom::Start(at)).ok()?;
+        f.read_exact(&mut b).ok()?;
+        Some(b)
+    };
+    let u64at = |b: &[u8], o: usize| u64::from_le_bytes(b[o..o + 8].try_into().unwrap());
+    let u32at = |b: &[u8], o: usize| u32::from_le_bytes(b[o..o + 4].try_into().unwrap());
+    let Some(h) = read(512, 92) else { return false };
+    if &h[..8] != b"EFI PART" {
+        return false;
+    }
+    let (at, n, size) = (u64at(&h, 72), u32at(&h, 80).min(256) as usize, u32at(&h, 84) as usize);
+    if !(128..=4096).contains(&size) {
+        return false;
+    }
+    let Some(table) = read(at * 512, n * size) else { return false };
+    for e in table.chunks(size) {
+        if e[..16] != ESP {
+            continue;
+        }
+        let (first, last) = (u64at(e, 32), u64at(e, 40));
+        let len = ((last.saturating_sub(first) + 1) * 512).min(64 << 20) as usize;
+        if let Some(b) = read(first * 512, len) {
+            if b.windows(7).any(|w| w.eq_ignore_ascii_case(b"AA64EFI")) {
+                return true;
+            }
+        }
+    }
+    false
 }
 
 /// the name the guest mounts Rosetta's share by (`mount -t virtiofs rosetta /media/rosetta`)

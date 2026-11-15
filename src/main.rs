@@ -217,7 +217,8 @@ pub fn is_menu_copy() -> bool {
 /// screen into its recording indicator, by bundle id (2026-11-10, seen: while a client was
 /// connected the icon was gone, and so was a test program's with the same id); with an id of
 /// its own the icon stays. build.rs leaves five spaces after the id for ".menu". Signed ad
-/// hoc: the menu bar process needs no Screen Recording or Accessibility of its own.
+/// hoc (or as HYPERMAC_MENU_SIGN says): the menu bar process needs no Screen Recording or
+/// Accessibility of its own.
 fn write_menu_binary(src: &Path, dst: &Path) -> anyhow::Result<()> {
     // made at run time, so this program's own constants never match it
     let from = format!("<string>{AGENT_LABEL}</string>{}", " ".repeat(5)).into_bytes();
@@ -236,8 +237,13 @@ fn write_menu_binary(src: &Path, dst: &Path) -> anyhow::Result<()> {
     std::fs::write(&tmp, &bin).with_context(|| format!("write {}", tmp.display()))?;
     use std::os::unix::fs::PermissionsExt;
     std::fs::set_permissions(&tmp, std::fs::Permissions::from_mode(0o755))?;
+    // HYPERMAC_MENU_SIGN (build.sh): the developer's identity instead of ad hoc, here, before
+    // the copy takes its name. (build.sh used to sign the copy again where it lay: the menu
+    // bar process running from that file was killed for an invalid signature, three times on
+    // 2026-11-11; and an ad-hoc copy is a new program to macOS after every build.)
+    let identity = std::env::var("HYPERMAC_MENU_SIGN").ok().filter(|i| !i.is_empty()).unwrap_or_else(|| "-".into());
     let st = std::process::Command::new("/usr/bin/codesign")
-        .args(["--force", "--sign", "-", "--identifier", MENU_LABEL])
+        .args(["--force", "--sign", &identity, "--timestamp=none", "--identifier", MENU_LABEL])
         .arg(&tmp)
         .stdout(std::process::Stdio::null())
         .stderr(std::process::Stdio::null())

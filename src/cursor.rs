@@ -16,6 +16,11 @@
 //! the client (or the last update) put it, so it never fights the client's own mouse
 //! (keel-rdp's pointer.rs rule; user 2026-11-10: "mac那边移动是这边也移动需要").
 //!
+//! Without the Accessibility permission the Mac's pointer never moves (input.rs's events are
+//! dropped by the system), so every one of the client's moves would look like "the Mac put it
+//! back": the client's pointer jumped back to one spot whenever the hand rested, and the
+//! person took the mouse for broken (a macOS guest, 2026-11-10). No position is sent then.
+//!
 //! Not done, by choice: hiding the client's pointer while typing (user: not needed).
 
 use std::hash::{DefaultHasher, Hash, Hasher};
@@ -31,6 +36,8 @@ const POLL: Duration = Duration::from_millis(30);
 /// The largest pointer RGBAPointer carries (Large Pointer capability, 96x96; mstsc and
 /// kRDPclient have it). A bigger cursor is drawn scaled down to it.
 const MAX: usize = 96;
+/// How often the Accessibility permission is asked about again.
+const AX_POLL: Duration = Duration::from_secs(2);
 /// The client must have held still this long before the Mac's own moves are sent.
 const MOVED: Duration = Duration::from_millis(300);
 /// A Mac pointer farther than this (points) from where the client has it was moved by the Mac.
@@ -50,8 +57,23 @@ fn run(tx: tokio::sync::mpsc::Sender<DisplayUpdate>) {
     let mut last: Option<u64> = None;
     let mut said_nil = false;
     let mut follow = Follow::default();
+    // asked again every AX_POLL: the person may grant it while the session is up
+    let mut ax = crate::gui::ax_ok();
+    let mut ax_asked = std::time::Instant::now();
+    if !ax {
+        warn!("no Accessibility permission: keyboard and mouse from the client do nothing (System Settings > Privacy & Security > Accessibility)");
+    }
     while !tx.is_closed() {
-        if let Some(update) = follow.step(mac_pointer(), crate::input::client_pointer(), std::time::Instant::now()) {
+        if ax_asked.elapsed() >= AX_POLL {
+            ax_asked = std::time::Instant::now();
+            let now = crate::gui::ax_ok();
+            if now && !ax {
+                info!("Accessibility permission granted: keyboard and mouse work from here on");
+                follow = Follow::default();
+            }
+            ax = now;
+        }
+        if ax && let Some(update) = follow.step(mac_pointer(), crate::input::client_pointer(), std::time::Instant::now()) {
             if tx.blocking_send(update).is_err() {
                 return;
             }
