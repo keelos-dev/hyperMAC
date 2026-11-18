@@ -1,5 +1,5 @@
 <?xml version="1.0" encoding="utf-8"?>
-<!-- hyperMAC: unattended Windows 11 arm64 on the bhyve engine (vm/src/bhyve.rs). Setup's hardware
+<!-- hyperMAC: unattended Windows 11 / 10 arm64 on the bhyve engine (vm/src/bhyve.rs). Setup's hardware
      checks stay on when the machine meets them (TPM 2.0, Secure Boot, 4 GB, 64 GB), else
      LABCONFIG switches them off (bhyve.rs `labconfig`); NVMe disk 0; virtio-win's
      drivers (\drivers on this CD) go in at the specialize pass (\hypermac.cmd). A template:
@@ -31,13 +31,13 @@
       </DiskConfiguration>
       <ImageInstall>
         <OSImage>
-          <InstallFrom><MetaData wcm:action="add"><Key>/IMAGE/NAME</Key><Value>Windows 11 Pro</Value></MetaData></InstallFrom>
+          <InstallFrom><MetaData wcm:action="add">{{IMAGE}}</MetaData></InstallFrom>
           <InstallTo><DiskID>0</DiskID><PartitionID>3</PartitionID></InstallTo>
         </OSImage>
       </ImageInstall>
       <UserData>
         <AcceptEula>true</AcceptEula>
-        <ProductKey><Key>VK7JG-NPHTM-C97JM-9MPGT-3V66T</Key><WillShowUI>Never</WillShowUI></ProductKey>
+        {{PRODUCTKEY}}
       </UserData>
     </component>
   </settings>

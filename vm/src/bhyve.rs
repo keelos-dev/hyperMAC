@@ -743,6 +743,21 @@ const FB_SOCK: &str = "fb.sock";
 const AGENT_SLOT: u32 = 10;
 const AGENT_PORT: &str = "hypermac.agent";
 
+/// Windows 10's kernel (the 19041 line) has an instruction the architecture calls
+/// UNPREDICTABLE ("str x9, [x9, #16]!") that Apple's CPUs take as undefined: setup bugchecks
+/// right after partitioning the disk. bhyve executes such instructions for the guest when
+/// HVF_UNDEF_FIXUP is set (vm/bhyve/hvf/vmmapi_hvf.c fix_undef(); it first tries the
+/// instruction on this Mac, and stays out of the way where the CPU runs it). It costs exits on
+/// every exception of the guest's kernel, so only where it is needed: Windows 11 has no such
+/// instruction. HYPERMAC_UNDEF_FIXUP=1 / 0 overrides.
+fn undef_fixup(conf: &VmConf) -> bool {
+    match std::env::var("HYPERMAC_UNDEF_FIXUP").as_deref() {
+        Ok("1") => true,
+        Ok("0") => false,
+        _ => conf.os == "windows" && conf.os_version.as_deref() == Some("10"),
+    }
+}
+
 /// The VM gets a sound card.
 fn hda(conf: &VmConf) -> bool {
     conf.os == "windows" && std::env::var("HYPERMAC_HDA").as_deref() != Ok("0")
@@ -867,6 +882,9 @@ pub fn run(name: &str, args: &[String], conf: VmConf) -> anyhow::Result<()> {
                 let _ = std::fs::remove_file(dir.join("agent.sock"));
                 let mut cmd = Command::new(&exe);
                 cmd.args(&a).stdin(std::process::Stdio::null());
+                if undef_fixup(&conf) {
+                    cmd.env("HVF_UNDEF_FIXUP", "1");
+                }
                 if let Some(g) = &g3 {
                     g.env(&mut cmd);
                 }
@@ -1123,7 +1141,7 @@ fn virtio_here() -> Option<PathBuf> {
 /// `hypermac create NAME --os windows --iso WINDOWS.iso --virtio virtio-win.iso --user U`
 /// (the password in HYPERMAC_WIN_PASSWORD) on this engine.
 pub fn create_windows(name: &str, args: &[String]) -> anyhow::Result<()> {
-    let iso = PathBuf::from(opt(args, "--iso").context("--iso PATH (Microsoft's Windows 11 ARM ISO)")?);
+    let iso = PathBuf::from(opt(args, "--iso").context("--iso PATH (Microsoft's Windows 11 or 10 ARM ISO)")?);
     // no --virtio (or "download"): the one in the storage folder's iso/, downloaded when none is there
     let virtio = opt(args, "--virtio").filter(|v| *v != "download").map(PathBuf::from);
     // --manual: setup asks its questions in the console; else the account for the unattended install
@@ -1196,9 +1214,14 @@ pub fn create_windows(name: &str, args: &[String]) -> anyhow::Result<()> {
     ws::mark(&dir, "win:stick");
     let lab = labconfig(&crate::load(name)?, disk, secure_boot);
     eprintln!("Secure Boot: {}; setup's hardware checks: {}", if secure_boot { "on" } else { "off (no key template)" }, if lab.is_empty() { "on" } else { "switched off" });
-    if let Err(e) = setup_cd(name, &iso, &virtio, account.as_ref(), &lab, &setup) {
-        ws::fail(&dir, &format!("{e:#}"));
-        return Err(e);
+    match setup_cd(name, &iso, &virtio, account.as_ref(), &lab, &setup) {
+        // what the ISO is, not what was assumed above: a Windows 10 guest runs with the
+        // fallback for its kernel's instruction (`undef_fixup`)
+        Ok(version) => ws::edit_conf(name, |c| c.os_version = Some(version.into()))?,
+        Err(e) => {
+            ws::fail(&dir, &format!("{e:#}"));
+            return Err(e);
+        }
     }
     if account.is_none() {
         // like a Linux VM from here: Start it, install in the Console, eject the installer
@@ -1343,7 +1366,8 @@ pub fn agent_cd(name: &str) -> anyhow::Result<()> {
 
 /// setup.iso: autounattend.xml (setup looks for it on every drive), hypermac.cmd, the drivers.
 /// `account`: the unattended install's user and password; None = the manual install's file.
-fn setup_cd(name: &str, iso: &Path, virtio: &Path, account: Option<&(String, String)>, lab: &str, out: &Path) -> anyhow::Result<()> {
+/// Returns the Windows on the ISO: "10" or "11" (its build: 22000 and later is 11).
+fn setup_cd(name: &str, iso: &Path, virtio: &Path, account: Option<&(String, String)>, lab: &str, out: &Path) -> anyhow::Result<&'static str> {
     // a VM with "gpu3d": the 3D adapter's driver goes with the others (hypermac.cmd installs
     // every .inf under \drivers); Windows binds it when it first sees the adapter
     let driver3d = if crate::load(name)?.gpu3d { gpu3d().and_then(|g| g.driver) } else { None };
@@ -1351,15 +1375,35 @@ fn setup_cd(name: &str, iso: &Path, virtio: &Path, account: Option<&(String, Str
     let stage = tmp.join("cd");
     std::fs::create_dir_all(&stage)?;
     let r = (|| {
-        let lang = {
+        let (lang, images) = {
             let m = ws::Mounted::iso(iso, &tmp)?;
             ensure!(ws::find_ci(&m.path, &["efi", "boot", "bootaa64.efi"]).is_some(), "the ISO has no efi/boot/bootaa64.efi: not a Windows ARM64 installer?");
-            ws::lang_of(&m.path).unwrap_or_else(|| "en-US".into())
+            (ws::lang_of(&m.path).unwrap_or_else(|| "en-US".into()), ws::wim_images(&m.path))
         };
-        eprintln!("Windows ISO: language {lang}");
+        // The edition and its key. Pro: Microsoft's generic key, which only says "Pro". The
+        // others (an LTSC ISO: Enterprise LTSC and IoT Enterprise LTSC) have no such key:
+        // the image is named by its index and the key left empty (setup wants the element;
+        // tested with Windows 10 IoT Enterprise LTSC 2021: it goes on without asking).
+        // An ISO whose images cannot be read: Windows 11 Pro by name, as before.
+        let pick = ws::wim_pick(&images);
+        let version = match pick {
+            Some(i) if i.build != 0 && i.build < 22000 => "10",
+            _ => "11",
+        };
+        let (image, key) = match pick {
+            Some(i) if i.edition.eq_ignore_ascii_case("Professional") => (format!("<Key>/IMAGE/INDEX</Key><Value>{}</Value>", i.index), "<ProductKey><Key>VK7JG-NPHTM-C97JM-9MPGT-3V66T</Key><WillShowUI>Never</WillShowUI></ProductKey>"),
+            Some(i) => (format!("<Key>/IMAGE/INDEX</Key><Value>{}</Value>", i.index), "<ProductKey><Key></Key><WillShowUI>OnError</WillShowUI></ProductKey>"),
+            None => ("<Key>/IMAGE/NAME</Key><Value>Windows 11 Pro</Value>".to_string(), "<ProductKey><Key>VK7JG-NPHTM-C97JM-9MPGT-3V66T</Key><WillShowUI>Never</WillShowUI></ProductKey>"),
+        };
+        match pick {
+            Some(i) => eprintln!("Windows ISO: language {lang}, Windows {version} (build {}), edition {:?} (image {} of {})", i.build, i.name, i.index, images.len()),
+            None => eprintln!("Windows ISO: language {lang} (its editions could not be read: taken as Windows 11 Pro)"),
+        }
         let xml = match account {
             Some((user, password)) => AUTOUNATTEND
                 .replace("{{LABCONFIG}}", lab)
+                .replace("{{IMAGE}}", &image)
+                .replace("{{PRODUCTKEY}}", key)
                 .replace("{{LANG}}", &lang)
                 .replace("{{COMPUTER}}", &ws::computer_name(name))
                 .replace("{{TIMEZONE}}", &ws::time_zone())
@@ -1375,7 +1419,9 @@ fn setup_cd(name: &str, iso: &Path, virtio: &Path, account: Option<&(String, Str
         std::fs::write(stage.join("hypermac.cmd"), HYPERMAC_CMD)?;
         let m = ws::Mounted::iso(virtio, &tmp)?;
         for d in DRIVERS {
-            let from = m.path.join(d).join("w11/ARM64");
+            // Windows 10 gets the drivers built for it where virtio-win has them
+            let w10 = m.path.join(d).join("w10/ARM64");
+            let from = if version == "10" && w10.exists() { w10 } else { m.path.join(d).join("w11/ARM64") };
             ensure!(from.exists(), "{}: no {d}/w11/ARM64: not virtio-win.iso?", virtio.display());
             ws::copy_tree(&from, &stage.join("drivers").join(d), &|_| false)?;
         }
@@ -1389,7 +1435,7 @@ fn setup_cd(name: &str, iso: &Path, virtio: &Path, account: Option<&(String, Str
         }
         let _ = std::fs::remove_file(out);
         ws::run(Command::new("/usr/bin/hdiutil").args(["makehybrid", "-quiet", "-iso", "-joliet", "-default-volume-name", "HMSETUP", "-o"]).arg(out).arg(&stage))?;
-        Ok(())
+        Ok(version)
     })();
     let _ = std::fs::remove_dir_all(&tmp);
     r

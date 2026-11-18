@@ -170,6 +170,13 @@ hypermac win-resume win1     # 中途停了从断点接着装
 ```
 
 - 实测（2026-11-11，Mac mini M4，日文 26300 ISO）：8 分钟到桌面，1920x1080，NetKVM 已装，来宾的 3389 可连。
+- **Windows 10 ARM 也能装**（2026-11-15）：同一条命令、同一个向导，给 Windows 10 ARM64 的 ISO 就行。`create` 从 ISO 的 `install.wim` 读出版本和各个版本名：
+  有 Pro 装 Pro（通用安装密钥），没有（LTSC 的 ISO）按 IoT Enterprise LTSC → Enterprise LTSC 的顺序选，密钥留空；build 小于 22000 记成 `"os_version": "10"`，
+  驱动用 virtio-win 的 `w10/ARM64`。Windows 10 的内核（19041 系）里有一条 ARM 规定为 UNPREDICTABLE 的指令（`str x9, [x9, #16]!`），Apple 的 CPU 当未定义指令，
+  安装程序分完区就蓝屏 `SYSTEM_THREAD_EXCEPTION_NOT_HANDLED`（QEMU / UTM 走 Hypervisor.framework 时一样）。`"os_version": "10"` 的虚拟机起 bhyve 时带 `HVF_UNDEF_FIXUP=1`：
+  bhyve 在来宾内核的同步异常入口下硬件断点，遇到这类指令替来宾执行（`bhyve/hvf/vmmapi_hvf.c` 的 `fix_undef()`；先在宿主上试这条指令，CPU 自己能执行就不开）。
+  `HYPERMAC_UNDEF_FIXUP=1|0` 强制开关。实测：Windows 10 IoT Enterprise LTSC 2021（en-US）无人值守约 5 分钟到桌面，NAT 拿到地址，来宾 3389 可连；
+  同一版程序再装一遍 Windows 11（26300）正常。没测：用户态程序里的同类指令（没拦那个入口）、手动安装、3D、融合模式、Windows Update、长时间运行、性能数字。
 - `vm.json` 里 `"engine": "bhyve"`。`hypermac run` 是监管进程：来宾重启时重新起 bhyve，`ctl NAME stop` = 电源键。
   画面、键鼠、`ctl.sock`、`screen.shm`、VNC 口和别的 VM 一样用（`src/bhyve.rs`）。来宾的串口输出在 VM 目录的 `console.log`。
 - 分辨率在创建时定（`--w --h`，最大 1920x1200），运行中不能改；声卡见下一条；没有 TPM 和 Secure Boot（安装时关掉了检查）。

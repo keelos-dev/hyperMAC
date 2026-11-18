@@ -67,6 +67,7 @@ Apple**, and it installs by itself. Linux and FreeBSD: point it at the distribut
 | Guest | Engine | How it installs | State |
 |---|---|---|---|
 | **Windows 11 ARM** | bhyve on Hypervisor.framework | Microsoft's ISO: by hand, or unattended | TPM 2.0, Secure Boot, network, 1920x1080, Windows Update, sound, 3D acceleration (Direct3D 11, opt-in) |
+| **Windows 10 ARM** | bhyve on Hypervisor.framework | the ARM64 ISO (e.g. IoT Enterprise LTSC 2021), same wizard: by hand, or unattended | new in 1.5: unattended install, network and 3D tested; the rest as Windows 11 but less tested |
 | **macOS** | Virtualization.framework | by itself, from Apple's restore image (downloaded for you) | graphics acceleration (Apple's paravirtual GPU), smooth |
 | **Linux** (arm64) | Virtualization.framework | the distribution's ISO | Fedora tested |
 | **FreeBSD** (arm64) | bhyve on Hypervisor.framework | the release's ISO | 15.1 tested |

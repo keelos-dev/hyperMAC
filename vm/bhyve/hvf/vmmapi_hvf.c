@@ -28,6 +28,8 @@
 #include <errno.h>
 #include <libutil.h>
 #include <pthread.h>
+#include <setjmp.h>
+#include <signal.h>
 #include <stdatomic.h>
 #include <stdlib.h>
 #include <string.h>
@@ -94,6 +96,7 @@ struct vmctx {
 	_Atomic int suspend;		/* enum vm_suspend_how once the VM is reset or powered off */
 
 	bool	watch;			/* HVF_WATCH is set */
+	bool	fixup;			/* HVF_UNDEF_FIXUP is set: see fix_undef() */
 	bool	gic_attached;
 	uint64_t gic_dist_start;
 	uint64_t gic_msi_base;		/* the GICv2m frame; 0: none */
@@ -137,6 +140,14 @@ struct vcpu {
 	bool	pair_pending;
 	struct vm_exit pair_exit;
 	uint64_t watch_esr, watch_far, watch_elr, watch_vbar, watch_x30;	/* HVF_WATCH: read by the owner when it syncs */
+	uint64_t watch_mem[8];		/* HVF_WATCH_DUMP: the guest's memory there */
+	char	watch_txt[3072];	/* HVF_WATCH_BT: registers and the chain of frames */
+	bool	watch_mem_ok;
+	/* fix_undef(): the breakpoint on the guest's vector, and the step over it */
+	bool	fix_trap;		/* debug exceptions come to us */
+	bool	fix_step;
+	uint64_t fix_bp;
+	uint64_t fix_mdscr;		/* MDSCR_EL1 as the guest wrote it */
 };
 
 /*
@@ -185,6 +196,12 @@ hv_ret(hv_return_t r)
 } while (0)
 
 static void *watch_thread(void *arg);
+static bool fix_needed(void);
+static void dbg_init(void);
+static int fix_mem(struct vcpu *v, uint64_t va, void *buf, size_t len, bool write, uint64_t *fault);
+static void watch_dump(struct vcpu *v);
+static void watch_bt(struct vcpu *v);
+static void watch_peek(struct vcpu *v);
 
 /*
  * Lifetime
@@ -226,6 +243,9 @@ vm_openf(const char *name, int flags __unused)
 	pthread_mutex_init(&ctx->mtx, NULL);
 	pthread_cond_init(&ctx->cv, NULL);
 	pthread_mutex_init(&ctx->spi_mtx, NULL);
+	ctx->fixup = getenv("HVF_UNDEF_FIXUP") != NULL && fix_needed();
+	if (ctx->fixup)
+		dbg_init();
 	if (getenv("HVF_WATCH") != NULL) {
 		pthread_t tid;
 		uint32_t *trap;
@@ -722,6 +742,9 @@ vcpu_sync(struct vcpu *v)
 		(void)hv_vcpu_get_sys_reg(v->hv, HV_SYS_REG_ELR_EL1, &v->watch_elr);
 		(void)hv_vcpu_get_sys_reg(v->hv, HV_SYS_REG_VBAR_EL1, &v->watch_vbar);
 		(void)hv_vcpu_get_reg(v->hv, HV_REG_LR, &v->watch_x30);
+		watch_dump(v);
+		watch_bt(v);
+		watch_peek(v);
 	}
 	v->synced = true;
 	pthread_cond_broadcast(&v->cv);
@@ -1134,6 +1157,14 @@ watch_thread(void *arg)
 			    (unsigned long long)v->watch_esr, (unsigned long long)v->watch_far,
 			    (unsigned long long)v->watch_elr, (unsigned long long)v->regs[VM_REG_GUEST_SCTLR_EL1],
 			    (unsigned long long)v->watch_vbar, (unsigned long long)v->watch_x30);
+			if (v->watch_txt[0] != '\0')
+				warnx("hvf: watch: vcpu %d%s", i, v->watch_txt);
+			if (v->watch_mem_ok)
+				warnx("hvf: watch: vcpu %d memory: %#llx %#llx %#llx %#llx %#llx %#llx %#llx %#llx", i,
+				    (unsigned long long)v->watch_mem[0], (unsigned long long)v->watch_mem[1],
+				    (unsigned long long)v->watch_mem[2], (unsigned long long)v->watch_mem[3],
+				    (unsigned long long)v->watch_mem[4], (unsigned long long)v->watch_mem[5],
+				    (unsigned long long)v->watch_mem[6], (unsigned long long)v->watch_mem[7]);
 		}
 	}
 	return (NULL);
@@ -1204,7 +1235,7 @@ vcpu_enter(struct vcpu *v)
 	}
 	if (v->caps_dirty) {
 		/* the debugger's: breakpoints (BRK) and single steps come to us, not to the guest */
-		HV_CHECK(hv_vcpu_set_trap_debug_exceptions(v->hv,
+		HV_CHECK(hv_vcpu_set_trap_debug_exceptions(v->hv, v->ctx->fixup ||
 		    (v->caps & ((1 << VM_CAP_BRK_EXIT) | (1 << VM_CAP_SS_EXIT))) != 0));
 		HV_CHECK(hv_vcpu_get_reg(v->hv, HV_REG_CPSR, &cpsr));
 		HV_CHECK(hv_vcpu_get_sys_reg(v->hv, HV_SYS_REG_MDSCR_EL1, &mdscr));
@@ -1241,6 +1272,8 @@ vcpu_pc(struct vcpu *v)
  * and ignore writes; anything else is an undefined instruction, which is what the access is on a
  * CPU without that register, and is logged the first times so that we learn what guests touch.
  */
+static bool fix_debug_reg(struct vcpu *v, u_int crm, u_int op2, bool read, u_int rt);
+
 static void
 handle_sysreg(struct vcpu *v, uint64_t syndrome, uint64_t pc)
 {
@@ -1260,6 +1293,10 @@ handle_sysreg(struct vcpu *v, uint64_t syndrome, uint64_t pc)
 		HV_CHECK(hv_vcpu_set_reg(v->hv, HV_REG_PC, pc + 4));
 		return;
 	}
+	if (v->ctx->fixup && op0 == 2 && op1 == 0 && crn == 0 && fix_debug_reg(v, crm, op2, read, rt)) {
+		HV_CHECK(hv_vcpu_set_reg(v->hv, HV_REG_PC, pc + 4));
+		return;
+	}
 	if (atomic_fetch_add(&logged, 1) < 32)
 		warnx("hvf: vcpu %d: %s of system register op0 %u op1 %u CRn %u CRm %u op2 %u at pc %#llx: undefined",
 		    v->vcpuid, read ? "read" : "write", op0, op1, crn, crm, op2, (unsigned long long)pc);
@@ -1276,7 +1313,7 @@ handle_sysreg(struct vcpu *v, uint64_t syndrome, uint64_t pc)
  * granule, up to 48 bits. No permission checks: the CPU has just executed from there.
  */
 static bool
-guest_va2gpa(struct vcpu *v, uint64_t va, uint64_t *gpa)
+guest_va2gpa_desc(struct vcpu *v, uint64_t va, uint64_t *gpa, uint64_t *leaf)
 {
 	uint64_t sctlr, tcr, ttbr, desc, *p, base;
 	u_int tsz, tg, g, stride, va_bits, shift, idx;
@@ -1286,6 +1323,8 @@ guest_va2gpa(struct vcpu *v, uint64_t va, uint64_t *gpa)
 	HV_CHECK(hv_vcpu_get_sys_reg(v->hv, HV_SYS_REG_SCTLR_EL1, &sctlr));
 	if ((sctlr & 1) == 0) {
 		*gpa = va;
+		if (leaf != NULL)
+			*leaf = 0;
 		return (true);
 	}
 	HV_CHECK(hv_vcpu_get_sys_reg(v->hv, HV_SYS_REG_TCR_EL1, &tcr));
@@ -1323,11 +1362,191 @@ guest_va2gpa(struct vcpu *v, uint64_t va, uint64_t *gpa)
 			if (level == 3 && (desc & 2) == 0)
 				return (false);
 			*gpa = (desc & 0x0000fffffffff000ul & ~((1ul << shift) - 1)) | (va & ((1ul << shift) - 1));
+			if (leaf != NULL)
+				*leaf = desc;
 			return (true);
 		}
 		base = desc & 0x0000fffffffff000ul & ~((1ul << g) - 1);
 	}
 	return (false);
+}
+
+static bool
+guest_va2gpa(struct vcpu *v, uint64_t va, uint64_t *gpa)
+{
+	return (guest_va2gpa_desc(v, va, gpa, NULL));
+}
+
+/*
+ * HVF_WATCH_DUMP=elr: 64 bytes around ELR_EL1 (the code that took the last exception).
+ * HVF_WATCH_DUMP=VECTOR,ADDRESS,code: ADDRESS holds a stop code and its arguments; 64 bytes around
+ * the address in the second argument (the instruction that failed).
+ * HVF_WATCH_DUMP=VECTOR,ADDRESS (hex, both as offsets in the guest kernel's image): 64 bytes of
+ * the guest's memory at VBAR_EL1 - VECTOR + ADDRESS with every line of HVF_WATCH. For a kernel
+ * that has stopped without a picture: Windows' KiBugCheckData (the stop code and its four
+ * arguments) is at a known place from its exception vectors.
+ */
+static void
+watch_dump(struct vcpu *v)
+{
+	const char *e = getenv("HVF_WATCH_DUMP");
+	char *end;
+	uint64_t vec, addr, gpa, va;
+	void *p;
+
+	v->watch_mem_ok = false;
+	if (e == NULL)
+		return;
+	if (strcmp(e, "elr") == 0) {
+		/* the instructions around where the last exception came from */
+		va = v->watch_elr - 32;
+	} else {
+		vec = strtoull(e, &end, 16);
+		if (*end != ',')
+			return;
+		addr = strtoull(end + 1, &end, 16);
+		va = v->watch_vbar - vec + addr;
+		if (strcmp(end, ",code") == 0) {
+			/* ADDRESS is Windows' KiBugCheckData: the code around its second argument */
+			uint64_t *q;
+
+			if ((va & 0xfff) > 0x1000 - 40 || !guest_va2gpa(v, va, &gpa) ||
+			    (q = vm_map_gpa(v->ctx, gpa, 40)) == NULL || q[0] == 0)
+				return;
+			va = q[2] - 32;
+		}
+	}
+	if (!guest_va2gpa(v, va, &gpa) || (va & 0xfff) > 0x1000 - sizeof(v->watch_mem) ||
+	    (p = vm_map_gpa(v->ctx, gpa, sizeof(v->watch_mem))) == NULL)
+		return;
+	memcpy(v->watch_mem, p, sizeof(v->watch_mem));
+	v->watch_mem_ok = true;
+}
+
+/*
+ * HVF_WATCH_BT=VECTOR,LIST (hex: where the exception vectors and PsLoadedModuleList are in the
+ * guest's ntoskrnl.exe): with every line of HVF_WATCH the registers, two words of memory at
+ * x0 and x19 to x22 where they are addresses, and the return addresses up the chain of frames
+ * (x29). The list of loaded modules is printed whenever its length has changed, to name the
+ * addresses afterwards. For a Windows guest that hangs: who waits, for what, called from where.
+ */
+static void
+watch_modules(struct vcpu *v, uint64_t head)
+{
+	static _Atomic int last;
+	uint64_t e, base, buf, fault;
+	uint32_t size;
+	uint16_t len, name[64];
+	char ascii[65];
+	int n, pass, i;
+
+	for (pass = 0; pass < 2; pass++) {
+		if (fix_mem(v, head, &e, 8, false, &fault) != 0)
+			return;
+		for (n = 0; n < 1024 && e != head && e != 0; n++) {
+			if (pass == 1) {
+				if (fix_mem(v, e + 0x30, &base, 8, false, &fault) != 0 ||
+				    fix_mem(v, e + 0x40, &size, 4, false, &fault) != 0 ||
+				    fix_mem(v, e + 0x58, &len, 2, false, &fault) != 0 ||
+				    fix_mem(v, e + 0x60, &buf, 8, false, &fault) != 0)
+					return;
+				if (len > sizeof(name))
+					len = sizeof(name);
+				if (fix_mem(v, buf, name, len, false, &fault) != 0)
+					len = 0;
+				for (i = 0; i < len / 2; i++)
+					ascii[i] = name[i] < 0x7f && name[i] > 0x20 ? (char)name[i] : '?';
+				ascii[i] = '\0';
+				warnx("hvf: watch: module %#llx %#x %s", (unsigned long long)base, size, ascii);
+			}
+			if (fix_mem(v, e, &e, 8, false, &fault) != 0)
+				return;
+		}
+		if (n == atomic_load(&last))
+			return;
+		if (pass == 1)
+			atomic_store(&last, n);
+	}
+}
+
+static void
+watch_bt(struct vcpu *v)
+{
+	static const int show[] = { 0, 1, 2, 3, 8, 9, 19, 20, 21, 22, 23, 24, 29, 30 };
+	static const int deref[] = { 0, 19, 20, 21, 22 };
+	const char *e = getenv("HVF_WATCH_BT");
+	char *end, *t = v->watch_txt;
+	size_t left = sizeof(v->watch_txt), k;
+	uint64_t vec, list, x[31], sp = 0, fp, w[2], fault, cpsr = 0;
+	int i, n;
+
+	v->watch_txt[0] = '\0';
+	if (e == NULL)
+		return;
+	vec = strtoull(e, &end, 16);
+	if (*end != ',')
+		return;
+	list = strtoull(end + 1, &end, 16);
+	if ((v->watch_vbar >> 55) == 0)
+		return;
+	watch_modules(v, v->watch_vbar - vec + list);
+	for (i = 0; i < 31; i++)
+		(void)hv_vcpu_get_reg(v->hv, HV_REG_X0 + i, &x[i]);
+	(void)hv_vcpu_get_reg(v->hv, HV_REG_CPSR, &cpsr);
+	(void)hv_vcpu_get_sys_reg(v->hv, (cpsr & 0xf) == 5 ? HV_SYS_REG_SP_EL1 : HV_SYS_REG_SP_EL0, &sp);
+#define	WB(...) do { n = snprintf(t, left, __VA_ARGS__); if (n < 0 || (size_t)n >= left) return; t += n; left -= n; } while (0)
+	WB(" regs: sp %#llx", (unsigned long long)sp);
+	for (k = 0; k < nitems(show); k++)
+		WB(" x%d %#llx", show[k], (unsigned long long)x[show[k]]);
+	for (k = 0; k < nitems(deref); k++)
+		if ((x[deref[k]] >> 55) != 0 && fix_mem(v, x[deref[k]], w, 16, false, &fault) == 0)
+			WB(" [x%d] %#llx %#llx", deref[k], (unsigned long long)w[0], (unsigned long long)w[1]);
+	WB(" bt:");
+	for (fp = x[29], i = 0; i < 24 && (fp >> 55) != 0 && (fp & 7) == 0; i++) {
+		if (fix_mem(v, fp, w, 16, false, &fault) != 0)
+			break;
+		WB(" %#llx", (unsigned long long)w[1]);
+		if (w[0] <= fp)
+			break;
+		fp = w[0];
+	}
+#undef WB
+}
+
+/*
+ * HVF_WATCH_PEEK=FILE: with every round of HVF_WATCH, vCPU 0 reads FILE (lines "ADDRESS COUNT",
+ * hex and decimal) and prints COUNT 64-bit words of the guest's memory at each address. The
+ * file can be changed while the guest runs: to follow pointers in a guest that hangs.
+ */
+static void
+watch_peek(struct vcpu *v)
+{
+	const char *e = getenv("HVF_WATCH_PEEK");
+	char line[128], out[1024], *end;
+	uint64_t va, w, fault;
+	unsigned long n, i;
+	size_t o;
+	FILE *f;
+
+	if (e == NULL || v->vcpuid != 0 || (f = fopen(e, "r")) == NULL)
+		return;
+	while (fgets(line, sizeof(line), f) != NULL) {
+		va = strtoull(line, &end, 16);
+		n = strtoul(end, NULL, 10);
+		if (va == 0 || n == 0)
+			continue;
+		if (n > 32)
+			n = 32;
+		for (i = 0, o = 0; i < n; i++) {
+			if (fix_mem(v, va + 8 * i, &w, 8, false, &fault) != 0) {
+				o += snprintf(out + o, sizeof(out) - o, " -");
+				break;
+			}
+			o += snprintf(out + o, sizeof(out) - o, " %#llx", (unsigned long long)w);
+		}
+		warnx("hvf: peek: %#llx:%s", (unsigned long long)va, out);
+	}
+	fclose(f);
 }
 
 /* Xn or the stack pointer in use, for a base register's writeback. */
@@ -1491,6 +1710,633 @@ handle_abort(struct vcpu *v, bool data, struct vm_exit *vme, uint64_t pc)
 	return (true);
 }
 
+/*
+ * HVF_UNDEF_FIXUP: instructions the architecture calls UNPREDICTABLE that Apple's
+ * CPUs take as undefined and others execute. Windows 10's kernel (19041) has one, "str x9,
+ * [x9, #16]!" (a store with writeback whose base is also the register stored), and bugchecks
+ * on it during setup. The undefined-instruction exception goes straight to the guest, so:
+ * hardware breakpoints on the guest's vectors for synchronous exceptions from EL1
+ * (VBAR_EL1 + 0 and + 0x200) bring every one of them here first. An undefined instruction of that
+ * family is executed here the way QEMU's TCG does (the value stored is the register's before
+ * the writeback; after a load the writeback wins) and the exception is undone; anything else
+ * goes on into the guest's handler, one single step past the breakpoint.
+ *
+ * Not done: exceptions from EL0 (a breakpoint at + 0x400 would take every system call out of
+ * the guest), the guest's own use of the debug registers (ours are written again before every
+ * entry; a guest that uses breakpoint 5 or clears MDSCR_EL1.MDE loses to us), table-level
+ * access permissions.
+ */
+#define	FIX_BRP		4	/* the breakpoints taken: this one and the next, the last two of Apple's six */
+#define	FIX_BCR		0x1e3	/* enabled, EL1 only, the whole instruction */
+
+static _Atomic uint64_t fix_hits, fix_done;
+
+static sigjmp_buf fix_probe_jmp;
+
+static void
+fix_probe_ill(int sig)
+{
+	siglongjmp(fix_probe_jmp, 1);
+}
+
+/*
+ * Does this Mac's CPU take the instruction as undefined? Tried, not looked up by model: where
+ * it runs (as on the CPUs Windows was built for) the guest needs nothing from us.
+ */
+static bool
+fix_needed(void)
+{
+	static uint64_t buf[4];
+	struct sigaction sa, old;
+	bool ill;
+
+	memset(&sa, 0, sizeof(sa));
+	sa.sa_handler = fix_probe_ill;
+	sigemptyset(&sa.sa_mask);
+	if (sigaction(SIGILL, &sa, &old) != 0)
+		return (true);
+	if (sigsetjmp(fix_probe_jmp, 1) == 0) {
+		register uint64_t *p __asm__("x9") = buf;
+
+		__asm__ volatile(".inst 0xf8010d29" : "+r"(p) : : "memory");	/* str x9, [x9, #16]! */
+		ill = false;
+	} else
+		ill = true;
+	(void)sigaction(SIGILL, &old, NULL);
+	if (!ill)
+		warnx("hvf: fixup: this CPU runs \"str x9, [x9, #16]!\" itself: not needed");
+	return (ill);
+}
+static uint64_t fix_xreg(struct vcpu *v, u_int r);
+static void fix_setx(struct vcpu *v, u_int r, uint64_t val);
+
+/*
+ * HVF_BP=VECTOR,LIST,MODULE,RVA[,RVA...] (with HVF_UNDEF_FIXUP; for looking into a Windows guest
+ * that has no kernel debugger and cannot write a dump): breakpoints in one of the guest
+ * kernel's modules, up to four. VECTOR and LIST are where the exception vectors and
+ * PsLoadedModuleList are in ntoskrnl.exe (hex, from its symbols), MODULE the file's name as the
+ * loader has it ("dxgkrnl.sys"), RVA hex offsets in it. Each hit prints the registers and goes
+ * on. Breakpoints 0 to 3 are taken from the guest for it. HVF_BP_ON=FILE: the hits are printed
+ * only while FILE exists.
+ */
+#define	DBG_NBP		4
+static struct {
+	bool	on;
+	uint64_t vec, list;
+	char	module[64];
+	uint64_t rva[DBG_NBP];
+	int	n;
+	_Atomic uint64_t base;		/* the module's, once it is loaded */
+} dbg;
+
+static void
+dbg_init(void)
+{
+	const char *e = getenv("HVF_BP");
+	char *end;
+	size_t l;
+
+	if (e == NULL)
+		return;
+	dbg.vec = strtoull(e, &end, 16);
+	if (*end != ',')
+		return;
+	dbg.list = strtoull(end + 1, &end, 16);
+	if (*end != ',')
+		return;
+	e = end + 1;
+	l = strcspn(e, ",");
+	if (l == 0 || l >= sizeof(dbg.module))
+		return;
+	memcpy(dbg.module, e, l);
+	for (e += l; *e == ',' && dbg.n < DBG_NBP; e = end)
+		dbg.rva[dbg.n++] = strtoull(e + 1, &end, 16);
+	dbg.on = dbg.n > 0;
+}
+
+/* The module in the guest's PsLoadedModuleList (LDR_DATA_TABLE_ENTRY: DllBase 0x30, BaseDllName 0x58). */
+static void
+dbg_find(struct vcpu *v, uint64_t vbar)
+{
+	uint64_t head = vbar - dbg.vec + dbg.list, e, base, buf, fault;
+	uint16_t len, name[64];
+	size_t i, want = strlen(dbg.module);
+	int n;
+
+	if (fix_mem(v, head, &e, 8, false, &fault) != 0)
+		return;
+	for (n = 0; n < 1024 && e != head && e != 0; n++) {
+		if (fix_mem(v, e + 0x30, &base, 8, false, &fault) != 0 ||
+		    fix_mem(v, e + 0x58, &len, 2, false, &fault) != 0 ||
+		    fix_mem(v, e + 0x60, &buf, 8, false, &fault) != 0)
+			return;
+		if (len == 2 * want && fix_mem(v, buf, name, len, false, &fault) == 0) {
+			for (i = 0; i < want; i++)
+				if ((name[i] | 0x20) != (dbg.module[i] | 0x20))
+					break;
+			if (i == want) {
+				atomic_store(&dbg.base, base);
+				warnx("hvf: bp: %s is at %#llx", dbg.module, (unsigned long long)base);
+				return;
+			}
+		}
+		if (fix_mem(v, e, &e, 8, false, &fault) != 0)
+			return;
+	}
+}
+
+static const hv_sys_reg_t dbg_bvr[DBG_NBP] = { HV_SYS_REG_DBGBVR0_EL1, HV_SYS_REG_DBGBVR1_EL1,
+    HV_SYS_REG_DBGBVR2_EL1, HV_SYS_REG_DBGBVR3_EL1 };
+static const hv_sys_reg_t dbg_bcr[DBG_NBP] = { HV_SYS_REG_DBGBCR0_EL1, HV_SYS_REG_DBGBCR1_EL1,
+    HV_SYS_REG_DBGBCR2_EL1, HV_SYS_REG_DBGBCR3_EL1 };
+
+static void
+dbg_arm(struct vcpu *v, uint64_t vbar, bool on)
+{
+	static _Atomic unsigned int tries;
+	uint64_t base = atomic_load(&dbg.base);
+	int i;
+
+	if (base == 0 && on && (vbar >> 55) != 0 && (atomic_fetch_add(&tries, 1) & 0x3ff) == 0) {
+		dbg_find(v, vbar);
+		base = atomic_load(&dbg.base);
+	}
+	if (base == 0)
+		return;
+	for (i = 0; i < dbg.n; i++) {
+		HV_CHECK(hv_vcpu_set_sys_reg(v->hv, dbg_bvr[i], base + dbg.rva[i]));
+		HV_CHECK(hv_vcpu_set_sys_reg(v->hv, dbg_bcr[i], on ? FIX_BCR : 0));
+	}
+}
+
+/* One of them was hit? The registers, and one step over it. */
+static bool
+dbg_hit(struct vcpu *v, uint64_t pc)
+{
+	uint64_t base = atomic_load(&dbg.base), x[31], sp = 0, cpsr, mdscr;
+	int i;
+
+	if (!dbg.on || base == 0)
+		return (false);
+	for (i = 0; i < dbg.n; i++)
+		if (pc == base + dbg.rva[i])
+			break;
+	if (i == dbg.n)
+		return (false);
+	for (i = 0; i < 31; i++)
+		HV_CHECK(hv_vcpu_get_reg(v->hv, HV_REG_X0 + i, &x[i]));
+	(void)hv_vcpu_get_sys_reg(v->hv, HV_SYS_REG_SP_EL0, &sp);
+	/* HVF_BP_ON=FILE: said only while that file is there (for a place that is hit all the time) */
+	if (getenv("HVF_BP_ON") == NULL || access(getenv("HVF_BP_ON"), F_OK) == 0)
+	warnx("hvf: bp: vcpu %d %s+%#llx: x0 %#llx x1 %#llx x2 %#llx x3 %#llx x8 %#llx x9 %#llx x19 %#llx x20 %#llx "
+	    "x21 %#llx x22 %#llx lr %s+%#llx sp %#llx", v->vcpuid, dbg.module, (unsigned long long)(pc - base),
+	    (unsigned long long)x[0], (unsigned long long)x[1], (unsigned long long)x[2], (unsigned long long)x[3],
+	    (unsigned long long)x[8], (unsigned long long)x[9], (unsigned long long)x[19], (unsigned long long)x[20],
+	    (unsigned long long)x[21], (unsigned long long)x[22],
+	    x[30] - base < 0x1000000 ? dbg.module : "", (unsigned long long)(x[30] - base < 0x1000000 ? x[30] - base : x[30]),
+	    (unsigned long long)sp);
+	dbg_arm(v, 0, false);
+	HV_CHECK(hv_vcpu_get_reg(v->hv, HV_REG_CPSR, &cpsr));
+	HV_CHECK(hv_vcpu_set_reg(v->hv, HV_REG_CPSR, cpsr | PSR_SS));
+	HV_CHECK(hv_vcpu_get_sys_reg(v->hv, HV_SYS_REG_MDSCR_EL1, &mdscr));
+	HV_CHECK(hv_vcpu_set_sys_reg(v->hv, HV_SYS_REG_MDSCR_EL1, mdscr | MDSCR_SS));
+	v->fix_step = true;
+	return (true);
+}
+
+/* fix_vidsch(): where the branch is in this guest, what it is, which register holds the scheduler */
+static struct {
+	_Atomic uint64_t site;
+	uint32_t ins;
+	u_int	reg;
+	_Atomic uint64_t n;
+} vidsch;
+
+/* Before every entry into the guest: the breakpoint follows VBAR_EL1. */
+static void
+fix_arm(struct vcpu *v)
+{
+	uint64_t vbar, mdscr;
+
+	if (!v->fix_trap) {
+		HV_CHECK(hv_vcpu_set_trap_debug_exceptions(v->hv, true));
+		/* with them the guest's accesses to the debug registers: fix_debug_reg() */
+		HV_CHECK(hv_vcpu_set_trap_debug_reg_accesses(v->hv, true));
+		HV_CHECK(hv_vcpu_get_sys_reg(v->hv, HV_SYS_REG_MDSCR_EL1, &v->fix_mdscr));
+		v->fix_trap = true;
+	}
+	if (v->fix_step)
+		return;
+	HV_CHECK(hv_vcpu_get_sys_reg(v->hv, HV_SYS_REG_VBAR_EL1, &vbar));
+	if (vbar == 0)
+		return;
+	/*
+	 * Synchronous exceptions from EL1 on SP_EL0 (+ 0, where Windows' kernel runs) and on
+	 * SP_EL1 (+ 0x200).
+	 */
+	v->fix_bp = vbar;
+	HV_CHECK(hv_vcpu_set_sys_reg(v->hv, HV_SYS_REG_DBGBVR4_EL1, vbar));
+	HV_CHECK(hv_vcpu_set_sys_reg(v->hv, HV_SYS_REG_DBGBCR4_EL1, FIX_BCR));
+	HV_CHECK(hv_vcpu_set_sys_reg(v->hv, HV_SYS_REG_DBGBVR5_EL1, vbar + 0x200));
+	HV_CHECK(hv_vcpu_set_sys_reg(v->hv, HV_SYS_REG_DBGBCR5_EL1, FIX_BCR));
+	if (dbg.on)
+		dbg_arm(v, vbar, true);
+	if (atomic_load(&vidsch.site) != 0) {
+		HV_CHECK(hv_vcpu_set_sys_reg(v->hv, HV_SYS_REG_DBGBVR3_EL1, atomic_load(&vidsch.site)));
+		HV_CHECK(hv_vcpu_set_sys_reg(v->hv, HV_SYS_REG_DBGBCR3_EL1, FIX_BCR));
+	}
+	HV_CHECK(hv_vcpu_get_sys_reg(v->hv, HV_SYS_REG_MDSCR_EL1, &mdscr));
+	if ((mdscr & MDSCR_MDE) == 0)
+		HV_CHECK(hv_vcpu_set_sys_reg(v->hv, HV_SYS_REG_MDSCR_EL1, mdscr | MDSCR_MDE));
+}
+
+/*
+ * The guest reads or writes a debug register (they trap while its debug exceptions do).
+ * MDSCR_EL1: the guest sees what it wrote; ours has the breakpoint enable (and the step) on
+ * top. Breakpoint FIX_BRP is ours: reads as zero, writes ignored. The other breakpoints and
+ * the watchpoints are the guest's as they are.
+ */
+static bool
+fix_debug_reg(struct vcpu *v, u_int crm, u_int op2, bool read, u_int rt)
+{
+	hv_sys_reg_t sr = (hv_sys_reg_t)(0x8000 | (crm << 3) | op2);
+	uint64_t val = 0, real;
+
+	if (crm == 2 && op2 == 2) {			/* MDSCR_EL1 */
+		if (read)
+			val = v->fix_mdscr;
+		else {
+			v->fix_mdscr = fix_xreg(v, rt);
+			HV_CHECK(hv_vcpu_get_sys_reg(v->hv, HV_SYS_REG_MDSCR_EL1, &real));
+			HV_CHECK(hv_vcpu_set_sys_reg(v->hv, HV_SYS_REG_MDSCR_EL1,
+			    v->fix_mdscr | MDSCR_MDE | (real & MDSCR_SS)));
+		}
+	} else if (op2 >= 4 && op2 <= 7 && crm < 6) {	/* DBGBVRn, DBGBCRn, DBGWVRn, DBGWCRn */
+		if ((crm >= FIX_BRP - 1 || dbg.on) && op2 <= 5)	/* FIX_BRP - 1: fix_vidsch() */
+			;
+		else if (read) {
+			if (hv_vcpu_get_sys_reg(v->hv, sr, &val) != HV_SUCCESS)
+				return (false);
+		} else if (hv_vcpu_set_sys_reg(v->hv, sr, fix_xreg(v, rt)) != HV_SUCCESS)
+			return (false);
+	} else
+		return (false);
+	if (read)
+		fix_setx(v, rt, val);
+	return (true);
+}
+
+/* 0: done; 1: not mapped at *fault; 2: mapped read-only at *fault; 3: not RAM. */
+static int
+fix_mem(struct vcpu *v, uint64_t va, void *buf, size_t len, bool write, uint64_t *fault)
+{
+	uint64_t gpa, leaf, a;
+	size_t i, n;
+	char *p;
+
+	/* first that all of it is there, so that nothing is done by halves */
+	for (a = va; a < va + len; a = (a | 0xfff) + 1) {
+		*fault = a;
+		if (!guest_va2gpa_desc(v, a, &gpa, &leaf))
+			return (1);
+		if (write && (leaf & (1ul << 7)) != 0)
+			return (2);
+		if (vm_map_gpa(v->ctx, gpa, 1) == NULL)
+			return (3);
+	}
+	for (i = 0; i < len; i += n) {
+		n = MIN(len - i, 0x1000 - ((va + i) & 0xfff));
+		(void)guest_va2gpa_desc(v, va + i, &gpa, NULL);
+		p = vm_map_gpa(v->ctx, gpa, n);
+		if (p == NULL)
+			return (3);
+		if (write)
+			memcpy(p, (char *)buf + i, n);
+		else
+			memcpy((char *)buf + i, p, n);
+	}
+	return (0);
+}
+
+static uint64_t
+fix_xreg(struct vcpu *v, u_int r)
+{
+	uint64_t val = 0;
+
+	if (r != 31)
+		HV_CHECK(hv_vcpu_get_reg(v->hv, HV_REG_X0 + r, &val));
+	return (val);
+}
+
+static void
+fix_setx(struct vcpu *v, u_int r, uint64_t val)
+{
+	if (r != 31)
+		HV_CHECK(hv_vcpu_set_reg(v->hv, HV_REG_X0 + r, val));
+}
+
+/*
+ * The instruction at `pc`, if it is of the family: 0 = executed; 1, 2 = it needs memory that
+ * is not there / not writable (*fault, *write: the data abort the guest should see instead);
+ * -1 = not ours.
+ */
+static int
+fix_emulate(struct vcpu *v, uint64_t pc, uint32_t *insp, uint64_t *fault, bool *write)
+{
+	uint64_t gpa, base, addr, val[2] = { 0, 0 };
+	uint32_t ins, *ip;
+	u_int rn, rt, rt2, size, opc, len;
+	int64_t imm;
+	uint8_t buf[16];
+	bool pre, load, pair;
+	int r;
+
+	if (!guest_va2gpa(v, pc, &gpa) || (ip = vm_map_gpa(v->ctx, gpa, 4)) == NULL)
+		return (-1);
+	*insp = ins = *ip;
+	rn = (ins >> 5) & 31;
+	rt = ins & 31;
+	rt2 = (ins >> 10) & 31;
+	if ((ins & 0x3f200400) == 0x38000400) {
+		/* load/store register, pre- or post-indexed (not SIMD) */
+		pair = false;
+		size = ins >> 30;
+		opc = (ins >> 22) & 3;
+		if (rn == 31 || rn != rt || (size == 3 && opc >= 2) || (size == 2 && opc == 3))
+			return (-1);
+		len = 1u << size;
+		imm = (int64_t)((uint64_t)((ins >> 12) & 0x1ff) << 55) >> 55;
+		pre = (ins & 0x800) != 0;
+		load = opc != 0;
+	} else if ((ins & 0x3e800000) == 0x28800000) {
+		/* load/store pair, pre- or post-indexed (not SIMD) */
+		pair = true;
+		opc = ins >> 30;
+		load = (ins & (1u << 22)) != 0;
+		if ((opc != 0 && opc != 2) || rn == 31 || (rn != rt && rn != rt2))
+			return (-1);
+		size = opc == 2 ? 3 : 2;
+		len = 2u << size;
+		imm = ((int64_t)((uint64_t)((ins >> 15) & 0x7f) << 57) >> 57) * (1 << size);
+		pre = (ins & (1u << 24)) != 0;
+	} else
+		return (-1);
+
+	base = fix_xreg(v, rn);
+	addr = pre ? base + imm : base;
+	*write = !load;
+	if (load) {
+		if ((r = fix_mem(v, addr, buf, len, false, fault)) != 0)
+			return (r == 3 ? -1 : r);
+		memcpy(&val[0], buf, pair ? len / 2 : len);
+		if (pair)
+			memcpy(&val[1], buf + len / 2, len / 2);
+		else if (opc >= 2 && size < 3) {
+			/* LDRSB/LDRSH/LDRSW: to 64 bits (opc 2) or to 32 (opc 3) */
+			val[0] = (uint64_t)((int64_t)(val[0] << (64 - 8 * len)) >> (64 - 8 * len));
+			if (opc == 3)
+				val[0] &= 0xffffffff;
+		}
+		fix_setx(v, rt, val[0]);
+		if (pair)
+			fix_setx(v, rt2, val[1]);
+	} else {
+		val[0] = fix_xreg(v, rt);
+		val[1] = fix_xreg(v, rt2);
+		memcpy(buf, &val[0], pair ? len / 2 : len);
+		if (pair)
+			memcpy(buf + len / 2, &val[1], len / 2);
+		if ((r = fix_mem(v, addr, buf, len, true, fault)) != 0)
+			return (r == 3 ? -1 : r);
+	}
+	fix_setx(v, rn, base + imm);
+	return (0);
+}
+
+/* One instruction of the guest's code. */
+static bool
+fix_insn(struct vcpu *v, uint64_t va, uint32_t *ins)
+{
+	uint64_t gpa;
+	uint32_t *p;
+
+	if (!guest_va2gpa(v, va, &gpa) || (p = vm_map_gpa(v->ctx, gpa, 4)) == NULL)
+		return (false);
+	*ins = *p;
+	return (true);
+}
+
+/*
+ * Windows 10's dxgmms2.sys (19041 line), the GPU scheduler with a driver that has one node
+ * (Triton's viogpu3d). VidSchiSelectContext() then only ever takes node 0 (the scheduler's
+ * field at +72 is 1), but VidSchiSwitchContextWithCheck(), when node 0 cannot take another
+ * packet, still asks whether another node has work, and the scheduler's own second node often
+ * has: it answers 3, "select again", and VidSchiScheduleCommandToRun() goes round with the
+ * scheduler's spin lock held, until an interrupt routine reports a completion. This driver
+ * reports its completions from its DPC: that one waits for the same lock, or is queued on a
+ * processor that waits for it. All of the guest's processors end up there and it stands still
+ * (stop code 0x133 after a while):
+ *
+ *	bl RtlAreBitsClearEx	; (nodes with work) & (nodes not tried) empty?
+ *	uxtb w8, w0
+ *	cbz w8, <return 3>	; <- here
+ *	cmn w21, #1		; ... <return 2>: wait for the scheduler's events, lock released
+ *
+ * A breakpoint on that branch (the guest's code is not changed: its kernel checks it): with
+ * one node the answer is 2. Windows 11's scheduler is another one. Found from
+ * fix_dxgmms(), which knows an address in the file, by the instructions around the branch.
+ */
+static void
+fix_vidsch_find(struct vcpu *v, uint64_t near)
+{
+	static const struct { int off; uint32_t mask, ins; } sig[] = {
+		{ 0, 0xff00001f, 0x34000008 },		/* cbz w8, ... */
+		{ -0x18, 0xfffffc1f, 0xf9410802 },	/* ldr x2, [xN, #528] */
+		{ -0x14, 0xffffffff, 0xd2800001 },	/* mov x1, #0 */
+		{ -0x10, 0xffffffff, 0xc8dffd09 },	/* ldar x9, [x8] */
+		{ -0xc, 0xfffffc1f, 0x91084000 },	/* add x0, xN, #528 */
+		{ -8, 0xffffffff, 0xd63f0120 },		/* blr x9 */
+		{ -4, 0xffffffff, 0x53001c08 },		/* uxtb w8, w0 */
+		{ 4, 0xfffffc1f, 0x3100041f },		/* cmn wN, #1 */
+	};
+	static _Atomic bool looked;
+	uint64_t page, a, fault, found = 0;
+	uint32_t buf[1024], ins, add = 0;
+	u_int i, k, n = 0;
+
+	if (atomic_exchange(&looked, true))
+		return;
+	for (page = (near & ~0xffful) - 0x100000; page < (near & ~0xffful) + 0x40000; page += 0x1000) {
+		if (fix_mem(v, page, buf, sizeof(buf), false, &fault) != 0)
+			continue;
+		for (i = 0; i < nitems(buf); i++) {
+			if ((buf[i] & sig[0].mask) != sig[0].ins)
+				continue;
+			a = page + 4 * i;
+			for (k = 1; k < nitems(sig); k++)
+				if (!fix_insn(v, a + sig[k].off, &ins) || (ins & sig[k].mask) != sig[k].ins)
+					break;
+			if (k < nitems(sig))
+				continue;
+			n++;
+			found = a;
+			vidsch.ins = buf[i];
+			(void)fix_insn(v, a - 0xc, &add);
+		}
+	}
+	if (n != 1) {
+		warnx("hvf: fixup: Windows 10's dxgmms2: the scheduler's branch found %u times: left alone", n);
+		return;
+	}
+	vidsch.reg = (add >> 5) & 0x1f;
+	atomic_store(&vidsch.site, found);
+	warnx("hvf: fixup: Windows 10's dxgmms2: the scheduler's \"select again\" is watched at %#llx",
+	    (unsigned long long)found);
+}
+
+/* The breakpoint on that branch: the branch is done here. */
+static bool
+fix_vidsch(struct vcpu *v, uint64_t pc)
+{
+	uint64_t site = atomic_load(&vidsch.site), fault, n;
+	uint32_t nodes = 0;
+	int64_t disp;
+
+	if (site == 0 || pc != site)
+		return (false);
+	disp = (int64_t)((uint64_t)((vidsch.ins >> 5) & 0x7ffff) << 45) >> 43;	/* imm19 * 4, signed */
+	if ((uint32_t)fix_xreg(v, 8) != 0)
+		pc += 4;
+	else if (fix_mem(v, fix_xreg(v, vidsch.reg) + 72, &nodes, 4, false, &fault) == 0 && nodes == 1) {
+		pc += 4;
+		n = atomic_fetch_add(&vidsch.n, 1) + 1;
+		if ((n & (n - 1)) == 0)
+			warnx("hvf: fixup: vcpu %d: Windows 10's dxgmms2: the scheduler waits instead of "
+			    "selecting again (%llu so far)", v->vcpuid, (unsigned long long)n);
+	} else
+		pc += disp;
+	HV_CHECK(hv_vcpu_set_reg(v->hv, HV_REG_PC, pc));
+	return (true);
+}
+
+/*
+ * Windows 10's dxgmms2.sys (19041 line), VIDMM_GLOBAL::InitPagingProcessVaSpace: for each of the
+ * paging buffers of an adapter with GPU virtual addressing it commits the buffer's allocation
+ * into the paging process, and does not look whether the buffer has one. A driver that keeps
+ * its paging buffers in system memory (PagingBufferSegmentId 0: Triton's viogpu3d) has none,
+ * and the adapter's start ends in stop code 0x7E, a read at 0x80:
+ *
+ *	ldr x19, [x22, #64]	; the buffer's VIDMM_ALLOC: NULL
+ *	...
+ *	ldr x19, [x19, #128]	; <- here
+ *	... CommitVirtualAddressRange ...
+ *	add w26, w26, #1	; the next buffer
+ *
+ * Windows 11's has the check ("cbz" to the next buffer). The same is done for it here: that
+ * read faulting with x19 = 0 goes on at the next buffer. Recognized by the instructions around
+ * it, so a build of the file that is not like these is left alone (and bugchecks as before).
+ */
+static bool
+fix_dxgmms(struct vcpu *v, uint64_t esr, uint64_t elr)
+{
+	/*
+	 * By their form, not their registers: the builds of the file differ in those (19041.1288
+	 * keeps the buffer in x22, 19041.7725 in x21).
+	 */
+	static const struct { int off; uint32_t mask, ins; } sig[] = {
+		{ -8, 0xffffffff, 0xf9403008 },		/* ldr x8, [x0, #96] */
+		{ -4, 0xfffffc1f, 0xf9003008 },		/* str x8, [xN, #96] */
+		{ 0, 0xffffffff, 0xf9404273 },		/* ldr x19, [x19, #128] */
+		{ 4, 0xffc003ff, 0xf90003ff },		/* str xzr, [sp, #...] */
+		{ 0x44, 0xffffffff, 0x1100075a },	/* add w26, w26, #1 */
+		{ 0x48, 0xffffffff, 0x71000b5f },	/* cmp w26, #2 */
+	};
+	uint64_t far, x19, spsr;
+	uint32_t ins;
+	u_int i;
+
+	if (((esr >> ESR_ELx_EC_SHIFT) & 0x3f) != EXCP_DATA_ABORT)
+		return (false);
+	HV_CHECK(hv_vcpu_get_sys_reg(v->hv, HV_SYS_REG_FAR_EL1, &far));
+	if (far != 0x80 || fix_xreg(v, 19) != 0)
+		return (false);
+	for (i = 0; i < nitems(sig); i++)
+		if (!fix_insn(v, elr + sig[i].off, &ins) || (ins & sig[i].mask) != sig[i].ins)
+			return (false);
+	HV_CHECK(hv_vcpu_get_sys_reg(v->hv, HV_SYS_REG_SPSR_EL1, &spsr));
+	HV_CHECK(hv_vcpu_set_reg(v->hv, HV_REG_CPSR, spsr));
+	HV_CHECK(hv_vcpu_set_reg(v->hv, HV_REG_PC, elr + 0x44));
+	warnx("hvf: fixup: vcpu %d: Windows 10's dxgmms2 at %#llx: a paging buffer without an allocation skipped",
+	    v->vcpuid, (unsigned long long)elr);
+	fix_vidsch_find(v, elr);
+	return (true);
+}
+
+/* The breakpoint on the guest's vector was hit: the guest has just taken an exception from EL1. */
+static void
+fix_undef(struct vcpu *v)
+{
+	uint64_t esr, elr, spsr, fault = 0, cpsr, mdscr, n;
+	uint32_t ins = 0;
+	bool write = false;
+	int r;
+
+	n = atomic_fetch_add(&fix_hits, 1) + 1;
+	HV_CHECK(hv_vcpu_get_sys_reg(v->hv, HV_SYS_REG_ESR_EL1, &esr));
+	if ((n & (n - 1)) == 0 || (getenv("HVF_FIX_TRACE") != NULL && ((esr >> 26) & 0x3f) == 0))
+		warnx("hvf: fixup: %llu exceptions of the guest's kernel looked at, %llu instructions executed for it (this one: ESR_EL1 %#llx, bp %#llx)",
+		    (unsigned long long)n, (unsigned long long)atomic_load(&fix_done), (unsigned long long)esr, (unsigned long long)v->fix_bp);
+	if (((esr >> ESR_ELx_EC_SHIFT) & 0x3f) == EXCP_DATA_ABORT && (esr & 0x3f) <= 0x07) {
+		/* (a translation fault: the rare case among the kernel's own faults is looked at) */
+		HV_CHECK(hv_vcpu_get_sys_reg(v->hv, HV_SYS_REG_ELR_EL1, &elr));
+		if (fix_dxgmms(v, esr, elr))
+			return;
+	}
+	if (((esr >> ESR_ELx_EC_SHIFT) & 0x3f) == EXCP_UNKNOWN) {
+		HV_CHECK(hv_vcpu_get_sys_reg(v->hv, HV_SYS_REG_ELR_EL1, &elr));
+		r = fix_emulate(v, elr, &ins, &fault, &write);
+		if (r == 0) {
+			/* as if the instruction had run: back to where the exception came from */
+			HV_CHECK(hv_vcpu_get_sys_reg(v->hv, HV_SYS_REG_SPSR_EL1, &spsr));
+			HV_CHECK(hv_vcpu_set_reg(v->hv, HV_REG_CPSR, spsr));
+			HV_CHECK(hv_vcpu_set_reg(v->hv, HV_REG_PC, elr + 4));
+			n = atomic_fetch_add(&fix_done, 1) + 1;
+			if (n <= 8 || (n & (n - 1)) == 0)
+				warnx("hvf: fixup: vcpu %d: executed %#x at %#llx for the guest (%llu so far)",
+				    v->vcpuid, ins, (unsigned long long)elr, (unsigned long long)n);
+			return;
+		}
+		if (r > 0) {
+			/* the guest gets the data abort the instruction would have taken, and comes back */
+			HV_CHECK(hv_vcpu_set_sys_reg(v->hv, HV_SYS_REG_ESR_EL1,
+			    ((uint64_t)EXCP_DATA_ABORT << ESR_ELx_EC_SHIFT) | ESR_ELx_IL |
+			    (write ? 1 << 6 : 0) | (r == 1 ? 0x07 : 0x0f)));
+			HV_CHECK(hv_vcpu_set_sys_reg(v->hv, HV_SYS_REG_FAR_EL1, fault));
+		}
+	}
+	/* into the guest's handler: one step with the breakpoint off */
+	HV_CHECK(hv_vcpu_set_sys_reg(v->hv, HV_SYS_REG_DBGBCR4_EL1, 0));
+	HV_CHECK(hv_vcpu_set_sys_reg(v->hv, HV_SYS_REG_DBGBCR5_EL1, 0));
+	HV_CHECK(hv_vcpu_get_reg(v->hv, HV_REG_CPSR, &cpsr));
+	HV_CHECK(hv_vcpu_set_reg(v->hv, HV_REG_CPSR, cpsr | PSR_SS));
+	HV_CHECK(hv_vcpu_get_sys_reg(v->hv, HV_SYS_REG_MDSCR_EL1, &mdscr));
+	HV_CHECK(hv_vcpu_set_sys_reg(v->hv, HV_SYS_REG_MDSCR_EL1, mdscr | MDSCR_SS));
+	v->fix_step = true;
+}
+
+/* The step past the breakpoint is done. */
+static void
+fix_stepped(struct vcpu *v)
+{
+	uint64_t cpsr, mdscr;
+
+	HV_CHECK(hv_vcpu_get_reg(v->hv, HV_REG_CPSR, &cpsr));
+	HV_CHECK(hv_vcpu_set_reg(v->hv, HV_REG_CPSR, cpsr & ~PSR_SS));
+	HV_CHECK(hv_vcpu_get_sys_reg(v->hv, HV_SYS_REG_MDSCR_EL1, &mdscr));
+	HV_CHECK(hv_vcpu_set_sys_reg(v->hv, HV_SYS_REG_MDSCR_EL1, mdscr & ~MDSCR_SS));
+	v->fix_step = false;
+}
+
 /* Returns true if the exit goes to bhyve (*vme filled). */
 static bool
 handle_exception(struct vcpu *v, struct vm_exit *vme)
@@ -1550,13 +2396,34 @@ handle_exception(struct vcpu *v, struct vm_exit *vme)
 		sched_yield();
 		return (false);
 	case EXCP_BRK:
+		if (v->ctx->fixup && (v->caps & (1 << VM_CAP_BRK_EXIT)) == 0) {
+			/* the guest's own BRK (they come out with the breakpoint): back to it */
+			vcpu_take_exception(v, syndrome, 0);
+			return (false);
+		}
 		vme->exitcode = VM_EXITCODE_BRK;
 		return (true);
+	case EXCP_BRKPT_EL0:
+	case EXCP_BRKPT_EL1:
+		if (v->ctx->fixup && (pc == v->fix_bp || pc == v->fix_bp + 0x200)) {
+			fix_undef(v);
+			return (false);
+		}
+		if (v->ctx->fixup && fix_vidsch(v, pc))
+			return (false);
+		if (v->ctx->fixup && dbg_hit(v, pc))
+			return (false);
+		goto unknown;
 	case EXCP_SOFTSTP_EL0:
 	case EXCP_SOFTSTP_EL1:
+		if (v->fix_step) {
+			fix_stepped(v);
+			return (false);
+		}
 		vme->exitcode = VM_EXITCODE_SS;
 		return (true);
 	default:
+	unknown:
 		if (v->ctx->watch)
 			warnx("hvf: watch: vcpu %d exception class %#x at pc %#llx (ESR %#llx, address %#llx)",
 			    v->vcpuid, ec, (unsigned long long)pc, (unsigned long long)syndrome,
@@ -1646,6 +2513,8 @@ vm_run(struct vcpu *v, struct vm_run *vmrun)
 			return (0);
 		}
 		vcpu_enter(v);
+		if (ctx->fixup)
+			fix_arm(v);
 		pthread_mutex_unlock(&v->mtx);
 
 		vcpus_wait_created(ctx);

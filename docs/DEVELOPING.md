@@ -166,7 +166,8 @@ app 都是 `accepted` / `Notarized Developer ID`。脚本不碰现役服务。
 
 **发布**：每个版本一个 release，tag = dmg 文件名去掉 `.dmg`，附件是 dmg 和 `dist/changelog.json`
 （「检查更新」列改动用），正文写这一版的说明和 sha256（`gh release create <tag> dist/<tag>.dmg
-dist/changelog.json -R keelos-dev/hyperMAC ...`）。发布前在
+dist/changelog.json -R keelos-dev/hyperMAC ...`）。发完跑 `sh tools/cask.sh <tag>` 更新 Homebrew cask
+（`keelos-dev/homebrew-tap` 的 `Casks/hypermac.rb`，本地 clone 在 `~/Developer/homebrew-tap`），再 push 那个仓库。发布前在
 Mac 上从 release 页**下载**（带隔离属性，才是用户的真实路径）走一遍：Gatekeeper 不拦 → 首次设置
 → kRDPclient 有画面、声音、键鼠、剪贴板。Developer ID 签名和开发签名的 TCC 授权不通用，
 换签名后两项授权要重给。验证要停现役服务时先跟用户说（他要换 TigerVNC 进来）。
@@ -191,7 +192,7 @@ Mac 上从 release 页**下载**（带隔离属性，才是用户的真实路径
 - 主页：连接（地址、证书指纹、token）、设置（登录时自动运行、H.264、声音、剪贴板、远程登录）、
   权限、账号（Mac 密码改过时提示重新输入）、重启服务、卸载。视频/声音/剪贴板写进
   `<state>/settings.json`，服务每个新连接读一次（环境变量 `MACRDP_VIDEO` 等仍优先）。卸载不关远程登录。
-- 看界面：`HOME=<临时目录> MACRDP_UI_PREVIEW=welcome|permissions|ssh|main MACRDP_UI_LANG=zh|en
+- 看界面：`HOME=<临时目录> MACRDP_UI_PREVIEW=welcome|permissions|ssh|main MACRDP_UI_LANG=zh|en|ja
   hyperMAC.app/Contents/MacOS/hypermac`（直接开那一页，不碰真实设置）。
 - 升级：新 app 拖进 `/Applications` 覆盖后双击，服务还在跑旧的可执行文件（`service.json` 记的
   mtime 不同）就 `kickstart -k`；自启指向别处（开发副本）时先问再换。

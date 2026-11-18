@@ -351,6 +351,76 @@ pub(crate) fn lang_of(src: &Path) -> Option<String> {
     None
 }
 
+/// One edition in the installer's install.wim / install.esd.
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) struct WimImage {
+    pub index: u32,
+    pub name: String,
+    /// "Professional", "IoTEnterpriseS", …
+    pub edition: String,
+    /// 19041 (Windows 10's line), 22000 and later (Windows 11)
+    pub build: u32,
+}
+
+/// The editions on a mounted Windows installer: the XML at the end of sources/install.wim
+/// (or .esd), read from the file itself (its header says where; the XML is never compressed).
+pub(crate) fn wim_images(src: &Path) -> Vec<WimImage> {
+    let Some(wim) = find_ci(src, &["sources", "install.wim"]).or_else(|| find_ci(src, &["sources", "install.esd"])) else { return Vec::new() };
+    wim_xml(&wim).map(|x| wim_parse(&x)).unwrap_or_default()
+}
+
+fn wim_xml(wim: &Path) -> Option<String> {
+    use std::io::{Read, Seek, SeekFrom};
+    let mut f = std::fs::File::open(wim).ok()?;
+    let mut h = [0u8; 0x60];
+    f.read_exact(&mut h).ok()?;
+    if &h[..8] != b"MSWIM\0\0\0" {
+        return None;
+    }
+    // the XML's resource header at 0x48: size (7 bytes) + flags, then the offset
+    let size = u64::from_le_bytes([h[0x48], h[0x49], h[0x4a], h[0x4b], h[0x4c], h[0x4d], h[0x4e], 0]);
+    let offset = u64::from_le_bytes(h[0x50..0x58].try_into().ok()?);
+    if size < 2 || size > 64 << 20 {
+        return None;
+    }
+    let mut b = vec![0u8; size as usize];
+    f.seek(SeekFrom::Start(offset)).ok()?;
+    f.read_exact(&mut b).ok()?;
+    let u: Vec<u16> = b.chunks_exact(2).map(|c| u16::from_le_bytes([c[0], c[1]])).collect();
+    Some(String::from_utf16_lossy(&u))
+}
+
+fn wim_parse(xml: &str) -> Vec<WimImage> {
+    fn tag<'a>(s: &'a str, t: &str) -> Option<&'a str> {
+        let a = s.find(&format!("<{t}>"))? + t.len() + 2;
+        let e = s[a..].find(&format!("</{t}>"))?;
+        Some(&s[a..a + e])
+    }
+    let mut v = Vec::new();
+    for part in xml.split("<IMAGE INDEX=\"").skip(1) {
+        let part = part.split("</IMAGE>").next().unwrap_or(part);
+        let Some(index) = part.split('"').next().and_then(|i| i.parse().ok()) else { continue };
+        // (<NAME> is the image's; the one inside <WINDOWS><LANGUAGES> etc. has other tags)
+        let name = tag(part.rsplit("</WINDOWS>").next().unwrap_or(part), "NAME").or_else(|| tag(part, "NAME")).unwrap_or("").to_string();
+        v.push(WimImage {
+            index,
+            name,
+            edition: tag(part, "EDITIONID").unwrap_or("").to_string(),
+            build: tag(part, "BUILD").and_then(|b| b.parse().ok()).unwrap_or(0),
+        });
+    }
+    v
+}
+
+/// The edition an unattended install takes: Pro where the ISO has it (what it always took),
+/// else the long-term editions (an LTSC ISO has nothing else), else the first.
+pub(crate) fn wim_pick(images: &[WimImage]) -> Option<&WimImage> {
+    ["Professional", "IoTEnterpriseS", "EnterpriseS", "IoTEnterprise", "Enterprise", "Education"]
+        .iter()
+        .find_map(|e| images.iter().find(|i| i.edition.eq_ignore_ascii_case(e)))
+        .or(images.first())
+}
+
 /// The Professional edition's index in install.wim (wimlib-imagex info).
 fn pro_index(wimlib: &Path, image: &Path) -> Option<u32> {
     let out = Command::new(wimlib).arg("info").arg(image).output().ok()?;
@@ -564,5 +634,31 @@ pub(crate) fn detach(dev: &str) {
             return;
         }
         std::thread::sleep(std::time::Duration::from_secs(2));
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn wim_editions() {
+        // the shape of install.wim's XML (Windows 10 LTSC 2021's two images, shortened)
+        let xml = "<WIM><TOTALBYTES>1</TOTALBYTES>\
+            <IMAGE INDEX=\"1\"><DIRCOUNT>1</DIRCOUNT><WINDOWS><ARCH>12</ARCH><EDITIONID>EnterpriseS</EDITIONID>\
+            <LANGUAGES><LANGUAGE>en-US</LANGUAGE></LANGUAGES><VERSION><MAJOR>10</MAJOR><BUILD>19041</BUILD></VERSION></WINDOWS>\
+            <NAME>Windows 10 Enterprise LTSC 2021</NAME><DESCRIPTION>d</DESCRIPTION></IMAGE>\
+            <IMAGE INDEX=\"2\"><WINDOWS><EDITIONID>IoTEnterpriseS</EDITIONID><VERSION><BUILD>19041</BUILD></VERSION></WINDOWS>\
+            <NAME>Windows 10 IoT Enterprise LTSC 2021</NAME></IMAGE></WIM>";
+        let v = wim_parse(xml);
+        assert_eq!(v.len(), 2);
+        assert_eq!(v[0], WimImage { index: 1, name: "Windows 10 Enterprise LTSC 2021".into(), edition: "EnterpriseS".into(), build: 19041 });
+        assert_eq!(wim_pick(&v).unwrap().index, 2);
+        // a consumer ISO: Pro wins wherever it is
+        let home = WimImage { index: 1, name: "Windows 11 Home".into(), edition: "Core".into(), build: 26100 };
+        let pro = WimImage { index: 6, name: "Windows 11 Pro".into(), edition: "Professional".into(), build: 26100 };
+        assert_eq!(wim_pick(&[home.clone(), pro]).unwrap().index, 6);
+        assert_eq!(wim_pick(&[home]).unwrap().index, 1);
+        assert!(wim_pick(&[]).is_none());
     }
 }

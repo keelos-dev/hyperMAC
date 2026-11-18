@@ -1227,7 +1227,7 @@ fn save_fields() {
 fn os_name(os: Os) -> &'static str {
     match os {
         Os::Mac => "macOS",
-        Os::Windows => "Windows 11",
+        Os::Windows => "Windows",
         Os::Linux => "Linux",
         Os::FreeBsd => "FreeBSD",
     }
@@ -1289,7 +1289,7 @@ fn step_os(root_stack: &NSStackView) {
         ),
         row(
             Some(("os.windows", NSColor::systemBlueColor())),
-            "Windows 11",
+            "Windows 11 / 10",
             Some(t(
                 "用微软的 ARM64 .iso，在「控制台」里安装，或者无人值守装到桌面",
                 "From Microsoft's ARM64 .iso: install in the Console, or unattended to the desktop",
@@ -1433,8 +1433,8 @@ fn step_image(root_stack: &NSStackView, os: Os, width: f64) {
             "Or use a restore image of your own (.ipsw; ipsw.me has every version); not newer than this Mac's macOS.",
         ),
         Os::Windows => t(
-            "在微软官网下载「Windows 11 ARM64」的 ISO（任何语言都行，装好的系统用 ISO 的语言）。",
-            "Download Microsoft's “Windows 11 ARM64” ISO (any language: the system gets the ISO's).",
+            "在微软官网下载「Windows 11 ARM64」的 ISO（任何语言都行，装好的系统用 ISO 的语言）。Windows 10 ARM64 的 ISO 也能装。",
+            "Download Microsoft's “Windows 11 ARM64” ISO (any language: the system gets the ISO's). A Windows 10 ARM64 ISO installs too.",
         ),
         Os::Linux => t(
             "各发行版的 arm64（aarch64）安装盘：Fedora、Debian、Ubuntu 等。",
@@ -1462,7 +1462,7 @@ fn step_image(root_stack: &NSStackView, os: Os, width: f64) {
 fn other_image(os: Os) {
     let Some(path) = choose_file(match os {
         Os::Mac => t("选一个 macOS 恢复映像（.ipsw）", "Choose a macOS restore image (.ipsw)"),
-        Os::Windows => t("选 Windows 11 ARM64 的 .iso", "Choose the Windows 11 ARM64 .iso"),
+        Os::Windows => t("选 Windows 11 或 10 ARM64 的 .iso", "Choose the Windows 11 or 10 ARM64 .iso"),
         Os::Linux => t("选一个 Linux arm64 安装盘（.iso）", "Choose a Linux arm64 installer (.iso)"),
         Os::FreeBsd => t("选一个 FreeBSD arm64 安装盘（.iso）", "Choose a FreeBSD arm64 installer (.iso)"),
     }) else {

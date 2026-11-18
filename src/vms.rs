@@ -213,7 +213,7 @@ pub fn guests(rdp_port: u16) -> Vec<serde_json::Value> {
         .map(|vm| {
             let (family, os_name, default_version) = match vm.os.as_str() {
                 "macos" => ("macos", "macOS", ""),
-                // Windows 11 ARM is the only Windows hyperMAC runs
+                // (vm.json says "10" for a Windows 10 guest; older files say nothing and are 11)
                 "windows" => ("windows", "Windows", "11"),
                 "freebsd" => ("freebsd", "FreeBSD", ""),
                 _ => ("linux", "Linux", ""),
