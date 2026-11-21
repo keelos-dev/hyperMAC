@@ -640,7 +640,8 @@ impl RdpServerDisplay for VmDisplay {
                                 had = None;
                                 if enc.as_ref().map(|(_, s)| *s) != Some(stream) {
                                     enc = None; // the old stream's encoder, and its drain thread, go
-                                    match crate::encoder::Encoder::new(w, h, v.fps() as u32, v.kbps()) {
+                                    let (ow, oh) = v.stream_size();
+                                    match crate::encoder::Encoder::new(ow, oh, v.fps() as u32, v.kbps()) {
                                         Ok((e, rx)) => {
                                             let v = v.clone();
                                             std::thread::spawn(move || {

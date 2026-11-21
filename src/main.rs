@@ -602,6 +602,14 @@ fn main() -> anyhow::Result<()> {
         let state = argv.iter().position(|s| s == "--state").and_then(|i| argv.get(i + 1)).map(PathBuf::from);
         return menubar::run(&state.unwrap_or_else(state_dir));
     }
+    // A client's picture promised on the pasteboard, for the service (clip.rs `CHILD`).
+    if argv.first().map(String::as_str) == Some("clip-promise") {
+        return clip::promise_command();
+    }
+    // The Mac to its English keyboard, for the service (input.rs `english`).
+    if argv.first().map(String::as_str) == Some("input-source") {
+        return input::source_command(&argv[1..]);
+    }
     serve()
 }
 

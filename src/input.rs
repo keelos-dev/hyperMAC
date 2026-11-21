@@ -129,6 +129,85 @@ pub struct Input {
     /// click count of the current press (1 single, 2 double, 3 triple, …): set on the down,
     /// its drags and its up
     clicks: i64,
+    /// the Mac's input method was looked at for this connection's composed text (`english`)
+    english_asked: bool,
+}
+
+/// A client that sends composed characters (a phone: its own keyboard and input method make
+/// the text) types into the Mac's input method when that is a Chinese or Japanese one: the
+/// letters are taken for pinyin and composed a second time. So at such a connection's first
+/// character the Mac goes to its English keyboard (user, 2026-11-21: "连上手机后，mac应该自动
+/// 切换到英文输入法"). It is not put back afterwards: selecting an input method from a
+/// program without a window is known to leave the menu saying one thing and the keys doing
+/// another.
+///
+/// Done by this program run once more as `hypermac input-source english`, not here: the
+/// Text Input Sources calls check the calling process in with LaunchServices, and the
+/// service must never be (cursor.rs `bitmap`); they also belong on a main thread.
+fn english() {
+    let Ok(exe) = std::env::current_exe() else { return };
+    let start = Instant::now();
+    match std::process::Command::new(exe).args(["input-source", "english"]).output() {
+        Ok(out) => {
+            let was = String::from_utf8_lossy(&out.stdout).trim().to_owned();
+            if !was.is_empty() {
+                tracing::info!(was, ms = start.elapsed().as_millis() as u64, "composed text from the client: the Mac's input method is the English keyboard now");
+            }
+        }
+        Err(e) => warn!("input-source: {e}"),
+    }
+}
+
+mod tis {
+    use std::ffi::c_void;
+    pub type Ref = *const c_void;
+    #[link(name = "Carbon", kind = "framework")]
+    unsafe extern "C" {
+        pub static kTISPropertyInputSourceType: Ref;
+        pub static kTISPropertyInputSourceID: Ref;
+        pub static kTISTypeKeyboardLayout: Ref;
+        pub fn TISCopyCurrentKeyboardInputSource() -> Ref;
+        pub fn TISCopyInputSourceForLanguage(language: Ref) -> Ref;
+        pub fn TISGetInputSourceProperty(source: Ref, key: Ref) -> Ref;
+        pub fn TISSelectInputSource(source: Ref) -> i32;
+    }
+    #[link(name = "CoreFoundation", kind = "framework")]
+    unsafe extern "C" {
+        pub fn CFEqual(a: Ref, b: Ref) -> u8;
+        pub fn CFRelease(a: Ref);
+    }
+}
+
+/// `hypermac input-source english` (see `english`): when the current input source is an
+/// input method and not a plain keyboard layout, the English keyboard is selected and the
+/// id of what was there is printed. A layout (ABC, a Japanese or a Dvorak one) is left.
+pub fn source_command(args: &[String]) -> anyhow::Result<()> {
+    anyhow::ensure!(args.first().map(String::as_str) == Some("english"), "usage: hypermac input-source english");
+    // SAFETY: Text Input Sources on the main thread of a process of its own; what is copied
+    // is released, what is got is not.
+    unsafe {
+        let current = tis::TISCopyCurrentKeyboardInputSource();
+        if current.is_null() {
+            return Ok(());
+        }
+        let kind = tis::TISGetInputSourceProperty(current, tis::kTISPropertyInputSourceType);
+        let layout = !kind.is_null() && tis::CFEqual(kind, tis::kTISTypeKeyboardLayout) != 0;
+        if !layout {
+            let language = objc2_core_foundation::CFString::from_str("en");
+            let english = tis::TISCopyInputSourceForLanguage((&*language as *const objc2_core_foundation::CFString).cast());
+            if !english.is_null() {
+                let status = tis::TISSelectInputSource(english);
+                tis::CFRelease(english);
+                anyhow::ensure!(status == 0, "TISSelectInputSource: {status}");
+                let id = tis::TISGetInputSourceProperty(current, tis::kTISPropertyInputSourceID);
+                if !id.is_null() {
+                    println!("{}", &*id.cast::<objc2_core_foundation::CFString>());
+                }
+            }
+        }
+        tis::CFRelease(current);
+    }
+    Ok(())
 }
 
 impl Input {
@@ -138,7 +217,7 @@ impl Input {
             .name("scroll-pump".into())
             .spawn(move || scroll_pump(scroll_rx))
             .expect("spawn scroll pump thread");
-        Self { flags: CGEventFlags::empty(), held: 0, buttons: 0, pos: CGPoint { x: 0.0, y: 0.0 }, scroll_tx, last_down: None, clicks: 1 }
+        Self { flags: CGEventFlags::empty(), held: 0, buttons: 0, pos: CGPoint { x: 0.0, y: 0.0 }, scroll_tx, last_down: None, clicks: 1, english_asked: false }
     }
 
     fn send(&self, ev: Option<objc2_core_foundation::CFRetained<CGEvent>>, what: &str) {
@@ -237,7 +316,13 @@ impl Input {
 impl RdpServerInputHandler for Input {
     fn keyboard(&mut self, ev: KeyboardEvent) {
         match ev {
-            KeyboardEvent::UnicodePressed(u) => self.type_unicode(u, true),
+            KeyboardEvent::UnicodePressed(u) => {
+                // (before the first character is typed, so that it is not composed)
+                if !std::mem::replace(&mut self.english_asked, true) {
+                    english();
+                }
+                self.type_unicode(u, true)
+            }
             KeyboardEvent::UnicodeReleased(u) => self.type_unicode(u, false),
             KeyboardEvent::Pressed { code, extended } | KeyboardEvent::Released { code, extended } => {
                 let down = matches!(ev, KeyboardEvent::Pressed { .. });

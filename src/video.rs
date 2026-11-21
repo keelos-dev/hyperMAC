@@ -41,6 +41,17 @@ pub const SOUND: u16 = 0x0004;
 /// with version 2 alone offers nothing — the client decides (e.g. only when UDP did not come
 /// up). Empty body.
 pub const TRANSPORT_REQUEST: u16 = 0x0006;
+/// LIMIT (kRDPclient 2026-11-20, a phone on mobile data): u16 `max_fps`, u16 reserved, u32
+/// `max_kbps`; 0 leaves that one to the server. May come at any time after CAPS; the running
+/// stream is ended and the next frame starts one within the limit.
+pub const LIMIT: u16 = 0x0007;
+/// SIZE (kRDPclient 2026-11-20): u16 `max_width`, u16 `max_height`: how large the client
+/// shows the whole desktop, in pixels (a phone: 1206 wide for 1920×1080); 0 0 = as it is.
+/// An H.264 stream is then encoded at about that size, in the desktop's shape (never
+/// larger than the desktop), and its START has the desktop's own size after `fps_hint`
+/// (u16, u16) so the client keeps the pointer in the desktop's pixels. May come at any
+/// time; the next frame starts a stream of the new size. Lossless streams stay as they are.
+pub const SIZE: u16 = 0x0008;
 pub const START: u16 = 0x0101;
 pub const FRAME: u16 = 0x0102;
 pub const STOP: u16 = 0x0103;
@@ -184,6 +195,8 @@ struct State {
     /// The stream id in progress, if any, and its size.
     stream: Option<u32>,
     size: (u32, u32),
+    /// The size the stream is encoded at: `size`, or smaller after the client's SIZE.
+    out: (u32, u32),
     /// The current stream's codec_id.
     codec: u8,
     /// Frames of the current stream sent (or being encoded) and not yet acknowledged.
@@ -194,6 +207,9 @@ struct State {
     next_frame: u32,
     /// The next encode must be a keyframe (START, or KEYFRAME_REQUEST).
     keyframe: bool,
+    /// When begin() last let a frame through (the client's LIMIT on frames a second: the
+    /// capture runs at its own rate).
+    let_through: Option<Instant>,
     /// v2: the second (video-only) TCP connection, once the client said TRANSPORT_READY:
     /// FRAMEs go there instead of the DVC. None: DVC (v1, or v2 before/after the transport).
     transport: Option<UnboundedSender<Vec<u8>>>,
@@ -230,6 +246,12 @@ pub struct Video {
     sound: Option<crate::sound::Sound>,
     /// the client is on the local network (set_lan): the high frame rate
     lan: Arc<AtomicBool>,
+    /// the client's LIMIT: frames a second (the upper half) and kilobits a second, 0 = none
+    limit: Arc<std::sync::atomic::AtomicU64>,
+    /// the client's SIZE: the width in the upper half, 0 = as it is
+    shown: Arc<AtomicU32>,
+    /// how many of the desktop's pixels the running stream has, in thousandths (begin())
+    share: Arc<AtomicU32>,
 }
 
 /// An address of the local network: private, link-local or this Mac itself. (A VPN that hands
@@ -261,13 +283,56 @@ impl Video {
     /// Frames a second for this connection: 60 on the local network, else capture::fps()'s 30
     /// (a WAN's jitter is as long as a 60 fps frame). MACRDP_FPS, when set, is it for both.
     pub fn fps(&self) -> i32 {
-        if std::env::var_os("MACRDP_FPS").is_none() && self.lan.load(Ordering::Relaxed) { 60 } else { crate::capture::fps() }
+        let own = if std::env::var_os("MACRDP_FPS").is_none() && self.lan.load(Ordering::Relaxed) { 60 } else { crate::capture::fps() };
+        match self.limit().0 {
+            0 => own,
+            most => own.min(most as i32),
+        }
+    }
+
+    /// The size an H.264 stream of a `w`×`h` desktop is encoded at: the desktop's, or
+    /// smaller when the client shows it smaller (SIZE). Even numbers; a size within a
+    /// twentieth of the desktop's is not worth another picture.
+    fn out_size(&self, w: u32, h: u32) -> (u32, u32) {
+        let shown = self.shown.load(Ordering::Relaxed);
+        let (max_w, max_h) = (shown >> 16, shown & 0xffff);
+        if max_w == 0 || max_h == 0 || w == 0 || h == 0 {
+            return (w, h);
+        }
+        let scale = (max_w as f64 / w as f64).min(max_h as f64 / h as f64);
+        if scale >= 0.95 {
+            return (w, h);
+        }
+        let even = |n: f64| (((n / 2.0).round() as u32) * 2).max(64);
+        (even(w as f64 * scale).min(w), even(h as f64 * scale).min(h))
+    }
+
+    /// The running stream's encoded size (begin() made it): what the encoder is made for.
+    pub fn stream_size(&self) -> (u32, u32) {
+        self.state.lock().unwrap().out
+    }
+
+    /// The client's LIMIT: frames and kilobits a second, 0 = none.
+    fn limit(&self) -> (u32, u32) {
+        let limit = self.limit.load(Ordering::Relaxed);
+        ((limit >> 32) as u32, limit as u32)
     }
 
     /// The H.264 bit rate: 6 Mbps is 1080p30 over a home uplink; twice the frames on the local
     /// network get twice the bits. MACRDP_VIDEO_KBPS, when set, is it for both.
     pub fn kbps(&self) -> u32 {
-        std::env::var("MACRDP_VIDEO_KBPS").ok().and_then(|s| s.parse().ok()).unwrap_or(if self.fps() > 30 { 12_000 } else { 6_000 })
+        let own: u32 = std::env::var("MACRDP_VIDEO_KBPS").ok().and_then(|s| s.parse().ok()).unwrap_or(if self.fps() > 30 { 12_000 } else { 6_000 });
+        // a stream made smaller for the client (SIZE) gets its share of the bits, not all
+        // of them: fewer pixels are the point
+        let own = match self.share.load(Ordering::Relaxed) {
+            0 | 1000.. => own,
+            share => (own * share / 1000).max(500),
+        };
+        match self.limit().1 {
+            0 => own,
+            // (below this VideoToolbox's picture is not one to read a desktop by)
+            most => own.min(most.max(200)),
+        }
     }
 
     pub fn attach_transport(&self, session: u32, tx: UnboundedSender<Vec<u8>>) -> bool {
@@ -354,11 +419,14 @@ impl Video {
             }
             return Go::NoVideo;
         };
-        if s.stream.is_none() || s.size != (w, h) || s.codec != codec {
+        let out = if codec == CODEC_H264 { self.out_size(w, h) } else { (w, h) };
+        if s.stream.is_none() || s.size != (w, h) || s.codec != codec || s.out != out {
             let id = self.next_stream.fetch_add(1, Ordering::Relaxed);
             info!(stream = id, w, h, codec = if codec == CODEC_INDEXED { "lossless" } else { "H.264" }, "keelOS::Video: START");
             s.stream = Some(id);
             s.size = (w, h);
+            s.out = out;
+            self.share.store((u64::from(out.0) * u64::from(out.1) * 1000 / (u64::from(w) * u64::from(h)).max(1)) as u32, Ordering::Relaxed);
             s.codec = codec;
             s.in_flight = 0;
             s.next_frame = 0;
@@ -366,8 +434,22 @@ impl Video {
             drop(s);
             // fps_hint = the capture ceiling actually in force (MACRDP_FPS), not a constant
             let hint = self.fps() as u16;
-            self.send(vec![message(START, &start_body(id, codec, w as u16, h as u16, hint))]);
+            let mut start = start_body(id, codec, out.0 as u16, out.1 as u16, hint);
+            if out != (w, h) {
+                info!(stream = id, w = out.0, h = out.1, "keelOS::Video: the stream is smaller than the desktop (the client's SIZE)");
+                start.extend_from_slice(&(w as u16).to_le_bytes());
+                start.extend_from_slice(&(h as u16).to_le_bytes());
+            }
+            self.send(vec![message(START, &start)]);
             s = self.state.lock().unwrap();
+        }
+        // The client's LIMIT on frames a second: the frames between are not encoded.
+        if let most @ 1.. = self.limit().0 {
+            let apart = std::time::Duration::from_micros(900_000 / u64::from(most));
+            if s.let_through.is_some_and(|at| at.elapsed() < apart) {
+                return Go::Busy;
+            }
+            s.let_through = Some(Instant::now());
         }
         if s.in_flight >= Self::max_in_flight(&s) {
             // Watchdog: full and not one ACK for STALL — the ACKs are lost (a line that went
@@ -533,6 +615,31 @@ impl Video {
                     },
                     None => warn!("keelOS::Video: bad SOUND"),
                 },
+                LIMIT => match (b.get(0..2), u32_at(b, 4)) {
+                    (Some(fps), Some(kbps)) => {
+                        let fps = u16::from_le_bytes([fps[0], fps[1]]);
+                        let limit = (u64::from(fps) << 32) | u64::from(kbps);
+                        if self.limit.swap(limit, Ordering::Relaxed) != limit {
+                            info!(max_fps = fps, max_kbps = kbps, "keelOS::Video: LIMIT (0 = this server's own)");
+                            // The encoder is made for a stream: the running one ends here,
+                            // and the next frame starts one at the new rates (begin()).
+                            s.stream = None;
+                            s.let_through = None;
+                        }
+                    }
+                    _ => warn!(len = b.len(), "keelOS::Video: bad LIMIT"),
+                },
+                SIZE => match b.get(0..4) {
+                    Some(b) => {
+                        let (w, h) = (u16::from_le_bytes([b[0], b[1]]), u16::from_le_bytes([b[2], b[3]]));
+                        let shown = (u32::from(w) << 16) | u32::from(h);
+                        if self.shown.swap(shown, Ordering::Relaxed) != shown {
+                            // (begin() sees the other size at the next frame and starts a stream)
+                            info!(max_width = w, max_height = h, "keelOS::Video: SIZE (0 = the desktop's own)");
+                        }
+                    }
+                    None => warn!(len = b.len(), "keelOS::Video: bad SIZE"),
+                },
                 _ => debug!(ty, len = b.len(), "keelOS::Video: unknown message skipped"),
             }
         }
@@ -589,3 +696,91 @@ impl DvcProcessor for Channel {
 }
 
 impl DvcServerProcessor for Channel {}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn caps_h264() -> Vec<u8> {
+        // version 2, 3840x2160, 3 in flight, one codec: H.264 in hardware
+        let mut b = Vec::new();
+        b.extend_from_slice(&2u32.to_le_bytes());
+        b.extend_from_slice(&3840u16.to_le_bytes());
+        b.extend_from_slice(&2160u16.to_le_bytes());
+        b.extend_from_slice(&[3, 1, CODEC_H264, 1]);
+        message(CAPS, &b)
+    }
+
+    fn limit(fps: u16, kbps: u32) -> Vec<u8> {
+        let mut b = Vec::new();
+        b.extend_from_slice(&fps.to_le_bytes());
+        b.extend_from_slice(&0u16.to_le_bytes());
+        b.extend_from_slice(&kbps.to_le_bytes());
+        message(LIMIT, &b)
+    }
+
+    /// kRDPclient's LIMIT (a phone on mobile data): the rates go down to it, the running
+    /// stream ends for a new one, frames closer than the limit are not encoded; 0 0 takes
+    /// it away again.
+    #[test]
+    fn limit_lowers_the_rates_and_starts_a_new_stream() {
+        let (v, _factory) = Video::new(None, None);
+        v.process(&caps_h264());
+        let (own_fps, own_kbps) = (v.fps(), v.kbps());
+        assert!(own_fps >= 30 && own_kbps >= 6000);
+        let first = match v.begin(1920, 1080, false) {
+            Go::Encode { stream, key, .. } => {
+                assert!(key);
+                stream
+            }
+            _ => panic!("no stream"),
+        };
+        v.process(&limit(10, 1000));
+        assert_eq!((v.fps(), v.kbps()), (10, 1000));
+        let second = match v.begin(1920, 1080, false) {
+            Go::Encode { stream, key, .. } => {
+                assert!(key, "the new stream starts with a keyframe");
+                stream
+            }
+            _ => panic!("no stream after LIMIT"),
+        };
+        assert_ne!(first, second);
+        // the capture's next frame, a moment later: too soon for 10 a second
+        assert!(matches!(v.begin(1920, 1080, false), Go::Busy));
+        // the same limit again changes nothing
+        v.process(&limit(10, 1000));
+        assert!(matches!(v.begin(1920, 1080, false), Go::Busy));
+        // a limit below what a picture needs is raised to the least
+        v.process(&limit(0, 50));
+        assert_eq!((v.fps(), v.kbps()), (own_fps, 200));
+        v.process(&limit(0, 0));
+        assert_eq!((v.fps(), v.kbps()), (own_fps, own_kbps));
+        // SIZE: a phone shows the desktop 1206 wide
+        let mut size = Vec::new();
+        size.extend_from_slice(&1206u16.to_le_bytes());
+        size.extend_from_slice(&2622u16.to_le_bytes());
+        v.process(&message(SIZE, &size));
+        assert_eq!(v.out_size(1920, 1080), (1206, 678));
+        let third = match v.begin(1920, 1080, false) {
+            Go::Encode { stream, key, .. } => {
+                assert!(key);
+                stream
+            }
+            _ => panic!("no stream after SIZE"),
+        };
+        assert_ne!(second, third);
+        assert_eq!(v.stream_size(), (1206, 678));
+        // its share of the bits: 1206*678 / 1920*1080 = 394 thousandths
+        assert_eq!(v.kbps(), own_kbps * 394 / 1000);
+        // lossless streams and sizes near the desktop's stay whole; 0 0 takes it away
+        assert_eq!(v.out_size(1280, 678), (1206, 638));
+        assert_eq!(v.out_size(1206, 600), (1206, 600));
+        v.process(&message(SIZE, &[0, 0, 0, 0]));
+        assert_eq!(v.out_size(1920, 1080), (1920, 1080));
+        assert!(matches!(v.begin(1920, 1080, false), Go::Encode { key: true, .. }));
+        assert_eq!((v.stream_size(), v.kbps()), ((1920, 1080), own_kbps));
+        // a short LIMIT is skipped
+        v.process(&message(LIMIT, &[10, 0]));
+        assert_eq!((v.fps(), v.kbps()), (own_fps, own_kbps));
+    }
+}

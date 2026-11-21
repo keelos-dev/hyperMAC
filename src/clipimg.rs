@@ -118,7 +118,7 @@ pub fn mac_has_image() -> bool {
     has_image(&NSPasteboard::generalPasteboard())
 }
 
-fn has_image(pb: &NSPasteboard) -> bool {
+pub(crate) fn has_image(pb: &NSPasteboard) -> bool {
     let Some(types) = pb.types() else { return false };
     let has = |t: &objc2_app_kit::NSPasteboardType| types.iter().any(|x| &*x == t);
     unsafe { !has(NSPasteboardTypeFileURL) && (has(NSPasteboardTypePNG) || has(NSPasteboardTypeTIFF)) }
@@ -156,7 +156,7 @@ pub fn mac_dib() -> Option<Vec<u8>> {
     dib_of(&NSPasteboard::generalPasteboard())
 }
 
-fn dib_of(pb: &NSPasteboard) -> Option<Vec<u8>> {
+pub(crate) fn dib_of(pb: &NSPasteboard) -> Option<Vec<u8>> {
     autoreleasepool(|_| {
         if !has_image(pb) {
             return None;
@@ -232,8 +232,13 @@ pub fn put_dib(dib: &[u8]) -> Option<isize> {
 }
 
 fn put_dib_on(pb: &NSPasteboard, dib: &[u8]) -> Option<isize> {
+    put_png_on(pb, &dib_png(dib)?)
+}
+
+/// A client's DIB as a PNG file's bytes.
+pub fn dib_png(dib: &[u8]) -> Option<Vec<u8>> {
     let img = from_dib(dib)?;
-    let png = autoreleasepool(|_| {
+    autoreleasepool(|_| {
         let rep = unsafe {
             NSBitmapImageRep::initWithBitmapDataPlanes_pixelsWide_pixelsHigh_bitsPerSample_samplesPerPixel_hasAlpha_isPlanar_colorSpaceName_bitmapFormat_bytesPerRow_bitsPerPixel(
                 NSBitmapImageRep::alloc(),
@@ -257,8 +262,39 @@ fn put_dib_on(pb: &NSPasteboard, dib: &[u8]) -> Option<isize> {
         unsafe { std::ptr::copy_nonoverlapping(img.px.as_ptr(), base, img.px.len()) };
         let png = unsafe { rep.representationUsingType_properties(NSBitmapImageFileType::PNG, &NSDictionary::new()) }?;
         Some(png.to_vec())
-    })?;
-    put_png_on(pb, &png)
+    })
+}
+
+/// A picture file's bytes (a JPEG, a PNG) as (PNG, TIFF): what the Mac's apps read.
+pub fn png_and_tiff(file: &[u8]) -> Option<(Vec<u8>, Option<Vec<u8>>)> {
+    autoreleasepool(|_| {
+        let rep = NSBitmapImageRep::imageRepWithData(&NSData::with_bytes(file))?;
+        let png = if file.starts_with(b"\x89PNG") {
+            file.to_vec()
+        } else {
+            unsafe { rep.representationUsingType_properties(NSBitmapImageFileType::PNG, &NSDictionary::new()) }?.to_vec()
+        };
+        Some((png, rep.TIFFRepresentation().map(|t| t.to_vec())))
+    })
+}
+
+/// A picture is promised on the pasteboard (PNG and TIFF), its data to come from `owner`
+/// when something reads it (clip.rs `promise_command`). Returns the pasteboard's changeCount.
+pub fn promise_on(pb: &NSPasteboard, owner: &objc2::runtime::AnyObject) -> isize {
+    let both = unsafe { [NSPasteboardTypePNG, NSPasteboardTypeTIFF] };
+    let types = objc2_foundation::NSArray::from_slice(&both);
+    unsafe { pb.declareTypes_owner(&types, Some(owner)) };
+    pb.changeCount()
+}
+
+/// The promised data, given when asked for: `tiff` says which of the two.
+pub fn keep_promise(pb: &NSPasteboard, tiff: bool, data: &[u8]) -> bool {
+    let kind = unsafe { if tiff { NSPasteboardTypeTIFF } else { NSPasteboardTypePNG } };
+    pb.setData_forType(Some(&NSData::with_bytes(data)), kind)
+}
+
+pub fn is_tiff(kind: &objc2_foundation::NSString) -> bool {
+    kind.isEqualToString(unsafe { NSPasteboardTypeTIFF })
 }
 
 #[cfg(test)]

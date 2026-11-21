@@ -497,7 +497,10 @@ impl Output {
                         *enc = None; // the old stream's encoder, and its drain thread, go
                         // 6 Mbps: 1080p30 over a home uplink (10 burst to 14 and queued, 200 ms
                         // spikes); 12 at 60 a second on the local network (video.rs kbps())
-                        match crate::encoder::Encoder::new(w, h, v.fps() as u32, v.kbps()) {
+                        // (the stream's size: the desktop's, or smaller after the client's SIZE;
+                        // VideoToolbox scales the frames it is given to the session's size)
+                        let (ow, oh) = v.stream_size();
+                        match crate::encoder::Encoder::new(ow, oh, v.fps() as u32, v.kbps()) {
                             Ok((e, rx)) => {
                                 let v = v.clone();
                                 // encoded frames come out on VideoToolbox's thread into rx;
